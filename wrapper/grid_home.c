@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
 
 #include <compat/strl.h>
 #include <file/file_path.h>
@@ -35,6 +36,8 @@
 #include "../gfx/font_driver.h"
 
 #define GRID_MAX_GAMES 1024
+/* RetroAchievements icon size; tiles are a whole multiple of it. */
+#define GRID_ICON_SIZE 96
 
 typedef struct
 {
@@ -48,6 +51,7 @@ typedef struct
    unsigned art_w;
    unsigned art_h;
    bool art_tried;
+   bool pixel_art;   /* RetroAchievements icon: nearest filter, integer scale */
 } grid_game_t;
 
 typedef struct
@@ -203,7 +207,8 @@ static void grid_apply_meta(grid_game_t *game)
       grid_clean_title(game->title);
    }
 
-   art = !string_is_empty(icon) ? icon : game->boxart_path;
+   art             = !string_is_empty(icon) ? icon : game->boxart_path;
+   game->pixel_art = !string_is_empty(icon);
 
    if (!string_is_equal(art, game->art_path))
    {
@@ -474,7 +479,9 @@ bool grid_home_frame(video_frame_info_t *video_info)
 
    /* Layout scales with window height. */
    gap     = height * 0.03f;
-   tile_w  = height * 0.22f;
+   /* ~22% of the height, rounded up to a whole multiple of the icon size
+    * so pixel-art icons scale evenly. */
+   tile_w  = GRID_ICON_SIZE * ceilf(height * 0.22f / GRID_ICON_SIZE);
    art_h   = tile_w;                 /* square art area */
    label_h = height * 0.06f;
    tile_h  = art_h + label_h;
@@ -535,7 +542,10 @@ bool grid_home_frame(video_frame_info_t *video_info)
          game->art_tried = true;
          if (!string_is_empty(game->art_path))
             gfx_display_reset_icon_texture(game->art_path, &game->art,
-                  TEXTURE_FILTER_MIPMAP_LINEAR, &game->art_w, &game->art_h);
+                  game->pixel_art
+                  ? TEXTURE_FILTER_NEAREST
+                  : TEXTURE_FILTER_MIPMAP_LINEAR,
+                  &game->art_w, &game->art_h);
       }
 
       if (selected)
@@ -560,6 +570,8 @@ bool grid_home_frame(video_frame_info_t *video_info)
          float aw, ah;
          if (game->art_h * s > art_h)
             s = art_h / game->art_h;
+         if (game->pixel_art && s >= 1.0f)
+            s = floorf(s);
          aw = game->art_w * s;
          ah = game->art_h * s;
 
