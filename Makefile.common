@@ -2718,6 +2718,9 @@ ifeq ($(HAVE_MIST), 1)
    OBJ += steam/steam.o tasks/task_steam.o
 endif
 
+### RetroArchWrapper additions
+OBJ += wrapper/wrapper_notify.o
+
 ### Shared rich presence code for Discord and Steam
 
 ifeq ($(HAVE_PRESENCE), 1)
