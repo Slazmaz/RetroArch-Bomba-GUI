@@ -43,6 +43,7 @@
 #include "../../frontend/frontend_driver.h"
 
 #include "../menu_driver.h"
+#include "../../wrapper/grid_home.h"
 #include "../menu_entries.h"
 #include "../menu_screensaver.h"
 
@@ -6014,8 +6015,13 @@ static int xmb_menu_entry_action(
       size_t i, enum menu_action action)
 {
    xmb_handle_t *xmb           = (xmb_handle_t*)userdata;
+   enum menu_action new_action;
+
+   if (grid_home_entry_action(action, xmb ? xmb->depth : 1))
+      return 0;
+
    /* Process input action */
-   enum menu_action new_action = xmb_parse_menu_entry_action(xmb, action);
+   new_action                  = xmb_parse_menu_entry_action(xmb, action);
    /* Call standard generic_menu_entry_action() function */
    return generic_menu_entry_action(userdata, entry, i, new_action);
 }
@@ -7913,6 +7919,9 @@ static void xmb_frame(void *data, video_frame_info_t *video_info)
    if (!xmb)
       return;
 
+   if (grid_home_frame(video_info))
+      return;
+
    msg[0]                              = '\0';
    title_msg[0]                        = '\0';
    title_truncated[0]                  = '\0';
@@ -9123,6 +9132,8 @@ static void xmb_context_reset(void *data, bool is_threaded)
       xmb_context_reset_internal(xmb, is_threaded, true,
             config_get_ptr()->uints.menu_xmb_theme);
 
+   grid_home_context_reset(is_threaded);
+
    video_driver_monitor_reset();
 }
 
@@ -9429,6 +9440,8 @@ static void xmb_context_destroy(void *data)
    xmb->font  = NULL;
    font_driver_free(xmb->font2);
    xmb->font2 = NULL;
+
+   grid_home_context_destroy();
 
    menu_screensaver_context_destroy(xmb->screensaver);
 }
