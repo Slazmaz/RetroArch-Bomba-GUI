@@ -22,6 +22,7 @@
 #include <string/stdstring.h>
 
 #include "grid_home.h"
+#include "grid_meta.h"
 
 #include "../configuration.h"
 #include "../core_info.h"
@@ -41,7 +42,8 @@ typedef struct
    char core_path[PATH_MAX_LENGTH];
    char title[NAME_MAX_LENGTH];
    char system[16];
-   char art_path[PATH_MAX_LENGTH];
+   char boxart_path[PATH_MAX_LENGTH]; /* libretro-thumbnails fallback */
+   char art_path[PATH_MAX_LENGTH];    /* what is shown */
    uintptr_t art;
    unsigned art_w;
    unsigned art_h;
@@ -139,7 +141,7 @@ static void grid_find_art(grid_game_t *game, const core_info_t *core,
    settings_t *settings = config_get_ptr();
    const char *thumbs  = settings->paths.directory_thumbnails;
 
-   game->art_path[0] = '\0';
+   game->boxart_path[0] = '\0';
 
    if (string_is_empty(thumbs) || !core || !core->databases_list)
       return;
@@ -155,14 +157,62 @@ static void grid_find_art(grid_game_t *game, const core_info_t *core,
             core->databases_list->elems[i].data, sizeof(db_dir));
       fill_pathname_join_special(art_dir, db_dir,
             "Named_Boxarts", sizeof(art_dir));
-      fill_pathname_join_special(game->art_path, art_dir,
-            name, sizeof(game->art_path));
+      fill_pathname_join_special(game->boxart_path, art_dir,
+            name, sizeof(game->boxart_path));
 
-      if (path_is_valid(game->art_path))
+      if (path_is_valid(game->boxart_path))
          return;
    }
 
-   game->art_path[0] = '\0';
+   game->boxart_path[0] = '\0';
+}
+
+/* "~Hack~ Pokemon Unbound" -> "Pokemon Unbound" */
+static const char *grid_skip_ra_tags(const char *s)
+{
+   while (*s == '~')
+   {
+      const char *end = strchr(s + 1, '~');
+      if (!end)
+         break;
+      s = end + 1;
+      while (*s == ' ')
+         s++;
+   }
+   return s;
+}
+
+/* Fills title/art from RetroAchievements when known, otherwise from the
+ * file name and libretro boxart. */
+static void grid_apply_meta(grid_game_t *game)
+{
+   char title[NAME_MAX_LENGTH];
+   char icon[PATH_MAX_LENGTH];
+   const char *art;
+
+   title[0] = icon[0] = '\0';
+
+   if (grid_meta_get(game->path, title, sizeof(title),
+            icon, sizeof(icon)) == GRID_META_FOUND
+         && !string_is_empty(title))
+      strlcpy(game->title, grid_skip_ra_tags(title), sizeof(game->title));
+   else
+   {
+      strlcpy(game->title, path_basename(game->path), sizeof(game->title));
+      path_remove_extension(game->title);
+      grid_clean_title(game->title);
+   }
+
+   art = !string_is_empty(icon) ? icon : game->boxart_path;
+
+   if (!string_is_equal(art, game->art_path))
+   {
+      if (game->art)
+         video_driver_texture_unload(&game->art);
+      game->art       = 0;
+      game->art_tried = false;
+      strlcpy(game->art_path, art, sizeof(game->art_path));
+   }
 }
 
 static void grid_scan(void)
@@ -215,10 +265,6 @@ static void grid_scan(void)
       /* TODO: let the user pick when several cores fit. */
       strlcpy(game->core_path, infos[0].path, sizeof(game->core_path));
 
-      strlcpy(game->title, base, sizeof(game->title));
-      path_remove_extension(game->title);
-      grid_clean_title(game->title);
-
       for (j = 0; ext[j] && j < sizeof(game->system) - 1; j++)
          game->system[j] = toupper((unsigned char)ext[j]);
       game->system[j] = '\0';
@@ -226,6 +272,7 @@ static void grid_scan(void)
       /* infos points into a list that the next lookup re-sorts,
        * so resolve the boxart now while it is valid. */
       grid_find_art(game, &infos[0], base);
+      grid_apply_meta(game);
 
       grid_st.count++;
    }
@@ -415,6 +462,11 @@ bool grid_home_frame(video_frame_info_t *video_info)
          || !string_is_equal(grid_st.scanned_dir,
                settings->paths.directory_menu_content))
       grid_scan();
+
+   /* RetroAchievements lookups finishing in the background. */
+   if (grid_meta_poll())
+      for (i = 0; i < grid_st.count; i++)
+         grid_apply_meta(&grid_st.games[i]);
 
    if (video_st->current_video && video_st->current_video->set_viewport)
       video_st->current_video->set_viewport(
