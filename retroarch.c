@@ -108,6 +108,8 @@
 #include "steam/steam.h"
 #endif
 
+#include "wrapper/wrapper_notify.h"
+
 #include "config.def.h"
 
 #ifdef HAVE_MENU
@@ -6058,6 +6060,8 @@ int rarch_main(int argc, char *argv[], void *data)
 #ifdef HAVE_MIST
    steam_poll();
 #endif
+
+      wrapper_notify_poll();
 
 #ifdef HAVE_QT
       app_exit = ui_companion_qt.application->exiting;
