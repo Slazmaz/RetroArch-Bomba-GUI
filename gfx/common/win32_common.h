@@ -150,6 +150,9 @@ void win32_window_reset(void);
 
 void win32_destroy_window(void);
 
+/* RetroArchWrapper: keep the window open across a D3D driver reinit. */
+void win32_keep_window(void);
+
 uint8_t win32_get_flags(void);
 
 float win32_get_refresh_rate(void *data);

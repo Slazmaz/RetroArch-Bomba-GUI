@@ -1812,6 +1812,73 @@ LRESULT CALLBACK wnd_proc_gdi_common(HWND hwnd, UINT message,
 }
 #endif
 
+/* RetroArchWrapper: keep the window across video driver reinits (content
+ * load/close) so it doesn't close and reopen. Only for the D3D drivers;
+ * GL/Vulkan set per-window state that can't be redone on a reused window. */
+static HWND    kept_hwnd       = NULL;
+static WNDPROC last_wndproc    = NULL;
+static bool    window_reused   = false;
+
+static bool win32_is_d3d_wndproc(WNDPROC proc)
+{
+#if defined(HAVE_D3D) || defined(HAVE_D3D8) || defined(HAVE_D3D9) || defined (HAVE_D3D10) || defined (HAVE_D3D11) || defined (HAVE_D3D12)
+   if (proc == wnd_proc_d3d_common)
+      return true;
+#ifdef HAVE_WINRAWINPUT
+   if (proc == wnd_proc_d3d_winraw)
+      return true;
+#endif
+#ifdef HAVE_DINPUT
+   if (proc == wnd_proc_d3d_dinput)
+      return true;
+#endif
+#endif
+   return false;
+}
+
+/* Use instead of win32_monitor_from_window() + win32_destroy_window()
+ * when freeing a D3D driver: the window stays open for the next init. */
+void win32_keep_window(void)
+{
+#ifndef _XBOX
+   win32_monitor_last = MonitorFromWindow(main_window.hwnd,
+         MONITOR_DEFAULTTONEAREST);
+#if defined(_WIN32_WINNT) && _WIN32_WINNT >= 0x501
+   UnregisterDeviceNotification(notification_handler);
+#endif
+#endif
+   kept_hwnd        = main_window.hwnd;
+   main_window.hwnd = NULL;
+}
+
+/* Hands the kept window to a new init if it is compatible, otherwise
+ * destroys it. Returns true if main_window.hwnd was set. */
+static bool win32_reuse_kept_window(unsigned style)
+{
+   const LONG_PTR mask = WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU;
+   HWND hwnd           = kept_hwnd;
+
+   kept_hwnd     = NULL;
+   window_reused = false;
+
+   if (!hwnd || !IsWindow(hwnd))
+      return false;
+
+   if (     !win32_is_d3d_wndproc(last_wndproc)
+         || (GetWindowLongPtr(hwnd, GWL_STYLE) & mask) != ((LONG_PTR)style & mask))
+   {
+      DestroyWindow(hwnd);
+      return false;
+   }
+
+   SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)last_wndproc);
+   main_window.hwnd  = hwnd;
+   window_reused     = true;
+   /* WM_CREATE won't come again; it is what normally sets this. */
+   g_win32_flags    |= WIN32_CMN_FLAG_INITED;
+   return true;
+}
+
 bool win32_window_create(void *data, unsigned style,
       RECT *mon_rect, unsigned width,
       unsigned height, bool fullscreen)
@@ -1839,6 +1906,11 @@ bool win32_window_create(void *data, unsigned style,
       user_width                 = g_win32->pos_width;
       user_height                = g_win32->pos_height;
    }
+
+   if (win32_reuse_kept_window(style))
+      free(title_local);
+   else
+   {
 #ifdef LEGACY_WIN32
    main_window.hwnd              = CreateWindowEx(0,
          "RetroArch", title_local,
@@ -1853,6 +1925,7 @@ bool win32_window_create(void *data, unsigned style,
          user_height,
          NULL, NULL, NULL, data);
    free(title_local);
+   }
    if (!main_window.hwnd)
       return false;
 
@@ -2528,9 +2601,13 @@ void win32_set_window(unsigned *width, unsigned *height,
       }
 #endif
 
-      ShowWindow(main_window.hwnd, SW_RESTORE);
-      UpdateWindow(main_window.hwnd);
-      SetForegroundWindow(main_window.hwnd);
+      /* A reused window keeps its state (e.g. maximized). */
+      if (!window_reused)
+      {
+         ShowWindow(main_window.hwnd, SW_RESTORE);
+         UpdateWindow(main_window.hwnd);
+         SetForegroundWindow(main_window.hwnd);
+      }
 
       if (window)
          window->set_focused(&main_window);
@@ -2834,6 +2911,18 @@ bool win32_window_init(WNDCLASSEX *wndclass,
 
    if (class_name)
       wndclass->style        |= CS_CLASSDC;
+
+   last_wndproc = wndclass->lpfnWndProc;
+
+   /* A kept window keeps the class registered; point it at the new
+    * driver's window procedure instead. */
+   if (kept_hwnd && IsWindow(kept_hwnd))
+   {
+      if (!RegisterClassEx(wndclass))
+         SetClassLongPtr(kept_hwnd, GCLP_WNDPROC,
+               (LONG_PTR)wndclass->lpfnWndProc);
+      return true;
+   }
 
    return RegisterClassEx(wndclass);
 }
