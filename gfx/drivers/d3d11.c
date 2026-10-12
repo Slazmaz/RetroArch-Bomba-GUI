@@ -2099,11 +2099,17 @@ static void d3d11_gfx_free(void* data)
    video_driver_unset_hdr_support();
 #endif
 
+#if defined(HAVE_MONITOR) && defined(HAVE_WINDOW)
+   /* RetroArchWrapper: keep the window for the next init (content
+    * load/close) instead of closing and reopening it. */
+   win32_keep_window();
+#else
 #ifdef HAVE_MONITOR
    win32_monitor_from_window();
 #endif
 #ifdef HAVE_WINDOW
    win32_destroy_window();
+#endif
 #endif
    free(d3d11);
 }
