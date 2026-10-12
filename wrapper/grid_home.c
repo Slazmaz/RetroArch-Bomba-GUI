@@ -14,6 +14,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <math.h>
+
+#include <features/features_cpu.h>
 
 #include <compat/strl.h>
 #include <file/file_path.h>
@@ -30,6 +33,9 @@
 #include "../runloop.h"
 #include "../content.h"
 #include "../tasks/task_content.h"
+#include "../command.h"
+#include "../paths.h"
+#include "../menu/menu_driver.h"
 #include "../gfx/gfx_display.h"
 #include "../gfx/video_driver.h"
 #include "../gfx/font_driver.h"
@@ -65,6 +71,33 @@ typedef struct
 } grid_home_t;
 
 static grid_home_t grid_st = { NULL, 0, 0, 0, 1, true, false, NULL, 0.0f };
+
+/* In-game bar: shown instead of XMB's Quick Menu while a game runs. */
+enum ingame_button
+{
+   INGAME_SETTINGS = 0,
+   INGAME_CONTINUE,
+   INGAME_QUIT,
+   INGAME_BUTTON_COUNT
+};
+
+static const char *ingame_labels[INGAME_BUTTON_COUNT] = {
+   "Settings", "Continue", "Quit"
+};
+
+static struct
+{
+   bool xmb;            /* user chose Settings: show XMB until menu closes */
+   unsigned selection;
+   uintptr_t icon;
+   char icon_path[PATH_MAX_LENGTH];
+   char title[NAME_MAX_LENGTH];
+   char content[PATH_MAX_LENGTH]; /* content the title/icon belong to */
+} ingame_st = { false, INGAME_CONTINUE, 0 };
+
+/* From menu_cbs_ok.c; also handles "quit on close" and the menu stack. */
+int action_ok_close_content(const char *path, const char *label,
+      unsigned type, size_t idx, size_t entry_idx);
 
 /* Colours (RGBA) */
 #define GRID_COL_BG        0x14161cff
@@ -303,13 +336,89 @@ static bool grid_content_running(void)
          & RETRO_CORE_FLAG_GAME_LOADED) ? true : false;
 }
 
+static void ingame_unload_icon(void)
+{
+   if (ingame_st.icon)
+      video_driver_texture_unload(&ingame_st.icon);
+   ingame_st.icon         = 0;
+   ingame_st.icon_path[0] = '\0';
+   ingame_st.content[0]   = '\0';
+}
+
+void grid_home_toggle(bool menu_on)
+{
+   if (menu_on)
+   {
+      ingame_st.xmb       = false;
+      ingame_st.selection = INGAME_CONTINUE;
+   }
+   else
+      ingame_unload_icon();
+}
+
+static bool ingame_entry_action(enum menu_action action, unsigned xmb_depth)
+{
+   if (ingame_st.xmb)
+   {
+      /* Back at XMB's top level returns to the bar. */
+      if (action == MENU_ACTION_CANCEL && xmb_depth <= 1)
+      {
+         ingame_st.xmb = false;
+         return true;
+      }
+      return false;
+   }
+
+   switch (action)
+   {
+      case MENU_ACTION_LEFT:
+         if (ingame_st.selection > 0)
+            ingame_st.selection--;
+         break;
+      case MENU_ACTION_RIGHT:
+         if (ingame_st.selection + 1 < INGAME_BUTTON_COUNT)
+            ingame_st.selection++;
+         break;
+      case MENU_ACTION_OK:
+         switch (ingame_st.selection)
+         {
+            case INGAME_SETTINGS:
+               ingame_st.xmb = true;
+               break;
+            case INGAME_CONTINUE:
+               command_event(CMD_EVENT_RESUME, NULL);
+               break;
+            case INGAME_QUIT:
+               grid_st.active = true;
+               action_ok_close_content(NULL, NULL,
+                     MENU_SETTING_ACTION_CLOSE, 0, 0);
+               break;
+         }
+         break;
+      case MENU_ACTION_CANCEL:
+         command_event(CMD_EVENT_RESUME, NULL);
+         break;
+      case MENU_ACTION_UP:
+      case MENU_ACTION_DOWN:
+      case MENU_ACTION_START:
+      case MENU_ACTION_SELECT:
+      case MENU_ACTION_SCROLL_UP:
+      case MENU_ACTION_SCROLL_DOWN:
+         break;
+      default:
+         return false;
+   }
+
+   return true;
+}
+
 bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth)
 {
    size_t sel  = grid_st.selection;
    size_t cols = grid_st.cols ? grid_st.cols : 1;
 
    if (grid_content_running())
-      return false;
+      return ingame_entry_action(action, xmb_depth);
 
    if (!grid_st.active)
    {
@@ -391,6 +500,7 @@ void grid_home_context_reset(bool is_threaded)
 void grid_home_context_destroy(void)
 {
    grid_free_textures();
+   ingame_unload_icon();
 
    if (grid_st.font)
       font_driver_free(grid_st.font);
@@ -441,6 +551,204 @@ static void grid_fit_text(char *dst, size_t dst_len, const char *src,
    }
 }
 
+static void grid_flush_text(unsigned width, unsigned height)
+{
+   if (grid_st.font && grid_st.font->renderer && grid_st.font->renderer->flush)
+      grid_st.font->renderer->flush(width, height,
+            grid_st.font->renderer_data);
+}
+
+/* Draws text inside [x, x + w]. If it doesn't fit, it scrolls: pause,
+ * scroll to the end, pause, jump back. key identifies what is being shown
+ * so the scroll restarts when it changes. align applies when it fits. */
+static void grid_draw_marquee(gfx_display_t *p_disp, void *userdata,
+      const char *text, float x, float y, float w,
+      unsigned width, unsigned height, uint32_t color, float scale,
+      enum text_alignment align, const void *key)
+{
+   static const void *last_key  = NULL;
+   static retro_time_t start    = 0;
+   const float pause            = 1.0f;           /* seconds */
+   const float speed            = height * 0.06f; /* pixels per second */
+   float s, text_w, overflow, scroll_time, t, offset, line_h;
+   retro_time_t now;
+
+   if (!grid_st.font)
+      return;
+
+   s      = scale * (height / grid_st.font_height);
+   text_w = font_driver_get_message_width(grid_st.font, text,
+         strlen(text), s);
+
+   if (text_w <= w)
+   {
+      grid_draw_text(text, align == TEXT_ALIGN_CENTER ? x + w / 2.0f : x,
+            y, width, height, color, align, scale);
+      return;
+   }
+
+   now = cpu_features_get_time_usec();
+   if (key != last_key)
+   {
+      last_key = key;
+      start    = now;
+   }
+
+   overflow    = text_w - w;
+   scroll_time = overflow / speed;
+   t           = fmodf((now - start) / 1000000.0f,
+         pause + scroll_time + pause);
+
+   if (t < pause)
+      offset = 0.0f;
+   else if (t < pause + scroll_time)
+      offset = (t - pause) * speed;
+   else
+      offset = overflow;
+
+   /* Clip to the text box. Earlier text is flushed first so the
+    * clip only affects this string. */
+   line_h = (grid_st.font_height / 32.0f) * s;
+
+   grid_flush_text(width, height);
+
+   if (p_disp->dispctx && p_disp->dispctx->scissor_begin)
+      gfx_display_scissor_begin(p_disp, userdata, width, height,
+            (int)x, (int)(y - line_h * 1.1f),
+            (unsigned)w, (unsigned)(line_h * 1.6f));
+
+   grid_draw_text(text, x - offset, y, width, height, color,
+         TEXT_ALIGN_LEFT, scale);
+   grid_flush_text(width, height);
+
+   if (p_disp->dispctx && p_disp->dispctx->scissor_end)
+      p_disp->dispctx->scissor_end(userdata, width, height);
+}
+
+/* Resolves title and icon for the running content (cached per content). */
+static void ingame_update_game(void)
+{
+   char title[NAME_MAX_LENGTH];
+   char icon[PATH_MAX_LENGTH];
+   const char *content = path_get(RARCH_PATH_CONTENT);
+
+   if (string_is_empty(content)
+         || string_is_equal(content, ingame_st.content))
+      return;
+
+   ingame_unload_icon();
+   strlcpy(ingame_st.content, content, sizeof(ingame_st.content));
+
+   title[0] = icon[0] = '\0';
+
+   if (grid_meta_get(content, title, sizeof(title), icon, sizeof(icon))
+         == GRID_META_FOUND && !string_is_empty(title))
+      strlcpy(ingame_st.title, grid_skip_ra_tags(title),
+            sizeof(ingame_st.title));
+   else
+   {
+      strlcpy(ingame_st.title, path_basename(content),
+            sizeof(ingame_st.title));
+      path_remove_extension(ingame_st.title);
+      grid_clean_title(ingame_st.title);
+   }
+
+   if (!string_is_empty(icon))
+   {
+      unsigned w, h;
+      strlcpy(ingame_st.icon_path, icon, sizeof(ingame_st.icon_path));
+      gfx_display_reset_icon_texture(icon, &ingame_st.icon,
+            TEXTURE_FILTER_MIPMAP_LINEAR, &w, &h);
+   }
+}
+
+/* Bottom bar: [icon] [title] ........ [Settings] [Continue] [Quit] */
+static bool ingame_frame(video_frame_info_t *video_info)
+{
+   float color[16];
+   unsigned i;
+   void *userdata                 = video_info->userdata;
+   unsigned width                 = video_info->width;
+   unsigned height                = video_info->height;
+   gfx_display_t *p_disp          = (gfx_display_t*)video_info->disp_userdata;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   float bar_h                    = height * 0.12f;
+   float bar_y                    = height - bar_h;
+   float pad                      = bar_h * 0.15f;
+   float icon_size                = bar_h - 2.0f * pad;
+   float btn_w                    = height * 0.17f;
+   float btn_h                    = bar_h * 0.5f;
+   float btn_y                    = bar_y + (bar_h - btn_h) / 2.0f;
+   float btn_x                    = width - 2.0f * pad
+         - INGAME_BUTTON_COUNT * btn_w - (INGAME_BUTTON_COUNT - 1) * pad;
+   float text_x                   = 2.0f * pad + icon_size + 1.5f * pad;
+   /* Rough vertical centring for the font's baseline. */
+   float text_dy                  = height * 0.012f;
+
+   if (ingame_st.xmb)
+      return false;
+
+   ingame_update_game();
+
+   if (video_st->current_video && video_st->current_video->set_viewport)
+      video_st->current_video->set_viewport(
+            video_st->data, width, height, true, false);
+
+   /* Light dim over the paused game, then the bar. */
+   grid_set_color(color, 0x00000060);
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         0, 0, width, (unsigned)bar_y, width, height, color, NULL);
+
+   grid_set_color(color, 0x14161cee);
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         0, (int)bar_y, width, (unsigned)bar_h, width, height, color, NULL);
+
+   /* Game icon */
+   grid_set_color(color, GRID_COL_TILE);
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         (int)(2.0f * pad), (int)(bar_y + pad),
+         (unsigned)icon_size, (unsigned)icon_size,
+         width, height, color, NULL);
+
+   if (ingame_st.icon)
+   {
+      grid_set_color(color, 0xffffffff);
+      gfx_display_draw_quad(p_disp, userdata, width, height,
+            (int)(2.0f * pad), (int)(bar_y + pad),
+            (unsigned)icon_size, (unsigned)icon_size,
+            width, height, color, &ingame_st.icon);
+   }
+
+   /* Game title, scrolling if wider than the space left of the buttons */
+   grid_draw_marquee(p_disp, userdata, ingame_st.title,
+         text_x, bar_y + bar_h / 2.0f + text_dy,
+         btn_x - text_x - 2.0f * pad, width, height,
+         GRID_COL_TEXT, 1.0f, TEXT_ALIGN_LEFT, &ingame_st);
+
+   /* Buttons */
+   for (i = 0; i < INGAME_BUTTON_COUNT; i++)
+   {
+      float x       = btn_x + i * (btn_w + pad);
+      bool selected = (i == ingame_st.selection);
+
+      grid_set_color(color, selected ? GRID_COL_SELECT : GRID_COL_TILE);
+      gfx_display_draw_quad(p_disp, userdata, width, height,
+            (int)x, (int)btn_y, (unsigned)btn_w, (unsigned)btn_h,
+            width, height, color, NULL);
+
+      grid_draw_text(ingame_labels[i], x + btn_w / 2.0f,
+            btn_y + btn_h / 2.0f + text_dy * 0.8f, width, height,
+            selected ? GRID_COL_TEXT : GRID_COL_TEXT_DIM,
+            TEXT_ALIGN_CENTER, 0.8f);
+   }
+
+   if (grid_st.font && grid_st.font->renderer && grid_st.font->renderer->flush)
+      grid_st.font->renderer->flush(width, height,
+            grid_st.font->renderer_data);
+
+   return true;
+}
+
 bool grid_home_frame(video_frame_info_t *video_info)
 {
    float color[16];
@@ -455,7 +763,10 @@ bool grid_home_frame(video_frame_info_t *video_info)
    video_driver_state_t *video_st = video_state_get_ptr();
    settings_t *settings           = config_get_ptr();
 
-   if (!grid_st.active || video_info->libretro_running)
+   if (video_info->libretro_running)
+      return ingame_frame(video_info);
+
+   if (!grid_st.active)
       return false;
 
    if (     !grid_st.scanned
@@ -574,14 +885,20 @@ bool grid_home_frame(video_frame_info_t *video_info)
                y + art_h / 2 + height * 0.012f, width, height,
                GRID_COL_TEXT_DIM, TEXT_ALIGN_CENTER, 1.0f);
 
+      if (selected)
+         /* Selected: scroll names that don't fit. */
+         grid_draw_marquee(p_disp, userdata, game->title,
+               x - gap * 0.25f, y + art_h + label_h * 0.6f,
+               tile_w + gap * 0.5f, width, height,
+               GRID_COL_TEXT, 0.6f, TEXT_ALIGN_CENTER, game);
+      else
       {
          char label[NAME_MAX_LENGTH];
          grid_fit_text(label, sizeof(label), game->title,
                tile_w + gap * 0.5f, height, 0.6f);
          grid_draw_text(label, x + tile_w / 2,
                y + art_h + label_h * 0.6f, width, height,
-               selected ? GRID_COL_TEXT : GRID_COL_TEXT_DIM,
-               TEXT_ALIGN_CENTER, 0.6f);
+               GRID_COL_TEXT_DIM, TEXT_ALIGN_CENTER, 0.6f);
       }
    }
 
