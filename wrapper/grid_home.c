@@ -1073,8 +1073,8 @@ static void grid_create_shoulders(unsigned w, unsigned h)
    for (side = 0; side < 2; side++)
    {
       struct texture_image ti;
-      float r_big   = h * 0.62f;
-      float r_small = h * 0.24f;
+      float r_big   = h * 0.55f;
+      float r_small = h * 0.13f;
       float hw      = w / 2.0f;
       float hh      = h / 2.0f;
 
@@ -1135,8 +1135,9 @@ static void grid_draw_shoulder(gfx_display_t *p_disp, void *userdata,
          (int)x, (int)y, w, h, width, height, color,
          grid_st.shoulder[side] ? &grid_st.shoulder[side] : NULL);
 
-   grid_draw_char_centered(letter, x + w / 2.0f, y + h / 2.0f + h * 0.04f,
-         width, height, COL_TEXT_DARK, 0.62f);
+   /* Letter cap height ~60% of the glyph, as in the reference. */
+   grid_draw_char_centered(letter, x + w / 2.0f, y + h / 2.0f,
+         width, height, COL_TEXT_DARK, h * 0.6f / (height / 32.0f) / 0.71f);
 }
 
 /* Draws text inside [x, x + w]. If it doesn't fit, it scrolls: pause,
@@ -1234,7 +1235,7 @@ static float grid_draw_hint(gfx_display_t *p_disp, void *userdata,
    /* Even pixel sizes so the centre falls on a pixel boundary and the
     * symbol inside can be centred exactly. */
    float scale  = 0.7f;
-   float d      = 2.0f * floorf(height * 0.0165f + 0.5f);
+   float d      = 2.0f * floorf(height * 0.0155f + 0.5f); /* 3.1% tall */
    float gap    = height * 0.01f;
    float lw     = grid_text_width(label, height, scale);
 
@@ -1249,9 +1250,10 @@ static float grid_draw_hint(gfx_display_t *p_disp, void *userdata,
       if (glyph[0] == '+')
       {
          /* Drawn as two bars: the font's '+' sits on the math axis, not
-          * centred, and its strokes blur at this size. */
-         float t   = 2.0f * floorf(d * 0.05f + 0.5f);
-         float len = 2.0f * floorf(d * 0.27f + 0.5f);
+          * centred, and its strokes blur at this size. Proportions match
+          * the reference: ~16% of the circle thick, ~62% long. */
+         float t   = 2.0f * floorf(d * 0.08f + 0.5f);
+         float len = 2.0f * floorf(d * 0.31f + 0.5f);
          if (t < 2.0f) t = 2.0f;
          grid_draw_rect(p_disp, userdata, width, height,
                gx + (d - len) / 2.0f, gy + (d - t) / 2.0f, len, t,
@@ -1261,8 +1263,10 @@ static float grid_draw_hint(gfx_display_t *p_disp, void *userdata,
                COL_TEXT_DARK);
       }
       else
+         /* Letter cap height ~54% of the circle, as in the reference. */
          grid_draw_char_centered(glyph[0], gx + d / 2.0f, gy + d / 2.0f,
-               width, height, COL_TEXT_DARK, 0.6f);
+               width, height, COL_TEXT_DARK,
+               d * 0.54f / (height / 32.0f) / 0.71f);
 
       grid_draw_text(label, gx + d + gap, grid_text_y(cy, height, scale),
             width, height, COL_TEXT, TEXT_ALIGN_LEFT, scale);
@@ -1477,25 +1481,25 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
    const char *search = grid_search_text();
    bool typing        = menu_input_dialog_get_display_kb();
    unsigned cur       = grid_current_tab_index();
-   /* Proportions follow the reference: the search box and tabs fill the
-    * bar's two rows rather than floating in it. */
-   float row1         = bar_h * 0.31f;
-   float row2         = bar_h * 0.76f;
-   float pill_h       = floorf(bar_h * 0.36f + 0.5f);
-   float pill_w       = width * 0.355f;
-   /* L / R: shoulder-button shape, wider than tall. */
-   float glyph        = (float)(int)(bar_h * 0.2f + 0.5f);
-   float glyph_w      = (float)(int)(glyph * 1.35f + 0.5f);
-   float tabs_x0      = side + glyph_w + height * 0.018f;
-   float tabs_x1      = width - side - glyph_w - height * 0.018f;
-   float tab_scale    = 0.66f;
+   /* Proportions measured from the reference layout (as fractions of
+    * the screen height): search row centred at 5.9%, box 7.1% tall;
+    * tab row centred at 15%; L/R glyphs 3.55% tall at 1.53:1. */
+   float row1         = floorf(height * 0.059f + 0.5f);
+   float row2         = floorf(height * 0.150f + 0.5f);
+   float pill_h       = floorf(height * 0.071f + 0.5f);
+   float pill_w       = width * 0.34f;
+   float glyph        = floorf(height * 0.0355f + 0.5f);
+   float glyph_w      = floorf(glyph * 1.53f + 0.5f);
+   float tabs_x0      = side + glyph_w + height * 0.031f;
+   float tabs_x1      = width - side - glyph_w - height * 0.031f;
+   float tab_scale    = 0.74f;
 
    grid_draw_rect(p_disp, userdata, width, height,
          0, 0, width, bar_h, COL_BAR);
 
    /* Soft drop shadow under the bar, over the grid. */
    grid_draw_vgradient(p_disp, userdata, width, height,
-         0, floorf(bar_h), width, floorf(height * 0.022f), 0x000000b0, 0x00000000);
+         0, floorf(bar_h), width, floorf(height * 0.028f), 0x000000b0, 0x00000000);
 
    /* Search box with a magnifier ring */
    {
@@ -1532,24 +1536,24 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
          /* Blinking caret while the keyboard is open. */
          bool caret = fmodf(cpu_features_get_time_usec() / 1000000.0f, 1.0f) < 0.5f;
          snprintf(text, sizeof(text), "%s%s", search, caret ? "|" : "");
-         grid_draw_text(text, tx, grid_text_y(row1, height, 0.78f),
-               width, height, COL_TEXT, TEXT_ALIGN_LEFT, 0.78f);
+         grid_draw_text(text, tx, grid_text_y(row1, height, 0.72f),
+               width, height, COL_TEXT, TEXT_ALIGN_LEFT, 0.72f);
       }
       else if (!string_is_empty(search))
-         grid_draw_text(search, tx, grid_text_y(row1, height, 0.78f),
-               width, height, COL_TEXT, TEXT_ALIGN_LEFT, 0.78f);
+         grid_draw_text(search, tx, grid_text_y(row1, height, 0.72f),
+               width, height, COL_TEXT, TEXT_ALIGN_LEFT, 0.72f);
       else
          grid_draw_text("Search for games...", tx,
-               grid_text_y(row1, height, 0.78f),
-               width, height, COL_TEXT_DIM, TEXT_ALIGN_LEFT, 0.78f);
+               grid_text_y(row1, height, 0.72f),
+               width, height, COL_TEXT_DIM, TEXT_ALIGN_LEFT, 0.72f);
    }
 
    /* Clock */
    now_t  = time(NULL);
    tm_now = localtime(&now_t);
    if (tm_now && strftime(clock, sizeof(clock), "%H:%M", tm_now))
-      grid_draw_text_bold(clock, width - side, grid_text_y(row1, height, 0.85f),
-            width, height, COL_TEXT, TEXT_ALIGN_RIGHT, 0.85f);
+      grid_draw_text_bold(clock, width - side, grid_text_y(row1, height, 1.0f),
+            width, height, COL_TEXT, TEXT_ALIGN_RIGHT, 1.0f);
 
    /* L / R shoulder-button glyphs */
    {
@@ -1564,8 +1568,8 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
     * after L, last ends before R, equal gaps between. The pill around the
     * current one pads its text by `pad`. */
    {
-      float ph     = floorf(bar_h * 0.235f + 0.5f); /* pill height */
-      float pad    = ph * 0.62f;        /* text to pill edge */
+      float ph     = floorf(height * 0.040f + 0.5f); /* pill height */
+      float pad    = ph * 0.95f;        /* text to pill edge (reference) */
       float min_sp = height * 0.04f;    /* tightest gap before sliding */
       float xs[GRID_MAX_TABS];
       float ws[GRID_MAX_TABS];
@@ -1584,7 +1588,7 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
 
          ws[i] = grid_text_width_bold(grid_st.tabs[i].label, height, tab_scale);
          if (counts[i][0])
-            ws[i] += height * 0.012f
+            ws[i] += height * 0.028f
                    + grid_text_width_bold(counts[i], height, tab_scale);
          sum  += ws[i];
       }
@@ -1626,7 +1630,7 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
          if (counts[i][0])
             grid_draw_text_bold(counts[i],
                   tx + grid_text_width_bold(grid_st.tabs[i].label, height,
-                     tab_scale) + height * 0.012f,
+                     tab_scale) + height * 0.028f,
                   grid_text_y(row2, height, tab_scale), width, height,
                   i == cur ? 0x6a6b72ff : COL_TEXT_DIM, TEXT_ALIGN_LEFT,
                   tab_scale);
@@ -1742,7 +1746,7 @@ bool grid_home_frame(video_frame_info_t *video_info)
    /* Layout scales with window size: 5 portrait covers per row. */
    side     = width * 0.027f;
    gap      = width * 0.02f;
-   top_h    = floorf(height * 0.175f);
+   top_h    = floorf(height * 0.191f);
    bot_h    = height * 0.12f;
    bot_y    = height - bot_h;
    grid_top = top_h + height * 0.04f;
