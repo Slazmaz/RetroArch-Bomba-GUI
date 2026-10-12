@@ -47,18 +47,22 @@
 
 #define GRID_MAX_GAMES 1024
 
-/* Colours (RGBA) - Switch light theme, Joy-Con accents */
-#define COL_BG          0xebebebff
+/* Colours (RGBA) - carbon background, white bar, Joy-Con accents */
+#define COL_BG          0x262626ff /* fallback if the carbon texture fails */
 #define COL_TILE        0xffffffff
-#define COL_TEXT        0x2d2d2dff
+#define COL_TEXT        0x2d2d2dff /* on the white bar */
 #define COL_TEXT_DIM    0x7a7a7aff
+#define COL_TEXT_BG     0xecececff /* on the carbon background */
+#define COL_TEXT_BG_DIM 0x9a9a9aff
 #define COL_TEXT_LIGHT  0xffffffff
 #define COL_BAR         0xffffffff
 #define COL_DIVIDER     0xd2d2d2ff
 #define COL_CURSOR      0x00c3e3ff /* selection outline */
-#define COL_BLUE        0x0ab9e6ff /* Settings */
+#define COL_BTN_WHITE   0xffffffff /* Settings */
+#define COL_BTN_BORDER  0xc4c4c4ff /* outline so white reads as a button */
 #define COL_LIME        0x7ed321ff /* Continue */
 #define COL_RED         0xff3c28ff /* Quit */
+#define COL_ICON_BG     0xebebebff /* bar icon placeholder */
 
 typedef struct
 {
@@ -87,7 +91,11 @@ static const char *button_labels[BTN_COUNT] = {
 };
 
 static const uint32_t button_colors[BTN_COUNT] = {
-   COL_BLUE, COL_LIME, COL_RED
+   COL_BTN_WHITE, COL_LIME, COL_RED
+};
+
+static const uint32_t button_text_colors[BTN_COUNT] = {
+   COL_TEXT, COL_TEXT_LIGHT, COL_TEXT_LIGHT
 };
 
 enum grid_focus
@@ -110,6 +118,9 @@ static struct
    font_data_t *font;
    float font_height;   /* video height the font was sized for */
    uintptr_t disc;      /* white anti-aliased circle, for rounded shapes */
+   uintptr_t carbon;    /* screen-sized carbon fibre background */
+   unsigned carbon_w;
+   unsigned carbon_h;
    char scanned_dir[PATH_MAX_LENGTH];
 
    /* Running game, for the bar */
@@ -635,6 +646,56 @@ static void grid_create_disc(void)
    free(ti.pixels);
 }
 
+/* Carbon fibre weave at screen size: a checkerboard of thread bundles,
+ * alternating horizontal/vertical, each shaded like a rounded thread. */
+static void grid_create_carbon(unsigned width, unsigned height)
+{
+   struct texture_image ti;
+   unsigned x, y;
+   unsigned cell = height / 180;   /* 6px at 1080p */
+   const float pi = 3.14159265f;
+
+   if (grid_st.carbon)
+      video_driver_texture_unload(&grid_st.carbon);
+   grid_st.carbon   = 0;
+   grid_st.carbon_w = width;
+   grid_st.carbon_h = height;
+
+   if (cell < 3)
+      cell = 3;
+
+   ti.width         = width;
+   ti.height        = height;
+   ti.supports_rgba = video_driver_supports_rgba();
+   ti.pixels        = (uint32_t*)malloc(width * height * sizeof(uint32_t));
+   if (!ti.pixels)
+      return;
+
+   for (y = 0; y < height; y++)
+   {
+      unsigned cy = y / cell;
+      float    fy = (y % cell + 0.5f) / cell;
+
+      for (x = 0; x < width; x++)
+      {
+         unsigned cx = x / cell;
+         float    fx = (x % cell + 0.5f) / cell;
+         /* Horizontal bundles shade across y, vertical ones across x. */
+         bool horiz  = ((cx + cy) & 1) == 0;
+         float f     = horiz ? fy : fx;
+         float shade = sinf(f * pi);              /* 0 at edges, 1 centre */
+         float sheen = horiz ? 1.0f : 0.8f;       /* weave catches light */
+         uint32_t v  = (uint32_t)(24.0f + shade * 22.0f * sheen);
+
+         /* Grey: identical in RGBA and BGRA. */
+         ti.pixels[y * width + x] = 0xff000000 | (v << 16) | (v << 8) | v;
+      }
+   }
+
+   video_driver_texture_load(&ti, TEXTURE_FILTER_NEAREST, &grid_st.carbon);
+   free(ti.pixels);
+}
+
 /* Opaque rounded rectangle: three strips plus four corner circles. */
 static void grid_draw_rounded(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height,
@@ -874,7 +935,7 @@ static void grid_draw_bar(gfx_display_t *p_disp, void *userdata,
 
       grid_draw_rounded(p_disp, userdata, width, height,
             side, bar_y + pad, icon_size, icon_size,
-            icon_size * 0.08f, COL_BG);
+            icon_size * 0.08f, COL_ICON_BG);
 
       if (grid_st.icon)
       {
@@ -898,18 +959,29 @@ static void grid_draw_bar(gfx_display_t *p_disp, void *userdata,
    for (i = 0; i < count; i++)
    {
       float x  = btn_x + i * (btn_w + btn_gap);
-      float r  = btn_h / 2.0f; /* pill */
+      float r  = 0.0f; /* square corners */
 
       if (grid_st.focus == FOCUS_BAR && i == grid_st.button)
          grid_draw_cursor(p_disp, userdata, width, height,
                x, btn_y, btn_w, btn_h, r);
 
-      grid_draw_rounded(p_disp, userdata, width, height,
-            x, btn_y, btn_w, btn_h, r, button_colors[i]);
+      if (button_colors[i] == COL_BTN_WHITE)
+      {
+         /* White on the white bar: outline it. */
+         float b = height * 0.002f + 1.0f;
+         grid_draw_rounded(p_disp, userdata, width, height,
+               x, btn_y, btn_w, btn_h, r, COL_BTN_BORDER);
+         grid_draw_rounded(p_disp, userdata, width, height,
+               x + b, btn_y + b, btn_w - 2.0f * b, btn_h - 2.0f * b,
+               r, COL_BTN_WHITE);
+      }
+      else
+         grid_draw_rounded(p_disp, userdata, width, height,
+               x, btn_y, btn_w, btn_h, r, button_colors[i]);
 
       grid_draw_text(button_labels[i], x + btn_w / 2.0f,
             btn_y + btn_h / 2.0f + text_dy * 0.75f, width, height,
-            COL_TEXT_LIGHT, TEXT_ALIGN_CENTER, 0.72f);
+            button_text_colors[i], TEXT_ALIGN_CENTER, 0.72f);
    }
 }
 
@@ -977,19 +1049,31 @@ bool grid_home_frame(video_frame_info_t *video_info)
    }
 
    /* Background (opaque, also over a paused game) */
-   grid_set_color(color, COL_BG);
-   gfx_display_draw_quad(p_disp, userdata, width, height,
-         0, 0, width, height, width, height, color, NULL);
+   if (grid_st.carbon_w != width || grid_st.carbon_h != height)
+      grid_create_carbon(width, height);
+
+   if (grid_st.carbon)
+   {
+      grid_set_color(color, 0xffffffff);
+      gfx_display_draw_quad(p_disp, userdata, width, height,
+            0, 0, width, height, width, height, color, &grid_st.carbon);
+   }
+   else
+   {
+      grid_set_color(color, COL_BG);
+      gfx_display_draw_quad(p_disp, userdata, width, height,
+            0, 0, width, height, width, height, color, NULL);
+   }
 
    /* Header: title left, clock right */
    grid_draw_text("Games", left, height * 0.09f, width, height,
-         COL_TEXT, TEXT_ALIGN_LEFT, 1.4f);
+         COL_TEXT_BG, TEXT_ALIGN_LEFT, 1.4f);
 
    now_t  = time(NULL);
    tm_now = localtime(&now_t);
    if (tm_now && strftime(clock, sizeof(clock), "%H:%M", tm_now))
       grid_draw_text(clock, width - left, height * 0.09f, width, height,
-            COL_TEXT, TEXT_ALIGN_RIGHT, 1.0f);
+            COL_TEXT_BG, TEXT_ALIGN_RIGHT, 1.0f);
 
    if (grid_st.count == 0)
    {
@@ -999,7 +1083,7 @@ bool grid_home_frame(video_frame_info_t *video_info)
             ? "(File Browser directory not set)"
             : settings->paths.directory_menu_content);
       grid_draw_text(msg, width / 2.0f, height / 2.0f, width, height,
-            COL_TEXT_DIM, TEXT_ALIGN_CENTER, 1.0f);
+            COL_TEXT_BG_DIM, TEXT_ALIGN_CENTER, 1.0f);
    }
 
    for (i = grid_st.scroll_row * cols;
@@ -1054,7 +1138,7 @@ bool grid_home_frame(video_frame_info_t *video_info)
          grid_draw_marquee(p_disp, userdata, game->title,
                x - gap * 0.25f, y + tile + label_h * 0.65f,
                tile + gap * 0.5f, width, height,
-               COL_TEXT, 0.6f, TEXT_ALIGN_CENTER, game);
+               COL_TEXT_BG, 0.6f, TEXT_ALIGN_CENTER, game);
       else
       {
          char label[NAME_MAX_LENGTH];
@@ -1062,7 +1146,7 @@ bool grid_home_frame(video_frame_info_t *video_info)
                tile + gap * 0.5f, height, 0.6f);
          grid_draw_text(label, x + tile / 2.0f,
                y + tile + label_h * 0.65f, width, height,
-               COL_TEXT_DIM, TEXT_ALIGN_CENTER, 0.6f);
+               COL_TEXT_BG_DIM, TEXT_ALIGN_CENTER, 0.6f);
       }
    }
 
@@ -1106,6 +1190,11 @@ void grid_home_context_destroy(void)
    if (grid_st.disc)
       video_driver_texture_unload(&grid_st.disc);
    grid_st.disc = 0;
+
+   if (grid_st.carbon)
+      video_driver_texture_unload(&grid_st.carbon);
+   grid_st.carbon   = 0;
+   grid_st.carbon_w = grid_st.carbon_h = 0;
 
    if (grid_st.font)
       font_driver_free(grid_st.font);
