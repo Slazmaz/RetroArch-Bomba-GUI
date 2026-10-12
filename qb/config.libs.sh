@@ -632,12 +632,11 @@ fi
 
 if [ "$HAVE_STEAM" = 'yes' ]; then
    add_opt CORE_INFO_CACHE no
-   add_opt ONLINE_UPDATER no
-   add_opt UPDATE_CORES no
+   # RetroArchWrapper: keep the online/core updater so cores Steam doesn't
+   # ship as DLC (e.g. Dolphin) can be downloaded from the libretro
+   # buildbot. They install next to the Steam DLC cores.
    die : 'Notice: Steam build enabled, disabling:'
    die : '* Core info cache.'
-   die : '* Core updater.'
-   die : '* Online updater.'
 
    # Keep base directory relative to installation on Linux just like it is on Windows
    if [ "$OS" = "Linux" ]; then
