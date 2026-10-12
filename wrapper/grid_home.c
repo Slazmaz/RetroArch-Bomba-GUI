@@ -61,16 +61,16 @@
 #define GRID_COLS      5
 
 /* Colours (RGBA), dark theme */
-#define COL_BG          0x1c1d22ff
-#define COL_BAR         0x26272dff /* top and bottom bars */
-#define COL_DIVIDER     0x3a3b42ff
-#define COL_SEARCH      0x34353cff
-#define COL_TILE        0x2e2f36ff /* tile placeholder */
+#define COL_BG          0x0e0e0eff
+#define COL_BAR         0x181818ff /* top and bottom bars */
+#define COL_DIVIDER     0x252526ff
+#define COL_SEARCH      0x252526ff
+#define COL_TILE        0x1f1f20ff /* tile placeholder */
 #define COL_TEXT        0xecececff
-#define COL_TEXT_DIM    0x9a9aa2ff
-#define COL_TEXT_DARK   0x1c1d22ff /* on light pills */
+#define COL_TEXT_DIM    0x8c8c90ff
+#define COL_TEXT_DARK   0x181818ff /* on light pills and glyphs */
 #define COL_TAB_PILL    0xecececff
-#define COL_GLYPH       0x45464eff /* L/R and button glyph backgrounds */
+#define COL_GLYPH       0xe6e6e6ff /* L/R and button glyphs: light, dark letter */
 #define COL_CURSOR      0x00c3e3ff /* selection outline */
 #define COL_MENU_BTN    0x2fa4e7ff
 #define COL_RED         0xff3c28ff
@@ -873,7 +873,9 @@ static void grid_create_disc(void)
       }
    }
 
-   video_driver_texture_load(&ti, TEXTURE_FILTER_LINEAR, &grid_st.disc);
+   /* Mipmaps keep edges smooth when drawn much smaller than 64px
+    * (button glyphs, small corners). */
+   video_driver_texture_load(&ti, TEXTURE_FILTER_MIPMAP_LINEAR, &grid_st.disc);
    free(ti.pixels);
 }
 
@@ -1075,17 +1077,18 @@ static float grid_draw_hint(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height, float x, float cy,
       const char *glyph, const char *label, bool measure_only)
 {
-   float d      = height * 0.032f;
-   float gap    = height * 0.008f;
+   float d      = height * 0.034f;
+   float gap    = height * 0.01f;
    float scale  = 0.62f;
    float lw     = grid_text_width(label, height, scale);
 
    if (!measure_only)
    {
       grid_draw_rounded(p_disp, userdata, width, height,
-            x, cy - d / 2.0f, d, d, d / 2.0f, COL_GLYPH);
-      grid_draw_text(glyph, x + d / 2.0f, grid_text_y(cy, height, 0.5f),
-            width, height, COL_TEXT, TEXT_ALIGN_CENTER, 0.5f);
+            (float)(int)x, (float)(int)(cy - d / 2.0f), d, d, d / 2.0f,
+            COL_GLYPH);
+      grid_draw_text(glyph, x + d / 2.0f, grid_text_y(cy, height, 0.56f),
+            width, height, COL_TEXT_DARK, TEXT_ALIGN_CENTER, 0.56f);
       grid_draw_text(label, x + d + gap, grid_text_y(cy, height, scale),
             width, height, COL_TEXT, TEXT_ALIGN_LEFT, scale);
    }
@@ -1364,13 +1367,13 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
    grid_draw_rounded(p_disp, userdata, width, height,
          side, row2 - glyph / 2.0f, glyph, glyph, glyph * 0.25f, COL_GLYPH);
    grid_draw_text("L", side + glyph / 2.0f, grid_text_y(row2, height, 0.6f),
-         width, height, COL_TEXT, TEXT_ALIGN_CENTER, 0.6f);
+         width, height, COL_TEXT_DARK, TEXT_ALIGN_CENTER, 0.6f);
    grid_draw_rounded(p_disp, userdata, width, height,
          width - side - glyph, row2 - glyph / 2.0f, glyph, glyph,
          glyph * 0.25f, COL_GLYPH);
    grid_draw_text("R", width - side - glyph / 2.0f,
          grid_text_y(row2, height, 0.6f),
-         width, height, COL_TEXT, TEXT_ALIGN_CENTER, 0.6f);
+         width, height, COL_TEXT_DARK, TEXT_ALIGN_CENTER, 0.6f);
 
    /* Tabs, each centred in an equal slot */
    for (i = 0; i < grid_st.tab_count; i++)
