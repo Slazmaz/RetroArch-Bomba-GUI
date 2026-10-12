@@ -59,6 +59,7 @@
 #define GRID_MAX_GAMES 1024
 #define GRID_MAX_TABS  24
 #define GRID_COLS      5
+#define GRID_COVER_RADIUS 0.06f /* corner radius / tile width */
 
 /* Colours (RGBA), dark theme */
 #define COL_BG          0x0e0e0eff
@@ -139,8 +140,9 @@ static struct
    bool scanned;
    char scanned_dir[PATH_MAX_LENGTH];
 
-   font_data_t *font;
-   float font_height;       /* video height the font was sized for */
+   font_data_t *font;       /* Roboto Medium: body text */
+   font_data_t *font_bold;  /* Roboto Bold: tabs, buttons, glyphs */
+   float font_height;       /* video height the fonts were sized for */
    uintptr_t disc;          /* white anti-aliased circle, for rounded shapes */
    uintptr_t game_bg;       /* blurred snapshot of the paused game */
    unsigned game_bg_w;
@@ -890,47 +892,118 @@ static void grid_draw_rect(gfx_display_t *p_disp, void *userdata,
          width, height, color, NULL);
 }
 
-/* Opaque rounded rectangle: three strips plus four corner circles. */
+/* Opaque rounded rectangle: three strips plus four corner circles.
+ * All edges are snapped to whole pixels first so the pieces meet
+ * exactly (no seams). */
 static void grid_draw_rounded(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height,
       float x, float y, float w, float h, float r, uint32_t rgba)
 {
    float color[16];
+   int x0 = (int)floorf(x + 0.5f);
+   int y0 = (int)floorf(y + 0.5f);
+   int x1 = (int)floorf(x + w + 0.5f);
+   int y1 = (int)floorf(y + h + 0.5f);
+   int ri = (int)floorf(r + 0.5f);
+   int d;
 
-   if (r * 2.0f > w) r = w / 2.0f;
-   if (r * 2.0f > h) r = h / 2.0f;
+   if (ri * 2 > x1 - x0) ri = (x1 - x0) / 2;
+   if (ri * 2 > y1 - y0) ri = (y1 - y0) / 2;
+   d = ri * 2;
 
-   if (!grid_st.disc || r < 1.0f)
+   if (!grid_st.disc || ri < 1)
    {
-      grid_draw_rect(p_disp, userdata, width, height, x, y, w, h, rgba);
+      grid_draw_rect(p_disp, userdata, width, height,
+            x0, y0, x1 - x0, y1 - y0, rgba);
       return;
    }
 
    grid_set_color(color, rgba);
 
+   /* Centre column full height, side columns between the corners. */
    gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)(x + r), (int)y, (unsigned)(w - 2.0f * r), (unsigned)h,
+         x0 + ri, y0, (unsigned)(x1 - x0 - d), (unsigned)(y1 - y0),
          width, height, color, NULL);
    gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)x, (int)(y + r), (unsigned)r, (unsigned)(h - 2.0f * r),
+         x0, y0 + ri, (unsigned)ri, (unsigned)(y1 - y0 - d),
          width, height, color, NULL);
    gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)(x + w - r), (int)(y + r), (unsigned)r, (unsigned)(h - 2.0f * r),
+         x1 - ri, y0 + ri, (unsigned)ri, (unsigned)(y1 - y0 - d),
          width, height, color, NULL);
 
    gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)x, (int)y, (unsigned)(2.0f * r), (unsigned)(2.0f * r),
+         x0, y0, (unsigned)d, (unsigned)d,
          width, height, color, &grid_st.disc);
    gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)(x + w - 2.0f * r), (int)y, (unsigned)(2.0f * r), (unsigned)(2.0f * r),
+         x1 - d, y0, (unsigned)d, (unsigned)d,
          width, height, color, &grid_st.disc);
    gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)x, (int)(y + h - 2.0f * r), (unsigned)(2.0f * r), (unsigned)(2.0f * r),
+         x0, y1 - d, (unsigned)d, (unsigned)d,
          width, height, color, &grid_st.disc);
    gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)(x + w - 2.0f * r), (int)(y + h - 2.0f * r),
-         (unsigned)(2.0f * r), (unsigned)(2.0f * r),
+         x1 - d, y1 - d, (unsigned)d, (unsigned)d,
          width, height, color, &grid_st.disc);
+}
+
+/* Loads an image with its corners rounded in the alpha channel (radius as
+ * a fraction of the image width), so covers look rounded over any
+ * background. */
+static bool grid_load_rounded_texture(const char *path, uintptr_t *tex,
+      unsigned *w, unsigned *h, float radius_frac)
+{
+   struct texture_image ti;
+   unsigned x, y;
+   float r;
+
+   ti.width         = 0;
+   ti.height        = 0;
+   ti.pixels        = NULL;
+   ti.supports_rgba = video_driver_supports_rgba();
+
+   if (string_is_empty(path) || !image_texture_load(&ti, path))
+      return false;
+
+   r = ti.width * radius_frac;
+
+   /* Alpha is the top byte in both ARGB and ABGR layouts. Only pixels in
+    * the four corner squares can be affected. */
+   for (y = 0; y < ti.height; y++)
+   {
+      float cy = y + 0.5f;
+      float dy = cy < r ? r - cy
+               : cy > ti.height - r ? cy - (ti.height - r) : 0.0f;
+      if (dy <= 0.0f)
+         continue;
+
+      for (x = 0; x < ti.width; x++)
+      {
+         float cx = x + 0.5f;
+         float dx = cx < r ? r - cx
+                  : cx > ti.width - r ? cx - (ti.width - r) : 0.0f;
+         float cover;
+         uint32_t *p, a;
+
+         if (dx <= 0.0f)
+            continue;
+
+         /* Coverage of the rounded corner, anti-aliased over a pixel. */
+         cover = r - sqrtf(dx * dx + dy * dy) + 0.5f;
+         if (cover >= 1.0f)
+            continue;
+         if (cover < 0.0f)
+            cover = 0.0f;
+
+         p  = &ti.pixels[y * ti.width + x];
+         a  = (uint32_t)(((*p >> 24) & 0xff) * cover);
+         *p = (*p & 0x00ffffff) | (a << 24);
+      }
+   }
+
+   *w = ti.width;
+   *h = ti.height;
+   video_driver_texture_load(&ti, TEXTURE_FILTER_MIPMAP_LINEAR, tex);
+   image_texture_free(&ti);
+   return true;
 }
 
 /* Selection cursor: pulsing cyan outline with a gap, drawn behind an
@@ -952,37 +1025,71 @@ static void grid_draw_cursor(gfx_display_t *p_disp, void *userdata,
          x - gap, y - gap, w + 2.0f * gap, h + 2.0f * gap, r + gap, gap_color);
 }
 
-static void grid_draw_text(const char *text, float x, float y,
-      unsigned width, unsigned height, uint32_t color,
+static void grid_draw_text_font(font_data_t *font, const char *text,
+      float x, float y, unsigned width, unsigned height, uint32_t color,
       enum text_alignment align, float scale)
 {
-   if (!grid_st.font)
+   if (!font)
       return;
 
-   gfx_display_draw_text(grid_st.font, text, x, y, width, height,
+   gfx_display_draw_text(font, text, x, y, width, height,
          color, align, scale * (height / grid_st.font_height),
          false, 0.0f, false);
 }
 
-/* Baseline y that vertically centres text of the given scale on cy. */
+static void grid_draw_text(const char *text, float x, float y,
+      unsigned width, unsigned height, uint32_t color,
+      enum text_alignment align, float scale)
+{
+   grid_draw_text_font(grid_st.font, text, x, y, width, height,
+         color, align, scale);
+}
+
+static void grid_draw_text_bold(const char *text, float x, float y,
+      unsigned width, unsigned height, uint32_t color,
+      enum text_alignment align, float scale)
+{
+   grid_draw_text_font(grid_st.font_bold ? grid_st.font_bold : grid_st.font,
+         text, x, y, width, height, color, align, scale);
+}
+
+/* Baseline y that vertically centres capital letters of the given scale
+ * on cy (Roboto's cap height is ~0.71 em). */
 static float grid_text_y(float cy, unsigned height, float scale)
 {
-   return cy + (height / 32.0f) * scale * 0.36f;
+   return cy + (height / 32.0f) * scale * 0.355f;
+}
+
+static float grid_text_width_font(font_data_t *font, const char *text,
+      unsigned height, float scale)
+{
+   if (!font)
+      return 0.0f;
+   return font_driver_get_message_width(font, text, strlen(text),
+         scale * (height / grid_st.font_height));
 }
 
 static float grid_text_width(const char *text, unsigned height, float scale)
 {
-   if (!grid_st.font)
-      return 0.0f;
-   return font_driver_get_message_width(grid_st.font, text, strlen(text),
-         scale * (height / grid_st.font_height));
+   return grid_text_width_font(grid_st.font, text, height, scale);
+}
+
+static float grid_text_width_bold(const char *text, unsigned height, float scale)
+{
+   return grid_text_width_font(grid_st.font_bold ? grid_st.font_bold
+         : grid_st.font, text, height, scale);
+}
+
+static void grid_flush_font(font_data_t *font, unsigned width, unsigned height)
+{
+   if (font && font->renderer && font->renderer->flush)
+      font->renderer->flush(width, height, font->renderer_data);
 }
 
 static void grid_flush_text(unsigned width, unsigned height)
 {
-   if (grid_st.font && grid_st.font->renderer && grid_st.font->renderer->flush)
-      grid_st.font->renderer->flush(width, height,
-            grid_st.font->renderer_data);
+   grid_flush_font(grid_st.font, width, height);
+   grid_flush_font(grid_st.font_bold, width, height);
 }
 
 /* Draws text inside [x, x + w]. If it doesn't fit, it scrolls: pause,
@@ -1077,19 +1184,23 @@ static float grid_draw_hint(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height, float x, float cy,
       const char *glyph, const char *label, bool measure_only)
 {
-   float d      = height * 0.034f;
-   float gap    = height * 0.01f;
-   float scale  = 0.62f;
+   /* Circle a little taller than the label's capitals, bold letter. */
+   float scale  = 0.6f;
+   float d      = (float)(int)(height * 0.029f + 0.5f);
+   float gap    = height * 0.009f;
    float lw     = grid_text_width(label, height, scale);
 
    if (!measure_only)
    {
+      float gx = floorf(x + 0.5f);
+      float gy = floorf(cy - d / 2.0f + 0.5f);
+
       grid_draw_rounded(p_disp, userdata, width, height,
-            (float)(int)x, (float)(int)(cy - d / 2.0f), d, d, d / 2.0f,
-            COL_GLYPH);
-      grid_draw_text(glyph, x + d / 2.0f, grid_text_y(cy, height, 0.56f),
-            width, height, COL_TEXT_DARK, TEXT_ALIGN_CENTER, 0.56f);
-      grid_draw_text(label, x + d + gap, grid_text_y(cy, height, scale),
+            gx, gy, d, d, d / 2.0f, COL_GLYPH);
+      grid_draw_text_bold(glyph, gx + d / 2.0f,
+            grid_text_y(gy + d / 2.0f, height, 0.48f),
+            width, height, COL_TEXT_DARK, TEXT_ALIGN_CENTER, 0.48f);
+      grid_draw_text(label, gx + d + gap, grid_text_y(cy, height, scale),
             width, height, COL_TEXT, TEXT_ALIGN_LEFT, scale);
    }
 
@@ -1306,12 +1417,10 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
    float row2         = height * 0.145f;
    float pill_h       = height * 0.058f;
    float pill_w       = width * 0.36f;
-   float glyph        = height * 0.04f;
-   float tabs_x0      = side + glyph + height * 0.03f;
-   float tabs_x1      = width - side - glyph - height * 0.03f;
-   float slot         = grid_st.tab_count
-                      ? (tabs_x1 - tabs_x0) / grid_st.tab_count : 0.0f;
-   float tab_scale    = 0.58f;
+   float glyph        = (float)(int)(height * 0.034f + 0.5f);
+   float tabs_x0      = side + glyph + height * 0.025f;
+   float tabs_x1      = width - side - glyph - height * 0.025f;
+   float tab_scale    = 0.5f;
 
    grid_draw_rect(p_disp, userdata, width, height,
          0, 0, width, bar_h, COL_BAR);
@@ -1322,22 +1431,31 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
    {
       float x    = side;
       float y    = row1 - pill_h / 2.0f;
-      float ring = pill_h * 0.36f;
-      float rx   = x + pill_h * 0.45f;
-      float ry   = row1 - ring / 2.0f - pill_h * 0.04f;
+      float ring = floorf(pill_h * 0.34f + 0.5f);
+      float th   = floorf(ring * 0.16f + 0.5f) + 1.0f; /* stroke */
+      float rx   = floorf(x + pill_h * 0.42f + 0.5f);
+      float ry   = floorf(row1 - ring / 2.0f - ring * 0.12f + 0.5f);
       float tx   = rx + ring + pill_h * 0.3f;
       char text[160];
+      unsigned k;
 
       grid_draw_rounded(p_disp, userdata, width, height,
             x, y, pill_w, pill_h, pill_h / 2.0f, COL_SEARCH);
+
+      /* Magnifier: ring, then a short diagonal handle made of dots
+       * (quads can't be rotated). */
       grid_draw_rounded(p_disp, userdata, width, height,
-            rx, ry, ring, ring, ring / 2.0f, COL_TEXT_DIM);
+            rx, ry, ring, ring, ring / 2.0f, COL_TEXT);
       grid_draw_rounded(p_disp, userdata, width, height,
-            rx + ring * 0.2f, ry + ring * 0.2f, ring * 0.6f, ring * 0.6f,
-            ring * 0.3f, COL_SEARCH);
-      grid_draw_rect(p_disp, userdata, width, height,
-            rx + ring * 0.82f, ry + ring * 0.82f,
-            ring * 0.32f, ring * 0.32f, COL_TEXT_DIM);
+            rx + th, ry + th, ring - 2.0f * th, ring - 2.0f * th,
+            (ring - 2.0f * th) / 2.0f, COL_SEARCH);
+      for (k = 0; k < 4; k++)
+      {
+         float o = ring * 0.8f + k * th * 0.55f;
+         grid_draw_rounded(p_disp, userdata, width, height,
+               rx + o - th / 2.0f, ry + o - th / 2.0f, th * 1.2f, th * 1.2f,
+               th * 0.6f, COL_TEXT);
+      }
 
       if (typing)
       {
@@ -1363,53 +1481,76 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
       grid_draw_text(clock, width - side, grid_text_y(row1, height, 0.8f),
             width, height, COL_TEXT, TEXT_ALIGN_RIGHT, 0.8f);
 
-   /* L / R glyphs */
-   grid_draw_rounded(p_disp, userdata, width, height,
-         side, row2 - glyph / 2.0f, glyph, glyph, glyph * 0.25f, COL_GLYPH);
-   grid_draw_text("L", side + glyph / 2.0f, grid_text_y(row2, height, 0.6f),
-         width, height, COL_TEXT_DARK, TEXT_ALIGN_CENTER, 0.6f);
-   grid_draw_rounded(p_disp, userdata, width, height,
-         width - side - glyph, row2 - glyph / 2.0f, glyph, glyph,
-         glyph * 0.25f, COL_GLYPH);
-   grid_draw_text("R", width - side - glyph / 2.0f,
-         grid_text_y(row2, height, 0.6f),
-         width, height, COL_TEXT_DARK, TEXT_ALIGN_CENTER, 0.6f);
-
-   /* Tabs, each centred in an equal slot */
-   for (i = 0; i < grid_st.tab_count; i++)
+   /* L / R glyphs: small light rounded squares, bold dark letter */
    {
-      const grid_tab_t *tab = &grid_st.tabs[i];
-      float cx              = tabs_x0 + slot * (i + 0.5f);
-      char count[16];
-      float lw, cw = 0.0f, total;
+      float gy = floorf(row2 - glyph / 2.0f + 0.5f);
+      grid_draw_rounded(p_disp, userdata, width, height,
+            side, gy, glyph, glyph, glyph * 0.22f, COL_GLYPH);
+      grid_draw_text_bold("L", side + glyph / 2.0f,
+            grid_text_y(gy + glyph / 2.0f, height, 0.5f),
+            width, height, COL_TEXT_DARK, TEXT_ALIGN_CENTER, 0.5f);
+      grid_draw_rounded(p_disp, userdata, width, height,
+            width - side - glyph, gy, glyph, glyph, glyph * 0.22f, COL_GLYPH);
+      grid_draw_text_bold("R", width - side - glyph / 2.0f,
+            grid_text_y(gy + glyph / 2.0f, height, 0.5f),
+            width, height, COL_TEXT_DARK, TEXT_ALIGN_CENTER, 0.5f);
+   }
 
-      count[0] = '\0';
-      if (tab->type == TAB_ALL)
-         snprintf(count, sizeof(count), "%u", (unsigned)grid_st.count);
+   /* Tabs, packed left to right with even spacing. The pill around the
+    * current one has the same padding as the spacing, so it hugs it. */
+   {
+      float pad    = height * 0.022f;   /* text to pill edge */
+      float space  = height * 0.06f;    /* between tab texts */
+      float ph     = height * 0.044f;
+      float xs[GRID_MAX_TABS];
+      float ws[GRID_MAX_TABS];
+      char  counts[GRID_MAX_TABS][16];
+      float x      = tabs_x0 + pad;
+      float shift  = 0.0f;
 
-      lw    = grid_text_width(tab->label, height, tab_scale);
-      if (count[0])
-         cw = height * 0.012f + grid_text_width(count, height, tab_scale);
-      total = lw + cw;
-
-      if (i == cur)
+      for (i = 0; i < grid_st.tab_count; i++)
       {
-         float ph = height * 0.042f;
-         float pw = total + height * 0.04f;
-         grid_draw_rounded(p_disp, userdata, width, height,
-               cx - pw / 2.0f, row2 - ph / 2.0f, pw, ph, ph / 2.0f,
-               COL_TAB_PILL);
+         counts[i][0] = '\0';
+         if (grid_st.tabs[i].type == TAB_ALL)
+            snprintf(counts[i], sizeof(counts[i]), "%u",
+                  (unsigned)grid_st.count);
+
+         ws[i] = grid_text_width_bold(grid_st.tabs[i].label, height, tab_scale);
+         if (counts[i][0])
+            ws[i] += height * 0.012f
+                   + grid_text_width_bold(counts[i], height, tab_scale);
+         xs[i] = x;
+         x    += ws[i] + space;
       }
 
-      grid_draw_text(tab->label, cx - total / 2.0f,
-            grid_text_y(row2, height, tab_scale), width, height,
-            i == cur ? COL_TEXT_DARK : COL_TEXT, TEXT_ALIGN_LEFT, tab_scale);
+      /* Too many tabs to fit: slide so the current one is visible. */
+      if (grid_st.tab_count && xs[cur] + ws[cur] + pad > tabs_x1)
+         shift = xs[cur] + ws[cur] + pad - tabs_x1;
 
-      if (count[0])
-         grid_draw_text(count, cx - total / 2.0f + lw + height * 0.012f,
+      for (i = 0; i < grid_st.tab_count; i++)
+      {
+         float tx = xs[i] - shift;
+
+         if (tx - pad < tabs_x0 - 1.0f || tx + ws[i] + pad > tabs_x1 + 1.0f)
+            continue;
+
+         if (i == cur)
+            grid_draw_rounded(p_disp, userdata, width, height,
+                  tx - pad, row2 - ph / 2.0f, ws[i] + 2.0f * pad, ph,
+                  ph / 2.0f, COL_TAB_PILL);
+
+         grid_draw_text_bold(grid_st.tabs[i].label, tx,
                grid_text_y(row2, height, tab_scale), width, height,
-               i == cur ? 0x6a6b72ff : COL_TEXT_DIM, TEXT_ALIGN_LEFT,
-               tab_scale);
+               i == cur ? COL_TEXT_DARK : COL_TEXT, TEXT_ALIGN_LEFT, tab_scale);
+
+         if (counts[i][0])
+            grid_draw_text_bold(counts[i],
+                  tx + grid_text_width_bold(grid_st.tabs[i].label, height,
+                     tab_scale) + height * 0.012f,
+                  grid_text_y(row2, height, tab_scale), width, height,
+                  i == cur ? 0x6a6b72ff : COL_TEXT_DIM, TEXT_ALIGN_LEFT,
+                  tab_scale);
+      }
    }
 }
 
@@ -1430,10 +1571,11 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
    float hints_w, hx;
    const char *a_label;
 
+   /* Down to the last pixel row, so nothing peeks out underneath. */
    grid_draw_rect(p_disp, userdata, width, height,
-         0, bar_y, width, bar_h, COL_BAR);
+         0, floorf(bar_y), width, height - floorf(bar_y), COL_BAR);
    grid_draw_rect(p_disp, userdata, width, height,
-         0, bar_y, width, height * 0.002f + 1.0f, COL_DIVIDER);
+         0, floorf(bar_y), width, height * 0.002f + 1.0f, COL_DIVIDER);
 
    for (i = 0; i < count; i++)
    {
@@ -1457,14 +1599,14 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
             grid_draw_rect(p_disp, userdata, width, height,
                   lx, cy - btn_h * 0.14f + k * btn_h * 0.14f - lh / 2.0f,
                   lw, lh, COL_TEXT);
-         grid_draw_text(labels[i], lx + lw + btn_h * 0.25f,
-               grid_text_y(cy, height, 0.68f), width, height,
-               COL_TEXT, TEXT_ALIGN_LEFT, 0.68f);
+         grid_draw_text_bold(labels[i], lx + lw + btn_h * 0.25f,
+               grid_text_y(cy, height, 0.62f), width, height,
+               COL_TEXT, TEXT_ALIGN_LEFT, 0.62f);
       }
       else
-         grid_draw_text(labels[i], x + btn_w / 2.0f,
-               grid_text_y(cy, height, 0.68f), width, height,
-               COL_TEXT, TEXT_ALIGN_CENTER, 0.68f);
+         grid_draw_text_bold(labels[i], x + btn_w / 2.0f,
+               grid_text_y(cy, height, 0.62f), width, height,
+               COL_TEXT, TEXT_ALIGN_CENTER, 0.62f);
 
       x += btn_w + btn_gap;
    }
@@ -1567,7 +1709,7 @@ bool grid_home_frame(video_frame_info_t *video_info)
    grid_top = top_h + height * 0.04f;
    tile     = (width - 2.0f * side - (GRID_COLS - 1) * gap) / GRID_COLS;
    art_h    = tile * 1.5f;
-   radius   = tile * 0.045f;
+   radius   = tile * GRID_COVER_RADIUS;
    row_h    = art_h + gap;
 
    /* Selected row slides to the top of the grid area. */
@@ -1611,9 +1753,10 @@ bool grid_home_frame(video_frame_info_t *video_info)
       if (!game->art_tried)
       {
          game->art_tried = true;
+         /* Same corner radius as the tile (radius / tile width). */
          if (!string_is_empty(game->art_path))
-            gfx_display_reset_icon_texture(game->art_path, &game->art,
-                  TEXTURE_FILTER_MIPMAP_LINEAR, &game->art_w, &game->art_h);
+            grid_load_rounded_texture(game->art_path, &game->art,
+                  &game->art_w, &game->art_h, GRID_COVER_RADIUS);
       }
 
       if (selected)
@@ -1692,6 +1835,17 @@ void grid_home_context_reset(bool is_threaded)
          fontpath, height / 32.0f, is_threaded);
    grid_st.font_height = (float)height;
 
+   /* Bold variant; without it bold text falls back to the main font. */
+   {
+      char app_dir[PATH_MAX_LENGTH];
+      fill_pathname_application_dir(app_dir, sizeof(app_dir));
+      fill_pathname_join_special(fontpath, app_dir,
+            "wrapper/fonts/Roboto-Bold.ttf", sizeof(fontpath));
+   }
+   if (path_is_valid(fontpath))
+      grid_st.font_bold = gfx_display_font_file(disp_get_ptr(),
+            fontpath, height / 32.0f, is_threaded);
+
    grid_create_disc();
 }
 
@@ -1707,4 +1861,8 @@ void grid_home_context_destroy(void)
    if (grid_st.font)
       font_driver_free(grid_st.font);
    grid_st.font = NULL;
+
+   if (grid_st.font_bold)
+      font_driver_free(grid_st.font_bold);
+   grid_st.font_bold = NULL;
 }
