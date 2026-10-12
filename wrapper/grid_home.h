@@ -16,6 +16,9 @@ bool grid_home_frame(video_frame_info_t *video_info);
 /* Handles a menu action. Returns true if consumed. */
 bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth);
 
+/* Call when the menu opens or closes. */
+void grid_home_toggle(bool menu_on);
+
 void grid_home_context_reset(bool is_threaded);
 void grid_home_context_destroy(void);
 

@@ -9480,6 +9480,8 @@ static void xmb_toggle(void *userdata, bool menu_on)
    if (!xmb)
       return;
 
+   grid_home_toggle(menu_on);
+
    /* Reset */
    xmb->alpha_list = 1.0f;
 
