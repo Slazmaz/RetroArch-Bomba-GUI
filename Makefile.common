@@ -2721,7 +2721,7 @@ endif
 ### RetroArchWrapper additions
 OBJ += wrapper/wrapper_notify.o
 ifeq ($(HAVE_XMB), 1)
-   OBJ += wrapper/grid_home.o wrapper/grid_meta.o
+   OBJ += wrapper/grid_home.o wrapper/grid_meta.o wrapper/grid_cover.o
 endif
 
 ### Shared rich presence code for Discord and Steam

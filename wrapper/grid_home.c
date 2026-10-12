@@ -31,6 +31,7 @@
 
 #include "grid_home.h"
 #include "grid_meta.h"
+#include "grid_cover.h"
 
 #include "../configuration.h"
 #include "../core_info.h"
@@ -76,6 +77,7 @@ typedef struct
    unsigned art_w;
    unsigned art_h;
    bool art_tried;
+   bool art_is_cover;                 /* portrait cover: fill the tile */
 } grid_game_t;
 
 enum grid_button
@@ -221,16 +223,19 @@ static void grid_sanitize_thumb_name(char *s)
 }
 
 /* Title and RetroAchievements icon for a ROM, falling back to the file
- * name. Returns the icon path in icon (empty if none). */
-static void grid_resolve_title(const char *path, char *title, size_t title_len,
-      char *icon, size_t icon_len)
+ * name. Returns the icon path in icon (empty if none) and the lookup
+ * state (PENDING while RetroAchievements hasn't answered yet). */
+static enum grid_meta_state grid_resolve_title(const char *path,
+      char *title, size_t title_len, char *icon, size_t icon_len)
 {
    char ra_title[NAME_MAX_LENGTH];
+   enum grid_meta_state state;
 
    ra_title[0] = icon[0] = '\0';
+   state       = grid_meta_get(path, ra_title, sizeof(ra_title),
+         icon, icon_len);
 
-   if (grid_meta_get(path, ra_title, sizeof(ra_title), icon, icon_len)
-         == GRID_META_FOUND && !string_is_empty(ra_title))
+   if (state == GRID_META_FOUND && !string_is_empty(ra_title))
       strlcpy(title, grid_skip_ra_tags(ra_title), title_len);
    else
    {
@@ -238,6 +243,8 @@ static void grid_resolve_title(const char *path, char *title, size_t title_len,
       path_remove_extension(title);
       grid_clean_title(title);
    }
+
+   return state;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -293,17 +300,25 @@ static void grid_find_art(grid_game_t *game, const core_info_t *core,
    game->boxart_path[0] = '\0';
 }
 
-/* Fills title/art from RetroAchievements when known, otherwise from the
- * file name and libretro boxart. */
+/* Fills title/art. Art preference: SteamGridDB cover, RetroAchievements
+ * icon, libretro boxart. The cover is looked up by the resolved title, so
+ * only once RetroAchievements has answered. */
 static void grid_apply_meta(grid_game_t *game)
 {
    char icon[PATH_MAX_LENGTH];
+   char cover[PATH_MAX_LENGTH];
    const char *art;
 
-   grid_resolve_title(game->path, game->title, sizeof(game->title),
-         icon, sizeof(icon));
+   cover[0] = '\0';
 
-   art = !string_is_empty(icon) ? icon : game->boxart_path;
+   if (grid_resolve_title(game->path, game->title, sizeof(game->title),
+            icon, sizeof(icon)) != GRID_META_PENDING)
+      grid_cover_get(game->title, cover, sizeof(cover));
+
+   game->art_is_cover = !string_is_empty(cover);
+   art = game->art_is_cover        ? cover
+       : !string_is_empty(icon)    ? icon
+       : game->boxart_path;
 
    if (!string_is_equal(art, game->art_path))
    {
@@ -1208,7 +1223,7 @@ bool grid_home_frame(video_frame_info_t *video_info)
    size_t i;
    size_t rows_visible;
    unsigned cols;
-   float tile, tile_h, gap, label_h, top, left, radius, bar_h, bar_y;
+   float tile, art_h, tile_h, gap, label_h, top, left, radius, bar_h, bar_y;
    char clock[16];
    time_t now_t;
    struct tm *tm_now;
@@ -1227,8 +1242,9 @@ bool grid_home_frame(video_frame_info_t *video_info)
                settings->paths.directory_menu_content))
       grid_scan();
 
-   /* RetroAchievements lookups finishing in the background. */
-   if (grid_meta_poll())
+   /* RetroAchievements / SteamGridDB lookups finishing in the background.
+    * (Both polled every frame; | not || so neither is skipped.) */
+   if (grid_meta_poll() | grid_cover_poll())
       for (i = 0; i < grid_st.count; i++)
          grid_apply_meta(&grid_st.games[i]);
 
@@ -1240,10 +1256,11 @@ bool grid_home_frame(video_frame_info_t *video_info)
    bar_h   = height * 0.11f;
    bar_y   = height - bar_h;
    gap     = height * 0.03f;
-   tile    = height * 0.1333f;       /* 144px at 1080p */
-   radius  = tile * 0.06f;
+   tile    = height * 0.18f;         /* tile width: 194px at 1080p */
+   art_h   = tile * 1.5f;            /* portrait 2:3, like SteamGridDB covers */
+   radius  = tile * 0.05f;
    label_h = height * 0.045f;
-   tile_h  = tile + label_h;
+   tile_h  = art_h + label_h;
    top     = height * 0.15f;
 
    cols = (unsigned)((width - gap) / (tile + gap));
@@ -1312,17 +1329,18 @@ bool grid_home_frame(video_frame_info_t *video_info)
 
       if (selected)
          grid_draw_cursor(p_disp, userdata, width, height,
-               x, y, tile, tile, radius);
+               x, y, tile, art_h, radius);
 
       grid_draw_rounded(p_disp, userdata, width, height,
-            x, y, tile, tile, radius, COL_TILE);
+            x, y, tile, art_h, radius, COL_TILE);
 
+      /* Covers fill the tile; square icons sit centred in it. */
       if (game->art && game->art_w && game->art_h)
          grid_draw_image(p_disp, userdata, width, height,
-               x, y, tile, tile, &game->art, game->art_w, game->art_h);
+               x, y, tile, art_h, &game->art, game->art_w, game->art_h);
       else
          grid_draw_text(game->system, x + tile / 2.0f,
-               y + tile / 2.0f + height * 0.012f, width, height,
+               y + art_h / 2.0f + height * 0.012f, width, height,
                COL_TEXT_DIM, TEXT_ALIGN_CENTER, 1.0f);
 
       /* Running game: lime badge in the corner. */
@@ -1340,7 +1358,7 @@ bool grid_home_frame(video_frame_info_t *video_info)
       if (selected)
          /* Selected: scroll names that don't fit. */
          grid_draw_marquee(p_disp, userdata, game->title,
-               x - gap * 0.25f, y + tile + label_h * 0.65f,
+               x - gap * 0.25f, y + art_h + label_h * 0.65f,
                tile + gap * 0.5f, width, height,
                COL_TEXT_BG, 0.6f, TEXT_ALIGN_CENTER, game);
       else
@@ -1349,7 +1367,7 @@ bool grid_home_frame(video_frame_info_t *video_info)
          grid_fit_text(label, sizeof(label), game->title,
                tile + gap * 0.5f, height, 0.6f);
          grid_draw_text(label, x + tile / 2.0f,
-               y + tile + label_h * 0.65f, width, height,
+               y + art_h + label_h * 0.65f, width, height,
                COL_TEXT_BG_DIM, TEXT_ALIGN_CENTER, 0.6f);
       }
    }
