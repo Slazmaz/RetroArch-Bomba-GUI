@@ -1276,10 +1276,11 @@ static float grid_draw_hint(gfx_display_t *p_disp, void *userdata,
                COL_TEXT_DARK);
       }
       else
-         /* Letter cap height ~54% of the circle, as in the reference. */
+         /* Letter cap height ~45% of the circle, so letters have the same
+          * visual size as the '+'. */
          grid_draw_char_centered(glyph[0], gx + d / 2.0f, gy + d / 2.0f,
                width, height, COL_TEXT_DARK,
-               d * 0.54f / (height / 32.0f) / GRID_FONT_CAP);
+               d * 0.45f / (height / 32.0f) / GRID_FONT_CAP);
 
       grid_draw_text(label, gx + d + gap, grid_text_y(cy, height, scale),
             width, height, COL_TEXT, TEXT_ALIGN_LEFT, scale);
@@ -1500,7 +1501,6 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
    float glyph        = floorf(REF(17) + 0.5f);
    float glyph_w      = floorf(REF(23) + 0.5f);
    float tabs_x0      = side + glyph_w + REF(14); /* first pill edge */
-   float tabs_x1      = width - side - glyph_w - REF(14);
    float tab_scale    = CAP(6);
 
    grid_draw_rect(p_disp, userdata, width, height,
@@ -1580,18 +1580,22 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
             (unsigned)glyph_w, (unsigned)glyph);
    }
 
-   /* Tabs packed left to right as in the reference: the pill starts 14px
-    * after L, text is padded 16px inside it, and consecutive tab texts
-    * are 50px apart. Count follows its label 9.5px later. */
+   /* Tabs spread across the full row: the first pill starts 14px after
+    * L and the last label ends 25px before R (as RACING does in the
+    * reference); the space between is shared evenly, never less than the
+    * reference's 50px. Text is padded 16px inside the pill and the count
+    * follows its label 9.5px later. */
    {
       float ph     = floorf(REF(17) + 0.5f); /* pill height = glyph height */
       float pad    = REF(16);
       float space  = REF(50);
       float cgap   = REF(9.5);
+      float last_x = width - side - glyph_w - REF(25); /* last text end */
       float xs[GRID_MAX_TABS];
       float ws[GRID_MAX_TABS];
       char  counts[GRID_MAX_TABS][16];
       float x      = tabs_x0 + pad;
+      float sum    = 0.0f;
       float shift  = 0.0f;
 
       for (i = 0; i < grid_st.tab_count; i++)
@@ -1604,6 +1608,15 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
          ws[i] = grid_text_width_bold(grid_st.tabs[i].label, height, tab_scale);
          if (counts[i][0])
             ws[i] += cgap + grid_text_width_bold(counts[i], height, tab_scale);
+         sum  += ws[i];
+      }
+
+      if (grid_st.tab_count > 1)
+      {
+         float even = (last_x - (tabs_x0 + pad) - sum)
+                    / (grid_st.tab_count - 1);
+         if (even > space)
+            space = even;
       }
 
       for (i = 0; i < grid_st.tab_count; i++)
@@ -1612,15 +1625,17 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
          x    += ws[i] + space;
       }
 
-      /* Too many tabs to fit: slide so the current one is visible. */
-      if (grid_st.tab_count && xs[cur] + ws[cur] + pad > tabs_x1)
-         shift = xs[cur] + ws[cur] + pad - tabs_x1;
+      /* Too many tabs to fit: slide so the current one is visible. Limits
+       * are on the label text; a pill around the last label still clears
+       * R (25px gap > 16px padding). */
+      if (grid_st.tab_count && xs[cur] + ws[cur] > last_x)
+         shift = xs[cur] + ws[cur] - last_x;
 
       for (i = 0; i < grid_st.tab_count; i++)
       {
          float tx = xs[i] - shift;
 
-         if (tx - pad < tabs_x0 - 1.0f || tx + ws[i] + pad > tabs_x1 + 1.0f)
+         if (tx - pad < tabs_x0 - 1.0f || tx + ws[i] > last_x + 1.0f)
             continue;
 
          if (i == cur)
