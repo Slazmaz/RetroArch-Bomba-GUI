@@ -1,17 +1,23 @@
-/* RetroArchWrapper: Switch-style home screen.
+/* RetroArchWrapper: console-style home screen (dark theme).
  *
- * Replaces XMB's main menu and Quick Menu with one screen: a grid of the
- * games in the File Browser start directory (settings:
- * rgui_browser_directory) above a white bottom bar. While a game runs the
- * bar shows its icon and title plus Settings / Continue / Quit, and the
- * grid can switch to another game.
+ * Replaces XMB's main menu and Quick Menu with one screen:
  *
- * Art and titles come from RetroAchievements (grid_meta.c), falling back to
- * libretro boxart in the thumbnails directory and the file name.
+ *   [ Search for games...      ]                         16:24
+ *   [L]  ALL GAMES 5   RECENT   GBA   SNES   NES   HACKS  [R]
+ *   +-----+ +-----+ +-----+ +-----+ +-----+
+ *   |cover| |cover| |cover| |cover| |cover|   portrait covers
+ *   +-----+ +-----+ +-----+ +-----+ +-----+
+ *   [= Menu] [Quit]  Game title          (X) Search (A) Play (B) Back
  *
- * Controls: D-pad moves (down from the last row reaches the bar), A
- * activates, B resumes the running game, Start opens Settings (XMB).
- * Back at XMB's top level returns here.
+ * Games are the files in the File Browser start directory (settings:
+ * rgui_browser_directory) that an installed core supports. Titles and
+ * icons come from RetroAchievements (grid_meta.c), covers from SteamGridDB
+ * (grid_cover.c), falling back to libretro boxart and the file name.
+ *
+ * Controls: D-pad moves (down from the last row reaches the bottom bar),
+ * L/R switch tabs, A plays/continues, B resumes the running game (or
+ * clears the search), X searches, Start opens Settings (XMB). Back at
+ * XMB's top level returns here.
  */
 
 #include <stdlib.h>
@@ -35,69 +41,75 @@
 
 #include "../configuration.h"
 #include "../core_info.h"
+#include "../defaults.h"
 #include "../file_path_special.h"
+#include "../playlist.h"
 #include "../runloop.h"
 #include "../content.h"
 #include "../tasks/task_content.h"
 #include "../command.h"
 #include "../paths.h"
+#include "../input/input_driver.h"
 #include "../menu/menu_driver.h"
+#include "../menu/menu_input.h"
 #include "../gfx/gfx_display.h"
 #include "../gfx/video_driver.h"
 #include "../gfx/font_driver.h"
 
 #define GRID_MAX_GAMES 1024
+#define GRID_MAX_TABS  24
+#define GRID_COLS      5
 
-/* Colours (RGBA) - gradient background, white bar, Joy-Con accents */
-#define COL_BG          0x0e0f16ff /* base under the moving glows */
-#define COL_TILE        0xffffffff
-#define COL_TEXT        0x2d2d2dff /* on the white bar */
-#define COL_TEXT_DIM    0x7a7a7aff
-#define COL_TEXT_BG     0xecececff /* on the carbon background */
-#define COL_TEXT_BG_DIM 0x9a9a9aff
-#define COL_TEXT_LIGHT  0xffffffff
-#define COL_BAR         0xffffffff
-#define COL_DIVIDER     0xd2d2d2ff
+/* Colours (RGBA), dark theme */
+#define COL_BG          0x1c1d22ff
+#define COL_BAR         0x26272dff /* top and bottom bars */
+#define COL_DIVIDER     0x3a3b42ff
+#define COL_SEARCH      0x34353cff
+#define COL_TILE        0x2e2f36ff /* tile placeholder */
+#define COL_TEXT        0xecececff
+#define COL_TEXT_DIM    0x9a9aa2ff
+#define COL_TEXT_DARK   0x1c1d22ff /* on light pills */
+#define COL_TAB_PILL    0xecececff
+#define COL_GLYPH       0x45464eff /* L/R and button glyph backgrounds */
 #define COL_CURSOR      0x00c3e3ff /* selection outline */
-#define COL_BTN_WHITE   0xffffffff /* Settings */
-#define COL_BTN_BORDER  0xc4c4c4ff /* outline so white reads as a button */
-#define COL_LIME        0x7ed321ff /* Continue */
-#define COL_RED         0xff3c28ff /* Quit */
-#define COL_ICON_BG     0xebebebff /* bar icon placeholder */
+#define COL_MENU_BTN    0x2fa4e7ff
+#define COL_RED         0xff3c28ff
+#define COL_LIME        0x7ed321ff /* running-game badge */
 
 typedef struct
 {
    char path[PATH_MAX_LENGTH];
    char core_path[PATH_MAX_LENGTH];
    char title[NAME_MAX_LENGTH];
-   char system[16];
+   char system[16];                   /* tab label, e.g. "SNES" */
    char boxart_path[PATH_MAX_LENGTH]; /* libretro-thumbnails fallback */
    char art_path[PATH_MAX_LENGTH];    /* what is shown */
    uintptr_t art;
    unsigned art_w;
    unsigned art_h;
    bool art_tried;
-   bool art_is_cover;                 /* portrait cover: fill the tile */
+   bool is_hack;                      /* RetroAchievements "~Hack~" */
 } grid_game_t;
+
+enum grid_tab_type
+{
+   TAB_ALL = 0,
+   TAB_RECENT,
+   TAB_SYSTEM,
+   TAB_HACKS
+};
+
+typedef struct
+{
+   enum grid_tab_type type;
+   char label[32];
+} grid_tab_t;
 
 enum grid_button
 {
-   BTN_SETTINGS = 0,
-   BTN_CONTINUE,
+   BTN_MENU = 0,
    BTN_QUIT,
    BTN_COUNT
-};
-
-static const char *button_labels[BTN_COUNT] = {
-   "Settings", "Continue", "Quit"
-};
-
-static const uint32_t button_colors[BTN_COUNT] = {
-   COL_BTN_WHITE, COL_LIME, COL_RED
-};
-
-static const uint32_t button_text_colors[BTN_COUNT] = {
-   COL_TEXT, COL_TEXT_LIGHT, COL_TEXT_LIGHT
 };
 
 enum grid_focus
@@ -110,27 +122,30 @@ static struct
 {
    grid_game_t *games;
    size_t count;
-   size_t selection;
-   size_t scroll_row;
-   unsigned cols;
+
+   /* Current tab + search, as a list of indices into games */
+   grid_tab_t tabs[GRID_MAX_TABS];
+   unsigned tab_count;
+   char tab_label[32];      /* current tab, kept across rebuilds */
+   size_t *view;
+   size_t view_count;
+   size_t selection;        /* index into view */
+   float scroll_y;          /* animated grid scroll, pixels */
+   char search[128];        /* applied search text */
+
    enum grid_focus focus;
-   unsigned button;     /* selected bar button */
-   bool xmb;            /* Settings chosen: show XMB until Back/close */
+   unsigned button;         /* selected bottom-bar button */
+   bool xmb;                /* Menu chosen: show XMB until Back/close */
    bool scanned;
+   char scanned_dir[PATH_MAX_LENGTH];
+
    font_data_t *font;
-   float font_height;   /* video height the font was sized for */
-   uintptr_t disc;      /* white anti-aliased circle, for rounded shapes */
-   uintptr_t glow;      /* soft white blob, for the moving gradient */
-   uintptr_t game_bg;   /* blurred snapshot of the paused game */
+   float font_height;       /* video height the font was sized for */
+   uintptr_t disc;          /* white anti-aliased circle, for rounded shapes */
+   uintptr_t game_bg;       /* blurred snapshot of the paused game */
    unsigned game_bg_w;
    unsigned game_bg_h;
    bool game_bg_tried;
-   char scanned_dir[PATH_MAX_LENGTH];
-
-   /* Running game, for the bar */
-   uintptr_t icon;
-   char title[NAME_MAX_LENGTH];
-   char content[PATH_MAX_LENGTH];
 } grid_st;
 
 /* From menu_cbs_ok.c; also handles "quit on close" and the menu stack. */
@@ -222,11 +237,56 @@ static void grid_sanitize_thumb_name(char *s)
          *s = '_';
 }
 
+/* Tab label for a file extension. */
+static void grid_system_label(const char *ext, char *s, size_t len)
+{
+   static const struct { const char *ext, *label; } map[] = {
+      { "gba", "GBA" },     { "gb",  "GAME BOY" }, { "gbc", "GBC" },
+      { "sfc", "SNES" },    { "smc", "SNES" },     { "nes", "NES" },
+      { "fds", "NES" },     { "n64", "N64" },      { "z64", "N64" },
+      { "v64", "N64" },     { "md",  "GENESIS" },  { "gen", "GENESIS" },
+      { "smd", "GENESIS" }, { "sms", "MASTER SYSTEM" },
+      { "gg",  "GAME GEAR" },{ "pce", "PC ENGINE" }, { "nds", "DS" }
+   };
+   size_t i;
+
+   for (i = 0; i < sizeof(map) / sizeof(map[0]); i++)
+      if (string_is_equal_noncase(ext, map[i].ext))
+      {
+         strlcpy(s, map[i].label, len);
+         return;
+      }
+
+   for (i = 0; ext[i] && i + 1 < len; i++)
+      s[i] = toupper((unsigned char)ext[i]);
+   s[i] = '\0';
+}
+
+/* Case-insensitive ASCII substring search. */
+static bool grid_contains_noncase(const char *hay, const char *needle)
+{
+   size_t i, n = strlen(needle);
+
+   if (!n)
+      return true;
+
+   for (; *hay; hay++)
+   {
+      for (i = 0; i < n && hay[i]; i++)
+         if (tolower((unsigned char)hay[i]) != tolower((unsigned char)needle[i]))
+            break;
+      if (i == n)
+         return true;
+   }
+   return false;
+}
+
 /* Title and RetroAchievements icon for a ROM, falling back to the file
- * name. Returns the icon path in icon (empty if none) and the lookup
- * state (PENDING while RetroAchievements hasn't answered yet). */
+ * name. Returns the lookup state (PENDING while RetroAchievements hasn't
+ * answered yet). */
 static enum grid_meta_state grid_resolve_title(const char *path,
-      char *title, size_t title_len, char *icon, size_t icon_len)
+      char *title, size_t title_len, char *icon, size_t icon_len,
+      bool *is_hack)
 {
    char ra_title[NAME_MAX_LENGTH];
    enum grid_meta_state state;
@@ -234,9 +294,13 @@ static enum grid_meta_state grid_resolve_title(const char *path,
    ra_title[0] = icon[0] = '\0';
    state       = grid_meta_get(path, ra_title, sizeof(ra_title),
          icon, icon_len);
+   *is_hack    = false;
 
    if (state == GRID_META_FOUND && !string_is_empty(ra_title))
+   {
+      *is_hack = string_starts_with(ra_title, "~Hack~");
       strlcpy(title, grid_skip_ra_tags(ra_title), title_len);
+   }
    else
    {
       strlcpy(title, path_basename(path), title_len);
@@ -312,12 +376,11 @@ static void grid_apply_meta(grid_game_t *game)
    cover[0] = '\0';
 
    if (grid_resolve_title(game->path, game->title, sizeof(game->title),
-            icon, sizeof(icon)) != GRID_META_PENDING)
+            icon, sizeof(icon), &game->is_hack) != GRID_META_PENDING)
       grid_cover_get(game->title, cover, sizeof(cover));
 
-   game->art_is_cover = !string_is_empty(cover);
-   art = game->art_is_cover        ? cover
-       : !string_is_empty(icon)    ? icon
+   art = !string_is_empty(cover) ? cover
+       : !string_is_empty(icon)  ? icon
        : game->boxart_path;
 
    if (!string_is_equal(art, game->art_path))
@@ -352,7 +415,9 @@ static void grid_scan(void)
 
    if (!grid_st.games)
       grid_st.games = (grid_game_t*)calloc(GRID_MAX_GAMES, sizeof(grid_game_t));
-   if (!grid_st.games)
+   if (!grid_st.view)
+      grid_st.view  = (size_t*)calloc(GRID_MAX_GAMES, sizeof(size_t));
+   if (!grid_st.games || !grid_st.view)
       return;
 
    files = dir_list_new(dir, NULL, false, false, false, false);
@@ -366,10 +431,7 @@ static void grid_scan(void)
       const core_info_t *infos = NULL;
       size_t num_infos         = 0;
       const char *path         = files->elems[i].data;
-      const char *base         = path_basename(path);
-      const char *ext          = path_get_extension(path);
       grid_game_t *game        = &grid_st.games[grid_st.count];
-      size_t j;
 
       core_info_list_get_supported_cores(cores, path, &infos, &num_infos);
       if (num_infos == 0)
@@ -379,23 +441,18 @@ static void grid_scan(void)
       strlcpy(game->path, path, sizeof(game->path));
       /* TODO: let the user pick when several cores fit. */
       strlcpy(game->core_path, infos[0].path, sizeof(game->core_path));
-
-      for (j = 0; ext[j] && j < sizeof(game->system) - 1; j++)
-         game->system[j] = toupper((unsigned char)ext[j]);
-      game->system[j] = '\0';
+      grid_system_label(path_get_extension(path),
+            game->system, sizeof(game->system));
 
       /* infos points into a list that the next lookup re-sorts,
        * so resolve the boxart now while it is valid. */
-      grid_find_art(game, &infos[0], base);
+      grid_find_art(game, &infos[0], path_basename(path));
       grid_apply_meta(game);
 
       grid_st.count++;
    }
 
    string_list_free(files);
-
-   if (grid_st.selection >= grid_st.count)
-      grid_st.selection = grid_st.count ? grid_st.count - 1 : 0;
 }
 
 static bool grid_is_running(const grid_game_t *game)
@@ -420,36 +477,164 @@ static void grid_launch(const grid_game_t *game)
          CORE_TYPE_PLAIN, NULL, NULL);
 }
 
-/* Title and icon of the running game, for the bar (cached per content). */
-static void grid_unload_running(void)
+/* ---------------------------------------------------------------------- */
+/* Tabs and view                                                          */
+/* ---------------------------------------------------------------------- */
+
+static void grid_add_tab(enum grid_tab_type type, const char *label)
 {
-   if (grid_st.icon)
-      video_driver_texture_unload(&grid_st.icon);
-   grid_st.icon       = 0;
-   grid_st.content[0] = '\0';
+   unsigned i;
+
+   if (grid_st.tab_count >= GRID_MAX_TABS)
+      return;
+   for (i = 0; i < grid_st.tab_count; i++)
+      if (string_is_equal(grid_st.tabs[i].label, label))
+         return;
+
+   grid_st.tabs[grid_st.tab_count].type = type;
+   strlcpy(grid_st.tabs[grid_st.tab_count].label, label,
+         sizeof(grid_st.tabs[0].label));
+   grid_st.tab_count++;
 }
 
-static void grid_update_running(void)
+static playlist_t *grid_history(void)
 {
-   char icon[PATH_MAX_LENGTH];
-   const char *content = path_get(RARCH_PATH_CONTENT);
+   return g_defaults.content_history;
+}
 
-   if (string_is_empty(content)
-         || string_is_equal(content, grid_st.content))
+/* Index of a game by path, or -1. */
+static int grid_find_game(const char *path)
+{
+   size_t i;
+   for (i = 0; i < grid_st.count; i++)
+      if (string_is_equal(grid_st.games[i].path, path))
+         return (int)i;
+   return -1;
+}
+
+/* Rebuilds the tab list (ALL, RECENT, systems, HACKS) from the games. */
+static void grid_build_tabs(void)
+{
+   size_t i;
+   bool recent = false, hacks = false;
+   playlist_t *hist = grid_history();
+
+   grid_st.tab_count = 0;
+   grid_add_tab(TAB_ALL, "ALL GAMES");
+
+   for (i = 0; hist && i < playlist_size(hist) && !recent; i++)
+   {
+      const struct playlist_entry *entry = NULL;
+      playlist_get_index(hist, i, &entry);
+      if (entry && entry->path && grid_find_game(entry->path) >= 0)
+         recent = true;
+   }
+   if (recent)
+      grid_add_tab(TAB_RECENT, "RECENT");
+
+   for (i = 0; i < grid_st.count; i++)
+   {
+      grid_add_tab(TAB_SYSTEM, grid_st.games[i].system);
+      hacks |= grid_st.games[i].is_hack;
+   }
+
+   if (hacks)
+      grid_add_tab(TAB_HACKS, "HACKS");
+}
+
+static const grid_tab_t *grid_current_tab(void)
+{
+   unsigned i;
+   for (i = 0; i < grid_st.tab_count; i++)
+      if (string_is_equal(grid_st.tabs[i].label, grid_st.tab_label))
+         return &grid_st.tabs[i];
+   /* Tab gone (e.g. last game of a system removed): back to ALL. */
+   strlcpy(grid_st.tab_label, grid_st.tabs[0].label, sizeof(grid_st.tab_label));
+   return &grid_st.tabs[0];
+}
+
+static unsigned grid_current_tab_index(void)
+{
+   return (unsigned)(grid_current_tab() - grid_st.tabs);
+}
+
+static const char *grid_search_text(void)
+{
+   /* While the search keyboard is open, filter live as the user types. */
+   if (menu_input_dialog_get_display_kb())
+   {
+      const char *buf = menu_input_dialog_get_buffer();
+      return buf ? buf : "";
+   }
+   return grid_st.search;
+}
+
+static bool grid_view_accepts(const grid_tab_t *tab, const grid_game_t *game,
+      const char *search)
+{
+   if (tab->type == TAB_SYSTEM && !string_is_equal(tab->label, game->system))
+      return false;
+   if (tab->type == TAB_HACKS && !game->is_hack)
+      return false;
+   return grid_contains_noncase(game->title, search);
+}
+
+/* Rebuilds the list of games shown for the current tab and search. */
+static void grid_build_view(void)
+{
+   size_t i;
+   const grid_tab_t *tab;
+   const char *search = grid_search_text();
+
+   grid_build_tabs();
+   tab                = grid_current_tab();
+   grid_st.view_count = 0;
+
+   if (!grid_st.view)
       return;
 
-   grid_unload_running();
-   strlcpy(grid_st.content, content, sizeof(grid_st.content));
-
-   grid_resolve_title(content, grid_st.title, sizeof(grid_st.title),
-         icon, sizeof(icon));
-
-   if (!string_is_empty(icon))
+   if (tab->type == TAB_RECENT)
    {
-      unsigned w, h;
-      gfx_display_reset_icon_texture(icon, &grid_st.icon,
-            TEXTURE_FILTER_MIPMAP_LINEAR, &w, &h);
+      playlist_t *hist = grid_history();
+      for (i = 0; hist && i < playlist_size(hist); i++)
+      {
+         const struct playlist_entry *entry = NULL;
+         int idx;
+         size_t j;
+         bool dup = false;
+
+         playlist_get_index(hist, i, &entry);
+         if (!entry || !entry->path || (idx = grid_find_game(entry->path)) < 0)
+            continue;
+         for (j = 0; j < grid_st.view_count; j++)
+            dup |= grid_st.view[j] == (size_t)idx;
+         if (!dup && grid_contains_noncase(grid_st.games[idx].title, search))
+            grid_st.view[grid_st.view_count++] = (size_t)idx;
+      }
    }
+   else
+   {
+      for (i = 0; i < grid_st.count; i++)
+         if (grid_view_accepts(tab, &grid_st.games[i], search))
+            grid_st.view[grid_st.view_count++] = i;
+   }
+
+   if (grid_st.selection >= grid_st.view_count)
+      grid_st.selection = grid_st.view_count ? grid_st.view_count - 1 : 0;
+}
+
+static void grid_switch_tab(int dir)
+{
+   int idx = (int)grid_current_tab_index() + dir;
+
+   if (idx < 0 || idx >= (int)grid_st.tab_count)
+      return;
+
+   strlcpy(grid_st.tab_label, grid_st.tabs[idx].label,
+         sizeof(grid_st.tab_label));
+   grid_st.selection = 0;
+   grid_st.scroll_y  = 0.0f;
+   grid_st.focus     = FOCUS_GRID;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -470,23 +655,12 @@ void grid_home_toggle(bool menu_on)
    grid_free_game_bg();
 
    if (menu_on)
-   {
       grid_st.xmb = false;
-
-      /* In-game: start on Continue, like the Switch's resume prompt. */
-      if (grid_content_running())
-      {
-         grid_st.focus  = FOCUS_BAR;
-         grid_st.button = BTN_CONTINUE;
-      }
-   }
-   else
-      grid_unload_running();
 }
 
 static unsigned grid_button_count(void)
 {
-   /* Without a running game only Settings applies. */
+   /* Quit only applies with a running game. */
    return grid_content_running() ? BTN_COUNT : 1;
 }
 
@@ -494,17 +668,35 @@ static void grid_activate_button(unsigned button)
 {
    switch (button)
    {
-      case BTN_SETTINGS:
+      case BTN_MENU:
          grid_st.xmb = true;
-         break;
-      case BTN_CONTINUE:
-         command_event(CMD_EVENT_RESUME, NULL);
          break;
       case BTN_QUIT:
          grid_st.focus = FOCUS_GRID;
          action_ok_close_content(NULL, NULL, MENU_SETTING_ACTION_CLOSE, 0, 0);
          break;
    }
+}
+
+static void grid_search_done(void *userdata, const char *line)
+{
+   strlcpy(grid_st.search, line ? line : "", sizeof(grid_st.search));
+   grid_st.selection = 0;
+   grid_st.scroll_y  = 0.0f;
+   menu_input_dialog_end();
+}
+
+static void grid_start_search(void)
+{
+   menu_input_ctx_line_t line;
+
+   line.label         = "Search";
+   line.label_setting = "";
+   line.type          = 0;
+   line.idx           = 0;
+   line.cb            = grid_search_done;
+
+   menu_input_dialog_start(&line);
 }
 
 static void grid_bar_action(enum menu_action action)
@@ -525,7 +717,7 @@ static void grid_bar_action(enum menu_action action)
             grid_st.button++;
          break;
       case MENU_ACTION_UP:
-         if (grid_st.count)
+         if (grid_st.view_count)
             grid_st.focus = FOCUS_GRID;
          break;
       case MENU_ACTION_OK:
@@ -539,7 +731,8 @@ static void grid_bar_action(enum menu_action action)
 static void grid_grid_action(enum menu_action action)
 {
    size_t sel  = grid_st.selection;
-   size_t cols = grid_st.cols ? grid_st.cols : 1;
+   size_t cols = GRID_COLS;
+   size_t n    = grid_st.view_count;
 
    switch (action)
    {
@@ -548,7 +741,7 @@ static void grid_grid_action(enum menu_action action)
             sel--;
          break;
       case MENU_ACTION_RIGHT:
-         if (sel + 1 < grid_st.count)
+         if (sel + 1 < n)
             sel++;
          break;
       case MENU_ACTION_UP:
@@ -556,30 +749,24 @@ static void grid_grid_action(enum menu_action action)
             sel -= cols;
          break;
       case MENU_ACTION_DOWN:
-         if (sel + cols < grid_st.count)
+         if (sel + cols < n)
             sel += cols;
-         else if (sel / cols < (grid_st.count - 1) / cols)
-            sel = grid_st.count - 1;   /* partial last row */
+         else if (sel / cols < (n - 1) / cols)
+            sel = n - 1;   /* partial last row */
          else
          {
             grid_st.focus  = FOCUS_BAR;
-            grid_st.button = grid_content_running() ? BTN_CONTINUE : BTN_SETTINGS;
+            grid_st.button = BTN_MENU;
          }
          break;
-      case MENU_ACTION_SCROLL_UP:
-         sel = 0;
-         break;
-      case MENU_ACTION_SCROLL_DOWN:
-         if (grid_st.count)
-            sel = grid_st.count - 1;
-         break;
       case MENU_ACTION_OK:
-         if (sel < grid_st.count)
+         if (sel < n)
          {
-            if (grid_is_running(&grid_st.games[sel]))
+            grid_game_t *game = &grid_st.games[grid_st.view[sel]];
+            if (grid_is_running(game))
                command_event(CMD_EVENT_RESUME, NULL);
             else
-               grid_launch(&grid_st.games[sel]);
+               grid_launch(game);
          }
          break;
       default:
@@ -609,25 +796,41 @@ bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth)
       case MENU_ACTION_RIGHT:
       case MENU_ACTION_UP:
       case MENU_ACTION_DOWN:
-      case MENU_ACTION_SCROLL_UP:
-      case MENU_ACTION_SCROLL_DOWN:
       case MENU_ACTION_OK:
-         if (grid_st.focus == FOCUS_BAR || !grid_st.count)
+         if (grid_st.focus == FOCUS_BAR || !grid_st.view_count)
          {
-            /* Empty grid: down/up have nowhere to go. */
+            /* Empty view: only the bar is left to navigate. */
             grid_st.focus = FOCUS_BAR;
             grid_bar_action(action);
          }
          else
             grid_grid_action(action);
          break;
+      case MENU_ACTION_SCROLL_UP:   /* L */
+         grid_switch_tab(-1);
+         break;
+      case MENU_ACTION_SCROLL_DOWN: /* R */
+         grid_switch_tab(1);
+         break;
+      case MENU_ACTION_SEARCH:      /* X */
+         grid_start_search();
+         break;
       case MENU_ACTION_START:
-      case MENU_ACTION_SELECT:
-         grid_activate_button(BTN_SETTINGS);
+         grid_activate_button(BTN_MENU);
          break;
       case MENU_ACTION_CANCEL:
-         if (grid_content_running())
+         if (!string_is_empty(grid_st.search))
+         {
+            grid_st.search[0] = '\0';
+            grid_st.selection = 0;
+            grid_st.scroll_y  = 0.0f;
+         }
+         else if (grid_content_running())
             command_event(CMD_EVENT_RESUME, NULL);
+         break;
+      case MENU_ACTION_SELECT:
+      case MENU_ACTION_INFO:
+      case MENU_ACTION_SCAN:
          break;
       default:
          /* Leave menu toggle, pointer etc. to XMB. */
@@ -638,7 +841,7 @@ bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth)
 }
 
 /* ---------------------------------------------------------------------- */
-/* Drawing                                                                */
+/* Drawing primitives                                                     */
 /* ---------------------------------------------------------------------- */
 
 static void grid_create_disc(void)
@@ -674,38 +877,225 @@ static void grid_create_disc(void)
    free(ti.pixels);
 }
 
-/* Soft white blob: alpha fades smoothly from the centre to the edge.
- * Drawn large and tinted, overlapping blobs read as a blurred gradient. */
-static void grid_create_glow(void)
+static void grid_draw_rect(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height,
+      float x, float y, float w, float h, uint32_t rgba)
 {
-   struct texture_image ti;
-   const unsigned size = 128;
-   const float r       = size / 2.0f;
-   unsigned x, y;
+   float color[16];
+   grid_set_color(color, rgba);
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         (int)x, (int)y, (unsigned)w, (unsigned)h,
+         width, height, color, NULL);
+}
 
-   ti.width         = size;
-   ti.height        = size;
-   ti.supports_rgba = video_driver_supports_rgba();
-   ti.pixels        = (uint32_t*)malloc(size * size * sizeof(uint32_t));
-   if (!ti.pixels)
-      return;
+/* Opaque rounded rectangle: three strips plus four corner circles. */
+static void grid_draw_rounded(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height,
+      float x, float y, float w, float h, float r, uint32_t rgba)
+{
+   float color[16];
 
-   for (y = 0; y < size; y++)
+   if (r * 2.0f > w) r = w / 2.0f;
+   if (r * 2.0f > h) r = h / 2.0f;
+
+   if (!grid_st.disc || r < 1.0f)
    {
-      for (x = 0; x < size; x++)
-      {
-         float dx = x + 0.5f - r;
-         float dy = y + 0.5f - r;
-         float a  = 1.0f - sqrtf(dx * dx + dy * dy) / r;
-         if (a < 0.0f) a = 0.0f;
-         a = a * a * (3.0f - 2.0f * a);           /* smoothstep */
-         ti.pixels[y * size + x] = ((uint32_t)(a * 255.0f) << 24) | 0x00ffffff;
-      }
+      grid_draw_rect(p_disp, userdata, width, height, x, y, w, h, rgba);
+      return;
    }
 
-   video_driver_texture_load(&ti, TEXTURE_FILTER_LINEAR, &grid_st.glow);
-   free(ti.pixels);
+   grid_set_color(color, rgba);
+
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         (int)(x + r), (int)y, (unsigned)(w - 2.0f * r), (unsigned)h,
+         width, height, color, NULL);
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         (int)x, (int)(y + r), (unsigned)r, (unsigned)(h - 2.0f * r),
+         width, height, color, NULL);
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         (int)(x + w - r), (int)(y + r), (unsigned)r, (unsigned)(h - 2.0f * r),
+         width, height, color, NULL);
+
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         (int)x, (int)y, (unsigned)(2.0f * r), (unsigned)(2.0f * r),
+         width, height, color, &grid_st.disc);
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         (int)(x + w - 2.0f * r), (int)y, (unsigned)(2.0f * r), (unsigned)(2.0f * r),
+         width, height, color, &grid_st.disc);
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         (int)x, (int)(y + h - 2.0f * r), (unsigned)(2.0f * r), (unsigned)(2.0f * r),
+         width, height, color, &grid_st.disc);
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         (int)(x + w - 2.0f * r), (int)(y + h - 2.0f * r),
+         (unsigned)(2.0f * r), (unsigned)(2.0f * r),
+         width, height, color, &grid_st.disc);
 }
+
+/* Selection cursor: pulsing cyan outline with a gap, drawn behind an
+ * item of the given rect and corner radius. */
+static void grid_draw_cursor(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height,
+      float x, float y, float w, float h, float r, uint32_t gap_color)
+{
+   float gap   = height * 0.003f;
+   float line  = height * 0.004f;
+   float t     = cpu_features_get_time_usec() / 1000000.0f;
+   float pulse = 0.5f + 0.5f * sinf(t * 4.0f);
+   uint32_t c  = grid_mix(COL_CURSOR, 0xffffffff, 0.35f * pulse);
+   float o     = gap + line;
+
+   grid_draw_rounded(p_disp, userdata, width, height,
+         x - o, y - o, w + 2.0f * o, h + 2.0f * o, r + o, c);
+   grid_draw_rounded(p_disp, userdata, width, height,
+         x - gap, y - gap, w + 2.0f * gap, h + 2.0f * gap, r + gap, gap_color);
+}
+
+static void grid_draw_text(const char *text, float x, float y,
+      unsigned width, unsigned height, uint32_t color,
+      enum text_alignment align, float scale)
+{
+   if (!grid_st.font)
+      return;
+
+   gfx_display_draw_text(grid_st.font, text, x, y, width, height,
+         color, align, scale * (height / grid_st.font_height),
+         false, 0.0f, false);
+}
+
+/* Baseline y that vertically centres text of the given scale on cy. */
+static float grid_text_y(float cy, unsigned height, float scale)
+{
+   return cy + (height / 32.0f) * scale * 0.36f;
+}
+
+static float grid_text_width(const char *text, unsigned height, float scale)
+{
+   if (!grid_st.font)
+      return 0.0f;
+   return font_driver_get_message_width(grid_st.font, text, strlen(text),
+         scale * (height / grid_st.font_height));
+}
+
+static void grid_flush_text(unsigned width, unsigned height)
+{
+   if (grid_st.font && grid_st.font->renderer && grid_st.font->renderer->flush)
+      grid_st.font->renderer->flush(width, height,
+            grid_st.font->renderer_data);
+}
+
+/* Draws text inside [x, x + w]. If it doesn't fit, it scrolls: pause,
+ * scroll to the end, pause, jump back. key identifies what is being shown
+ * so the scroll restarts when it changes. align applies when it fits. */
+static void grid_draw_marquee(gfx_display_t *p_disp, void *userdata,
+      const char *text, float x, float y, float w,
+      unsigned width, unsigned height, uint32_t color, float scale,
+      enum text_alignment align, const void *key)
+{
+   static const void *last_key  = NULL;
+   static retro_time_t start    = 0;
+   const float pause            = 1.0f;           /* seconds */
+   const float speed            = height * 0.06f; /* pixels per second */
+   float text_w, overflow, scroll_time, t, offset, line_h;
+   retro_time_t now;
+
+   if (!grid_st.font || w <= 0.0f)
+      return;
+
+   text_w = grid_text_width(text, height, scale);
+
+   if (text_w <= w)
+   {
+      grid_draw_text(text, align == TEXT_ALIGN_CENTER ? x + w / 2.0f : x,
+            y, width, height, color, align, scale);
+      return;
+   }
+
+   now = cpu_features_get_time_usec();
+   if (key != last_key)
+   {
+      last_key = key;
+      start    = now;
+   }
+
+   overflow    = text_w - w;
+   scroll_time = overflow / speed;
+   t           = fmodf((now - start) / 1000000.0f,
+         pause + scroll_time + pause);
+
+   if (t < pause)
+      offset = 0.0f;
+   else if (t < pause + scroll_time)
+      offset = (t - pause) * speed;
+   else
+      offset = overflow;
+
+   /* Clip to the text box. Earlier text is flushed first so the
+    * clip only affects this string. */
+   line_h = (height / 32.0f) * scale;
+
+   grid_flush_text(width, height);
+
+   if (p_disp->dispctx && p_disp->dispctx->scissor_begin)
+      gfx_display_scissor_begin(p_disp, userdata, width, height,
+            (int)x, (int)(y - line_h * 1.1f),
+            (unsigned)w, (unsigned)(line_h * 1.6f));
+
+   grid_draw_text(text, x - offset, y, width, height, color,
+         TEXT_ALIGN_LEFT, scale);
+   grid_flush_text(width, height);
+
+   if (p_disp->dispctx && p_disp->dispctx->scissor_end)
+      p_disp->dispctx->scissor_end(userdata, width, height);
+}
+
+static void grid_draw_image(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height,
+      float x, float y, float w, float h,
+      uintptr_t *tex, unsigned tex_w, unsigned tex_h)
+{
+   float color[16];
+   float s = w / tex_w;
+   float iw, ih;
+
+   /* Fit inside the box, keeping aspect ratio. */
+   if (tex_h * s > h)
+      s = h / tex_h;
+   iw = tex_w * s;
+   ih = tex_h * s;
+
+   grid_set_color(color, 0xffffffff);
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         (int)(x + (w - iw) / 2.0f), (int)(y + (h - ih) / 2.0f),
+         (unsigned)iw, (unsigned)ih, width, height, color, tex);
+}
+
+/* Round button glyph (e.g. "A") with its label to the right. Returns the
+ * total width drawn. Draws nothing when measure_only. */
+static float grid_draw_hint(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, float x, float cy,
+      const char *glyph, const char *label, bool measure_only)
+{
+   float d      = height * 0.032f;
+   float gap    = height * 0.008f;
+   float scale  = 0.62f;
+   float lw     = grid_text_width(label, height, scale);
+
+   if (!measure_only)
+   {
+      grid_draw_rounded(p_disp, userdata, width, height,
+            x, cy - d / 2.0f, d, d, d / 2.0f, COL_GLYPH);
+      grid_draw_text(glyph, x + d / 2.0f, grid_text_y(cy, height, 0.5f),
+            width, height, COL_TEXT, TEXT_ALIGN_CENTER, 0.5f);
+      grid_draw_text(label, x + d + gap, grid_text_y(cy, height, scale),
+            width, height, COL_TEXT, TEXT_ALIGN_LEFT, scale);
+   }
+
+   return d + gap + lw;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Background                                                             */
+/* ---------------------------------------------------------------------- */
 
 /* One box-blur pass over an RGB float image, horizontally then
  * vertically, radius r. */
@@ -839,9 +1229,9 @@ static void grid_capture_game_bg(void)
       /* Dim so the grid and text stay readable on top. */
       for (i = 0; i < dw * dh; i++)
       {
-         uint32_t r = (uint32_t)(img[i * 3 + 0] * 0.55f);
-         uint32_t g = (uint32_t)(img[i * 3 + 1] * 0.55f);
-         uint32_t b = (uint32_t)(img[i * 3 + 2] * 0.55f);
+         uint32_t r = (uint32_t)(img[i * 3 + 0] * 0.45f);
+         uint32_t g = (uint32_t)(img[i * 3 + 1] * 0.45f);
+         uint32_t b = (uint32_t)(img[i * 3 + 2] * 0.45f);
 
          /* RGBA-capable drivers take R in the low byte, others ARGB. */
          ti.pixels[i] = video_driver_supports_rgba()
@@ -863,26 +1253,11 @@ static void grid_capture_game_bg(void)
    free(ti.pixels);
 }
 
-/* Background: the blurred paused game if there is one, otherwise soft
- * coloured glows drifting over a dark base. */
+/* Solid dark background, or the blurred paused game while one runs. */
 static void grid_draw_background(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height, bool game_running)
 {
-   /* Joy-Con-ish colours; alpha keeps overlaps soft. */
-   static const struct
-   {
-      uint32_t color;
-      float sx, sy, phase;
-   } glows[] = {
-      { 0x0ab9e68c, 0.11f, 0.07f, 0.0f }, /* blue   */
-      { 0xff3c2870, 0.08f, 0.10f, 2.1f }, /* red    */
-      { 0x7b3cff80, 0.06f, 0.09f, 4.2f }, /* purple */
-      { 0x00c89670, 0.09f, 0.05f, 1.3f }, /* teal   */
-      { 0xe6a0ff50, 0.05f, 0.08f, 3.4f }  /* pink   */
-   };
    float color[16];
-   unsigned i;
-   float t;
 
    if (game_running && !grid_st.game_bg && !grid_st.game_bg_tried)
       grid_capture_game_bg();
@@ -905,328 +1280,254 @@ static void grid_draw_background(gfx_display_t *p_disp, void *userdata,
       return;
    }
 
-   grid_set_color(color, COL_BG);
-   gfx_display_draw_quad(p_disp, userdata, width, height,
-         0, 0, width, height, width, height, color, NULL);
-
-   if (!grid_st.glow)
-      return;
-
-   t = cpu_features_get_time_usec() / 1000000.0f;
-
-   for (i = 0; i < sizeof(glows) / sizeof(glows[0]); i++)
-   {
-      float size = height * 1.3f;
-      float cx   = width  * (0.5f + 0.38f * sinf(t * glows[i].sx * 6.2832f + glows[i].phase));
-      float cy   = height * (0.5f + 0.38f * cosf(t * glows[i].sy * 6.2832f + glows[i].phase * 1.7f));
-
-      grid_set_color(color, glows[i].color);
-      gfx_display_draw_quad(p_disp, userdata, width, height,
-            (int)(cx - size / 2.0f), (int)(cy - size / 2.0f),
-            (unsigned)size, (unsigned)size, width, height, color,
-            &grid_st.glow);
-   }
+   grid_draw_rect(p_disp, userdata, width, height,
+         0, 0, width, height, COL_BG);
 }
 
-/* Opaque rounded rectangle: three strips plus four corner circles. */
-static void grid_draw_rounded(gfx_display_t *p_disp, void *userdata,
-      unsigned width, unsigned height,
-      float x, float y, float w, float h, float r, uint32_t rgba)
+/* ---------------------------------------------------------------------- */
+/* Screen parts                                                           */
+/* ---------------------------------------------------------------------- */
+
+/* Top bar: search box, clock, then L [tabs] R. */
+static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, float bar_h, float side)
 {
-   float color[16];
-
-   if (r * 2.0f > w) r = w / 2.0f;
-   if (r * 2.0f > h) r = h / 2.0f;
-
-   grid_set_color(color, rgba);
-
-   if (!grid_st.disc || r < 1.0f)
-   {
-      gfx_display_draw_quad(p_disp, userdata, width, height,
-            (int)x, (int)y, (unsigned)w, (unsigned)h,
-            width, height, color, NULL);
-      return;
-   }
-
-   gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)(x + r), (int)y, (unsigned)(w - 2.0f * r), (unsigned)h,
-         width, height, color, NULL);
-   gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)x, (int)(y + r), (unsigned)r, (unsigned)(h - 2.0f * r),
-         width, height, color, NULL);
-   gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)(x + w - r), (int)(y + r), (unsigned)r, (unsigned)(h - 2.0f * r),
-         width, height, color, NULL);
-
-   gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)x, (int)y, (unsigned)(2.0f * r), (unsigned)(2.0f * r),
-         width, height, color, &grid_st.disc);
-   gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)(x + w - 2.0f * r), (int)y, (unsigned)(2.0f * r), (unsigned)(2.0f * r),
-         width, height, color, &grid_st.disc);
-   gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)x, (int)(y + h - 2.0f * r), (unsigned)(2.0f * r), (unsigned)(2.0f * r),
-         width, height, color, &grid_st.disc);
-   gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)(x + w - 2.0f * r), (int)(y + h - 2.0f * r),
-         (unsigned)(2.0f * r), (unsigned)(2.0f * r),
-         width, height, color, &grid_st.disc);
-}
-
-/* Switch-style cursor: pulsing cyan outline with a white gap, drawn
- * behind an item of the given rect and corner radius. */
-static void grid_draw_cursor(gfx_display_t *p_disp, void *userdata,
-      unsigned width, unsigned height,
-      float x, float y, float w, float h, float r)
-{
-   float gap   = height * 0.003f;
-   float line  = height * 0.004f;
-   float t     = cpu_features_get_time_usec() / 1000000.0f;
-   float pulse = 0.5f + 0.5f * sinf(t * 4.0f);
-   uint32_t c  = grid_mix(COL_CURSOR, 0xffffffff, 0.35f * pulse);
-   float o     = gap + line;
-
-   grid_draw_rounded(p_disp, userdata, width, height,
-         x - o, y - o, w + 2.0f * o, h + 2.0f * o, r + o, c);
-   grid_draw_rounded(p_disp, userdata, width, height,
-         x - gap, y - gap, w + 2.0f * gap, h + 2.0f * gap, r + gap, 0xffffffff);
-}
-
-static void grid_draw_text(const char *text, float x, float y,
-      unsigned width, unsigned height, uint32_t color,
-      enum text_alignment align, float scale)
-{
-   if (!grid_st.font)
-      return;
-
-   gfx_display_draw_text(grid_st.font, text, x, y, width, height,
-         color, align, scale * (height / grid_st.font_height),
-         false, 0.0f, false);
-}
-
-static void grid_flush_text(unsigned width, unsigned height)
-{
-   if (grid_st.font && grid_st.font->renderer && grid_st.font->renderer->flush)
-      grid_st.font->renderer->flush(width, height,
-            grid_st.font->renderer_data);
-}
-
-/* Copies src into dst, cutting it short with "..." to fit max_w pixels. */
-static void grid_fit_text(char *dst, size_t dst_len, const char *src,
-      float max_w, unsigned height, float scale)
-{
-   size_t len;
-   float s = scale * (height / grid_st.font_height);
-
-   strlcpy(dst, src, dst_len);
-
-   if (!grid_st.font)
-      return;
-
-   len = strlen(dst);
-   if (font_driver_get_message_width(grid_st.font, dst, len, s) <= max_w)
-      return;
-
-   while (len > 0)
-   {
-      /* Step back over whole UTF-8 characters. */
-      do { len--; } while (len > 0 && ((unsigned char)dst[len] & 0xc0) == 0x80);
-
-      dst[len] = '\0';
-      strlcat(dst, "...", dst_len);
-
-      if (font_driver_get_message_width(grid_st.font, dst,
-               strlen(dst), s) <= max_w)
-         return;
-
-      dst[len] = '\0';
-   }
-}
-
-/* Draws text inside [x, x + w]. If it doesn't fit, it scrolls: pause,
- * scroll to the end, pause, jump back. key identifies what is being shown
- * so the scroll restarts when it changes. align applies when it fits. */
-static void grid_draw_marquee(gfx_display_t *p_disp, void *userdata,
-      const char *text, float x, float y, float w,
-      unsigned width, unsigned height, uint32_t color, float scale,
-      enum text_alignment align, const void *key)
-{
-   static const void *last_key  = NULL;
-   static retro_time_t start    = 0;
-   const float pause            = 1.0f;           /* seconds */
-   const float speed            = height * 0.06f; /* pixels per second */
-   float s, text_w, overflow, scroll_time, t, offset, line_h;
-   retro_time_t now;
-
-   if (!grid_st.font)
-      return;
-
-   s      = scale * (height / grid_st.font_height);
-   text_w = font_driver_get_message_width(grid_st.font, text,
-         strlen(text), s);
-
-   if (text_w <= w)
-   {
-      grid_draw_text(text, align == TEXT_ALIGN_CENTER ? x + w / 2.0f : x,
-            y, width, height, color, align, scale);
-      return;
-   }
-
-   now = cpu_features_get_time_usec();
-   if (key != last_key)
-   {
-      last_key = key;
-      start    = now;
-   }
-
-   overflow    = text_w - w;
-   scroll_time = overflow / speed;
-   t           = fmodf((now - start) / 1000000.0f,
-         pause + scroll_time + pause);
-
-   if (t < pause)
-      offset = 0.0f;
-   else if (t < pause + scroll_time)
-      offset = (t - pause) * speed;
-   else
-      offset = overflow;
-
-   /* Clip to the text box. Earlier text is flushed first so the
-    * clip only affects this string. */
-   line_h = (grid_st.font_height / 32.0f) * s;
-
-   grid_flush_text(width, height);
-
-   if (p_disp->dispctx && p_disp->dispctx->scissor_begin)
-      gfx_display_scissor_begin(p_disp, userdata, width, height,
-            (int)x, (int)(y - line_h * 1.1f),
-            (unsigned)w, (unsigned)(line_h * 1.6f));
-
-   grid_draw_text(text, x - offset, y, width, height, color,
-         TEXT_ALIGN_LEFT, scale);
-   grid_flush_text(width, height);
-
-   if (p_disp->dispctx && p_disp->dispctx->scissor_end)
-      p_disp->dispctx->scissor_end(userdata, width, height);
-}
-
-static void grid_draw_image(gfx_display_t *p_disp, void *userdata,
-      unsigned width, unsigned height,
-      float x, float y, float w, float h,
-      uintptr_t *tex, unsigned tex_w, unsigned tex_h)
-{
-   float color[16];
-   float s = w / tex_w;
-   float iw, ih;
-
-   /* Fit inside the box, keeping aspect ratio. */
-   if (tex_h * s > h)
-      s = h / tex_h;
-   iw = tex_w * s;
-   ih = tex_h * s;
-
-   grid_set_color(color, 0xffffffff);
-   gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)(x + (w - iw) / 2.0f), (int)(y + (h - ih) / 2.0f),
-         (unsigned)iw, (unsigned)ih, width, height, color, tex);
-}
-
-/* White bottom bar: icon and title (in-game) or hints (home) on the
- * left, pill buttons on the right. */
-static void grid_draw_bar(gfx_display_t *p_disp, void *userdata,
-      unsigned width, unsigned height, float bar_y, float bar_h)
-{
-   float color[16];
+   char clock[16];
+   time_t now_t;
+   struct tm *tm_now;
    unsigned i;
-   bool running    = grid_content_running();
-   unsigned count  = grid_button_count();
-   float pad       = bar_h * 0.18f;
-   float side      = height * 0.045f;
-   float icon_size = bar_h - 2.0f * pad;
-   float btn_w     = height * 0.16f;
-   float btn_h     = bar_h * 0.52f;
-   float btn_y     = bar_y + (bar_h - btn_h) / 2.0f;
-   float btn_gap   = height * 0.018f;
-   float btn_x     = width - side - count * btn_w - (count - 1) * btn_gap;
-   float text_dy   = height * 0.012f; /* rough baseline centring */
+   const char *search = grid_search_text();
+   bool typing        = menu_input_dialog_get_display_kb();
+   unsigned cur       = grid_current_tab_index();
+   float row1         = height * 0.06f;
+   float row2         = height * 0.145f;
+   float pill_h       = height * 0.058f;
+   float pill_w       = width * 0.36f;
+   float glyph        = height * 0.04f;
+   float tabs_x0      = side + glyph + height * 0.03f;
+   float tabs_x1      = width - side - glyph - height * 0.03f;
+   float slot         = grid_st.tab_count
+                      ? (tabs_x1 - tabs_x0) / grid_st.tab_count : 0.0f;
+   float tab_scale    = 0.58f;
 
-   grid_set_color(color, COL_BAR);
-   gfx_display_draw_quad(p_disp, userdata, width, height,
-         0, (int)bar_y, width, (unsigned)bar_h, width, height, color, NULL);
+   grid_draw_rect(p_disp, userdata, width, height,
+         0, 0, width, bar_h, COL_BAR);
+   grid_draw_rect(p_disp, userdata, width, height,
+         0, bar_h, width, height * 0.002f + 1.0f, COL_DIVIDER);
 
-   grid_set_color(color, COL_DIVIDER);
-   gfx_display_draw_quad(p_disp, userdata, width, height,
-         (int)side, (int)bar_y, (unsigned)(width - 2.0f * side),
-         (unsigned)(height * 0.0015f + 1.0f), width, height, color, NULL);
-
-   if (running)
+   /* Search box with a magnifier ring */
    {
-      float text_x = side + icon_size + pad;
-
-      grid_update_running();
+      float x    = side;
+      float y    = row1 - pill_h / 2.0f;
+      float ring = pill_h * 0.36f;
+      float rx   = x + pill_h * 0.45f;
+      float ry   = row1 - ring / 2.0f - pill_h * 0.04f;
+      float tx   = rx + ring + pill_h * 0.3f;
+      char text[160];
 
       grid_draw_rounded(p_disp, userdata, width, height,
-            side, bar_y + pad, icon_size, icon_size,
-            icon_size * 0.08f, COL_ICON_BG);
+            x, y, pill_w, pill_h, pill_h / 2.0f, COL_SEARCH);
+      grid_draw_rounded(p_disp, userdata, width, height,
+            rx, ry, ring, ring, ring / 2.0f, COL_TEXT_DIM);
+      grid_draw_rounded(p_disp, userdata, width, height,
+            rx + ring * 0.2f, ry + ring * 0.2f, ring * 0.6f, ring * 0.6f,
+            ring * 0.3f, COL_SEARCH);
+      grid_draw_rect(p_disp, userdata, width, height,
+            rx + ring * 0.82f, ry + ring * 0.82f,
+            ring * 0.32f, ring * 0.32f, COL_TEXT_DIM);
 
-      if (grid_st.icon)
+      if (typing)
       {
-         grid_set_color(color, 0xffffffff);
-         gfx_display_draw_quad(p_disp, userdata, width, height,
-               (int)side, (int)(bar_y + pad),
-               (unsigned)icon_size, (unsigned)icon_size,
-               width, height, color, &grid_st.icon);
+         /* Blinking caret while the keyboard is open. */
+         bool caret = fmodf(cpu_features_get_time_usec() / 1000000.0f, 1.0f) < 0.5f;
+         snprintf(text, sizeof(text), "%s%s", search, caret ? "|" : "");
+         grid_draw_text(text, tx, grid_text_y(row1, height, 0.65f),
+               width, height, COL_TEXT, TEXT_ALIGN_LEFT, 0.65f);
+      }
+      else if (!string_is_empty(search))
+         grid_draw_text(search, tx, grid_text_y(row1, height, 0.65f),
+               width, height, COL_TEXT, TEXT_ALIGN_LEFT, 0.65f);
+      else
+         grid_draw_text("Search for games...", tx,
+               grid_text_y(row1, height, 0.65f),
+               width, height, COL_TEXT_DIM, TEXT_ALIGN_LEFT, 0.65f);
+   }
+
+   /* Clock */
+   now_t  = time(NULL);
+   tm_now = localtime(&now_t);
+   if (tm_now && strftime(clock, sizeof(clock), "%H:%M", tm_now))
+      grid_draw_text(clock, width - side, grid_text_y(row1, height, 0.8f),
+            width, height, COL_TEXT, TEXT_ALIGN_RIGHT, 0.8f);
+
+   /* L / R glyphs */
+   grid_draw_rounded(p_disp, userdata, width, height,
+         side, row2 - glyph / 2.0f, glyph, glyph, glyph * 0.25f, COL_GLYPH);
+   grid_draw_text("L", side + glyph / 2.0f, grid_text_y(row2, height, 0.6f),
+         width, height, COL_TEXT, TEXT_ALIGN_CENTER, 0.6f);
+   grid_draw_rounded(p_disp, userdata, width, height,
+         width - side - glyph, row2 - glyph / 2.0f, glyph, glyph,
+         glyph * 0.25f, COL_GLYPH);
+   grid_draw_text("R", width - side - glyph / 2.0f,
+         grid_text_y(row2, height, 0.6f),
+         width, height, COL_TEXT, TEXT_ALIGN_CENTER, 0.6f);
+
+   /* Tabs, each centred in an equal slot */
+   for (i = 0; i < grid_st.tab_count; i++)
+   {
+      const grid_tab_t *tab = &grid_st.tabs[i];
+      float cx              = tabs_x0 + slot * (i + 0.5f);
+      char count[16];
+      float lw, cw = 0.0f, total;
+
+      count[0] = '\0';
+      if (tab->type == TAB_ALL)
+         snprintf(count, sizeof(count), "%u", (unsigned)grid_st.count);
+
+      lw    = grid_text_width(tab->label, height, tab_scale);
+      if (count[0])
+         cw = height * 0.012f + grid_text_width(count, height, tab_scale);
+      total = lw + cw;
+
+      if (i == cur)
+      {
+         float ph = height * 0.042f;
+         float pw = total + height * 0.04f;
+         grid_draw_rounded(p_disp, userdata, width, height,
+               cx - pw / 2.0f, row2 - ph / 2.0f, pw, ph, ph / 2.0f,
+               COL_TAB_PILL);
       }
 
-      grid_draw_marquee(p_disp, userdata, grid_st.title,
-            text_x, bar_y + bar_h / 2.0f + text_dy,
-            btn_x - text_x - 2.0f * pad, width, height,
-            COL_TEXT, 0.9f, TEXT_ALIGN_LEFT, &grid_st.content);
+      grid_draw_text(tab->label, cx - total / 2.0f,
+            grid_text_y(row2, height, tab_scale), width, height,
+            i == cur ? COL_TEXT_DARK : COL_TEXT, TEXT_ALIGN_LEFT, tab_scale);
+
+      if (count[0])
+         grid_draw_text(count, cx - total / 2.0f + lw + height * 0.012f,
+               grid_text_y(row2, height, tab_scale), width, height,
+               i == cur ? 0x6a6b72ff : COL_TEXT_DIM, TEXT_ALIGN_LEFT,
+               tab_scale);
    }
-   else
-      grid_draw_text("A  Start        Start  Settings", side,
-            bar_y + bar_h / 2.0f + text_dy * 0.8f, width, height,
-            COL_TEXT_DIM, TEXT_ALIGN_LEFT, 0.7f);
+}
+
+/* Bottom bar: Menu (+ Quit in-game) buttons, selected title, hints. */
+static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, float bar_y, float bar_h, float side)
+{
+   static const char *labels[BTN_COUNT] = { "Menu", "Quit" };
+   static const uint32_t colors[BTN_COUNT] = { COL_MENU_BTN, COL_RED };
+   unsigned i;
+   bool running   = grid_content_running();
+   unsigned count = grid_button_count();
+   float cy       = bar_y + bar_h / 2.0f;
+   float btn_h    = height * 0.062f;
+   float btn_w    = height * 0.15f;
+   float btn_gap  = height * 0.018f;
+   float x        = side;
+   float hints_w, hx;
+   const char *a_label;
+
+   grid_draw_rect(p_disp, userdata, width, height,
+         0, bar_y, width, bar_h, COL_BAR);
+   grid_draw_rect(p_disp, userdata, width, height,
+         0, bar_y, width, height * 0.002f + 1.0f, COL_DIVIDER);
 
    for (i = 0; i < count; i++)
    {
-      float x  = btn_x + i * (btn_w + btn_gap);
-      float r  = 0.0f; /* square corners */
+      float by = cy - btn_h / 2.0f;
 
       if (grid_st.focus == FOCUS_BAR && i == grid_st.button)
          grid_draw_cursor(p_disp, userdata, width, height,
-               x, btn_y, btn_w, btn_h, r);
+               x, by, btn_w, btn_h, btn_h / 2.0f, COL_BAR);
 
-      if (button_colors[i] == COL_BTN_WHITE)
+      grid_draw_rounded(p_disp, userdata, width, height,
+            x, by, btn_w, btn_h, btn_h / 2.0f, colors[i]);
+
+      if (i == BTN_MENU)
       {
-         /* White on the white bar: outline it. */
-         float b = height * 0.002f + 1.0f;
-         grid_draw_rounded(p_disp, userdata, width, height,
-               x, btn_y, btn_w, btn_h, r, COL_BTN_BORDER);
-         grid_draw_rounded(p_disp, userdata, width, height,
-               x + b, btn_y + b, btn_w - 2.0f * b, btn_h - 2.0f * b,
-               r, COL_BTN_WHITE);
+         /* Hamburger icon + label */
+         float lx  = x + btn_h * 0.45f;
+         float lw  = btn_h * 0.32f;
+         float lh  = height * 0.0028f + 1.0f;
+         unsigned k;
+         for (k = 0; k < 3; k++)
+            grid_draw_rect(p_disp, userdata, width, height,
+                  lx, cy - btn_h * 0.14f + k * btn_h * 0.14f - lh / 2.0f,
+                  lw, lh, COL_TEXT);
+         grid_draw_text(labels[i], lx + lw + btn_h * 0.25f,
+               grid_text_y(cy, height, 0.68f), width, height,
+               COL_TEXT, TEXT_ALIGN_LEFT, 0.68f);
       }
       else
-         grid_draw_rounded(p_disp, userdata, width, height,
-               x, btn_y, btn_w, btn_h, r, button_colors[i]);
+         grid_draw_text(labels[i], x + btn_w / 2.0f,
+               grid_text_y(cy, height, 0.68f), width, height,
+               COL_TEXT, TEXT_ALIGN_CENTER, 0.68f);
 
-      grid_draw_text(button_labels[i], x + btn_w / 2.0f,
-            btn_y + btn_h / 2.0f + text_dy * 0.75f, width, height,
-            button_text_colors[i], TEXT_ALIGN_CENTER, 0.72f);
+      x += btn_w + btn_gap;
    }
+
+   /* Hints, right-aligned: (X) Search (A) Play/Continue (B) Back */
+   a_label = "Play";
+   if (grid_st.focus == FOCUS_GRID && grid_st.selection < grid_st.view_count
+         && grid_is_running(&grid_st.games[grid_st.view[grid_st.selection]]))
+      a_label = "Continue";
+   else if (grid_st.focus == FOCUS_BAR)
+      a_label = "Select";
+
+   {
+      float sp = height * 0.03f;
+      hints_w  = grid_draw_hint(p_disp, userdata, width, height, 0, cy,
+                  "X", "Search", true) + sp
+               + grid_draw_hint(p_disp, userdata, width, height, 0, cy,
+                  "A", a_label, true);
+      if (running || !string_is_empty(grid_st.search))
+         hints_w += sp + grid_draw_hint(p_disp, userdata, width, height, 0, cy,
+               "B", "Back", true);
+
+      hx  = width - side - hints_w;
+      hx += grid_draw_hint(p_disp, userdata, width, height, hx, cy,
+            "X", "Search", false) + sp;
+      hx += grid_draw_hint(p_disp, userdata, width, height, hx, cy,
+            "A", a_label, false) + sp;
+      if (running || !string_is_empty(grid_st.search))
+         grid_draw_hint(p_disp, userdata, width, height, hx, cy,
+               "B", "Back", false);
+   }
+
+   /* Selected game's title between the buttons and the hints. */
+   if (grid_st.focus == FOCUS_GRID && grid_st.selection < grid_st.view_count)
+   {
+      grid_game_t *game = &grid_st.games[grid_st.view[grid_st.selection]];
+      float tx          = x + height * 0.02f;
+      float tw          = width - side - hints_w - height * 0.04f - tx;
+
+      grid_draw_marquee(p_disp, userdata, game->title,
+            tx, grid_text_y(cy, height, 0.75f), tw, width, height,
+            COL_TEXT, 0.75f, TEXT_ALIGN_LEFT, game);
+   }
+}
+
+/* On-screen keyboard while searching (physical keyboards type directly). */
+static void grid_draw_keyboard(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height)
+{
+   input_driver_state_t *input_st = input_state_get_ptr();
+
+   /* Dim the screen behind the keyboard. */
+   grid_draw_rect(p_disp, userdata, width, height,
+         0, height * 0.5f, width, height * 0.5f, 0x000000c0);
+
+   grid_flush_text(width, height);
+   gfx_display_draw_keyboard(p_disp, userdata, width, height,
+         grid_st.disc, grid_st.font, input_st->osk_grid,
+         input_st->osk_ptr, 0xffffffff);
 }
 
 bool grid_home_frame(video_frame_info_t *video_info)
 {
-   float color[16];
    size_t i;
-   size_t rows_visible;
-   unsigned cols;
-   float tile, art_h, tile_h, gap, label_h, top, left, radius, bar_h, bar_y;
-   char clock[16];
-   time_t now_t;
-   struct tm *tm_now;
+   float tile, art_h, gap, side, radius, top_h, bot_h, bot_y, grid_top;
+   float row_h, target;
    void *userdata                 = video_info->userdata;
    unsigned width                 = video_info->width;
    unsigned height                = video_info->height;
@@ -1248,76 +1549,61 @@ bool grid_home_frame(video_frame_info_t *video_info)
       for (i = 0; i < grid_st.count; i++)
          grid_apply_meta(&grid_st.games[i]);
 
+   grid_build_view();
+
    if (video_st->current_video && video_st->current_video->set_viewport)
       video_st->current_video->set_viewport(
             video_st->data, width, height, true, false);
 
-   /* Layout scales with window height. */
-   bar_h   = height * 0.11f;
-   bar_y   = height - bar_h;
-   gap     = height * 0.03f;
-   tile    = height * 0.18f;         /* tile width: 194px at 1080p */
-   art_h   = tile * 1.5f;            /* portrait 2:3, like SteamGridDB covers */
-   radius  = tile * 0.05f;
-   label_h = height * 0.045f;
-   tile_h  = art_h + label_h;
-   top     = height * 0.15f;
+   /* Layout scales with window size: 5 portrait covers per row. */
+   side     = width * 0.027f;
+   gap      = width * 0.02f;
+   top_h    = height * 0.19f;
+   bot_h    = height * 0.12f;
+   bot_y    = height - bot_h;
+   grid_top = top_h + height * 0.04f;
+   tile     = (width - 2.0f * side - (GRID_COLS - 1) * gap) / GRID_COLS;
+   art_h    = tile * 1.5f;
+   radius   = tile * 0.045f;
+   row_h    = art_h + gap;
 
-   cols = (unsigned)((width - gap) / (tile + gap));
-   if (cols < 1)
-      cols = 1;
-   grid_st.cols = cols;
-   left = (width - (cols * tile + (cols - 1) * gap)) / 2.0f;
+   /* Selected row slides to the top of the grid area. */
+   target = (float)(grid_st.selection / GRID_COLS) * row_h;
+   grid_st.scroll_y += (target - grid_st.scroll_y) * 0.25f;
+   if (fabsf(target - grid_st.scroll_y) < 0.5f)
+      grid_st.scroll_y = target;
 
-   rows_visible = (size_t)((bar_y - top) / (tile_h + gap));
-   if (rows_visible < 1)
-      rows_visible = 1;
-
-   /* Keep the selected row on screen. */
-   {
-      size_t row = grid_st.selection / cols;
-      if (row < grid_st.scroll_row)
-         grid_st.scroll_row = row;
-      else if (row >= grid_st.scroll_row + rows_visible)
-         grid_st.scroll_row = row - rows_visible + 1;
-   }
-
-   /* Background (opaque, also over a paused game) */
    grid_draw_background(p_disp, userdata, width, height,
          video_info->libretro_running);
 
-   /* Header: title left, clock right */
-   grid_draw_text("Games", left, height * 0.09f, width, height,
-         COL_TEXT_BG, TEXT_ALIGN_LEFT, 1.4f);
-
-   now_t  = time(NULL);
-   tm_now = localtime(&now_t);
-   if (tm_now && strftime(clock, sizeof(clock), "%H:%M", tm_now))
-      grid_draw_text(clock, width - left, height * 0.09f, width, height,
-            COL_TEXT_BG, TEXT_ALIGN_RIGHT, 1.0f);
-
-   if (grid_st.count == 0)
+   if (grid_st.view_count == 0)
    {
       char msg[PATH_MAX_LENGTH + 64];
-      snprintf(msg, sizeof(msg), "No games found in %s",
-            string_is_empty(settings->paths.directory_menu_content)
-            ? "(File Browser directory not set)"
-            : settings->paths.directory_menu_content);
-      grid_draw_text(msg, width / 2.0f, height / 2.0f, width, height,
-            COL_TEXT_BG_DIM, TEXT_ALIGN_CENTER, 1.0f);
+      if (!string_is_empty(grid_search_text()))
+         snprintf(msg, sizeof(msg), "No games match \"%s\"",
+               grid_search_text());
+      else
+         snprintf(msg, sizeof(msg), "No games found in %s",
+               string_is_empty(settings->paths.directory_menu_content)
+               ? "(File Browser directory not set)"
+               : settings->paths.directory_menu_content);
+      grid_draw_text(msg, width / 2.0f, (grid_top + bot_y) / 2.0f,
+            width, height, COL_TEXT_DIM, TEXT_ALIGN_CENTER, 0.9f);
    }
 
-   for (i = grid_st.scroll_row * cols;
-        i < grid_st.count && i < (grid_st.scroll_row + rows_visible) * cols;
-        i++)
+   for (i = 0; i < grid_st.view_count; i++)
    {
-      grid_game_t *game = &grid_st.games[i];
-      size_t col        = i % cols;
-      size_t row        = i / cols - grid_st.scroll_row;
-      float x           = left + col * (tile + gap);
-      float y           = top + row * (tile_h + gap);
+      grid_game_t *game = &grid_st.games[grid_st.view[i]];
+      size_t col        = i % GRID_COLS;
+      size_t row        = i / GRID_COLS;
+      float x           = side + col * (tile + gap);
+      float y           = grid_top + row * row_h - grid_st.scroll_y;
       bool selected     = grid_st.focus == FOCUS_GRID
                        && i == grid_st.selection;
+
+      /* Rows outside the screen (the bars are drawn over the rest). */
+      if (y + art_h < 0.0f || y > height)
+         continue;
 
       if (!game->art_tried)
       {
@@ -1329,7 +1615,7 @@ bool grid_home_frame(video_frame_info_t *video_info)
 
       if (selected)
          grid_draw_cursor(p_disp, userdata, width, height,
-               x, y, tile, art_h, radius);
+               x, y, tile, art_h, radius, COL_BG);
 
       grid_draw_rounded(p_disp, userdata, width, height,
             x, y, tile, art_h, radius, COL_TILE);
@@ -1340,39 +1626,33 @@ bool grid_home_frame(video_frame_info_t *video_info)
                x, y, tile, art_h, &game->art, game->art_w, game->art_h);
       else
          grid_draw_text(game->system, x + tile / 2.0f,
-               y + art_h / 2.0f + height * 0.012f, width, height,
+               grid_text_y(y + art_h * 0.45f, height, 1.0f), width, height,
                COL_TEXT_DIM, TEXT_ALIGN_CENTER, 1.0f);
 
-      /* Running game: lime badge in the corner. */
+      /* Running game: lime badge in the bottom-right corner. */
       if (grid_is_running(game))
       {
-         float d = tile * 0.16f;
+         float d = tile * 0.13f;
          float b = height * 0.003f;
+         float bx = x + tile - d - tile * 0.05f;
+         float by = y + art_h - d - tile * 0.05f;
          grid_draw_rounded(p_disp, userdata, width, height,
-               x + tile - d * 0.75f - b, y - d * 0.25f - b,
-               d + 2.0f * b, d + 2.0f * b, d / 2.0f + b, 0xffffffff);
+               bx - b, by - b, d + 2.0f * b, d + 2.0f * b, d / 2.0f + b,
+               0xffffffff);
          grid_draw_rounded(p_disp, userdata, width, height,
-               x + tile - d * 0.75f, y - d * 0.25f, d, d, d / 2.0f, COL_LIME);
-      }
-
-      if (selected)
-         /* Selected: scroll names that don't fit. */
-         grid_draw_marquee(p_disp, userdata, game->title,
-               x - gap * 0.25f, y + art_h + label_h * 0.65f,
-               tile + gap * 0.5f, width, height,
-               COL_TEXT_BG, 0.6f, TEXT_ALIGN_CENTER, game);
-      else
-      {
-         char label[NAME_MAX_LENGTH];
-         grid_fit_text(label, sizeof(label), game->title,
-               tile + gap * 0.5f, height, 0.6f);
-         grid_draw_text(label, x + tile / 2.0f,
-               y + art_h + label_h * 0.65f, width, height,
-               COL_TEXT_BG_DIM, TEXT_ALIGN_CENTER, 0.6f);
+               bx, by, d, d, d / 2.0f, COL_LIME);
       }
    }
 
-   grid_draw_bar(p_disp, userdata, width, height, bar_y, bar_h);
+   grid_flush_text(width, height);
+
+   /* Bars over the grid, so scrolled rows slide under them. */
+   grid_draw_top_bar(p_disp, userdata, width, height, top_h, side);
+   grid_draw_bottom_bar(p_disp, userdata, width, height, bot_y, bot_h, side);
+   grid_flush_text(width, height);
+
+   if (menu_input_dialog_get_display_kb())
+      grid_draw_keyboard(p_disp, userdata, width, height);
 
    grid_flush_text(width, height);
 
@@ -1410,23 +1690,16 @@ void grid_home_context_reset(bool is_threaded)
    grid_st.font_height = (float)height;
 
    grid_create_disc();
-   grid_create_glow();
 }
 
 void grid_home_context_destroy(void)
 {
    grid_free_textures();
-   grid_unload_running();
+   grid_free_game_bg();
 
    if (grid_st.disc)
       video_driver_texture_unload(&grid_st.disc);
    grid_st.disc = 0;
-
-   if (grid_st.glow)
-      video_driver_texture_unload(&grid_st.glow);
-   grid_st.glow = 0;
-
-   grid_free_game_bg();
 
    if (grid_st.font)
       font_driver_free(grid_st.font);
