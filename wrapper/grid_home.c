@@ -33,6 +33,7 @@
 #include <formats/image.h>
 #include <lists/dir_list.h>
 #include <lists/string_list.h>
+#include <streams/file_stream.h>
 #include <string/stdstring.h>
 
 #include "grid_home.h"
@@ -238,6 +239,48 @@ static void grid_sanitize_thumb_name(char *s)
    for (; *s; s++)
       if (strchr("&*/:`<>?\\|\"", *s))
          *s = '_';
+}
+
+/* GameCube and Wii share disc image formats; read the header to tell
+ * them apart. Returns "WII", "GAMECUBE" or NULL (not a disc / unknown).
+ *  - RVZ/WIA: header 2 starts at 0x48 with a big-endian disc type
+ *    (1 = GameCube, 2 = Wii).
+ *  - ISO/GCM: raw disc; Wii magic 0x5D1C9EA3 at 0x18, GameCube magic
+ *    0xC2339F3D at 0x1C. */
+static const char *grid_disc_system(const char *path, const char *ext)
+{
+   uint8_t b[0x50];
+   int64_t got;
+   RFILE *f;
+
+   if (     !string_is_equal_noncase(ext, "rvz")
+         && !string_is_equal_noncase(ext, "wia")
+         && !string_is_equal_noncase(ext, "iso")
+         && !string_is_equal_noncase(ext, "gcm"))
+      return NULL;
+
+   if (!(f = filestream_open(path, RETRO_VFS_FILE_ACCESS_READ,
+               RETRO_VFS_FILE_ACCESS_HINT_NONE)))
+      return NULL;
+   got = filestream_read(f, b, sizeof(b));
+   filestream_close(f);
+
+   if (got < (int64_t)sizeof(b))
+      return NULL;
+
+   if (memcmp(b, "RVZ\x01", 4) == 0 || memcmp(b, "WIA\x01", 4) == 0)
+   {
+      uint32_t type = ((uint32_t)b[0x48] << 24) | ((uint32_t)b[0x49] << 16)
+                    | ((uint32_t)b[0x4A] <<  8) |  (uint32_t)b[0x4B];
+      return type == 2 ? "WII" : type == 1 ? "GAMECUBE" : NULL;
+   }
+
+   if (b[0x18] == 0x5D && b[0x19] == 0x1C && b[0x1A] == 0x9E && b[0x1B] == 0xA3)
+      return "WII";
+   if (b[0x1C] == 0xC2 && b[0x1D] == 0x33 && b[0x1E] == 0x9F && b[0x1F] == 0x3D)
+      return "GAMECUBE";
+
+   return NULL; /* e.g. a PSP/PS2 ISO */
 }
 
 /* Tab label for a file extension. */
@@ -452,8 +495,14 @@ static void grid_scan(void)
 
       memset(game, 0, sizeof(*game));
       strlcpy(game->path, path, sizeof(game->path));
-      grid_system_label(path_get_extension(path),
-            game->system, sizeof(game->system));
+      {
+         const char *disc = grid_disc_system(path, path_get_extension(path));
+         if (disc)
+            strlcpy(game->system, disc, sizeof(game->system));
+         else
+            grid_system_label(path_get_extension(path),
+                  game->system, sizeof(game->system));
+      }
 
       if (num_infos == 0)
          game->pending = true;
