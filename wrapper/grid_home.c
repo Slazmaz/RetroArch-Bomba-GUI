@@ -1173,8 +1173,16 @@ void grid_home_context_reset(bool is_threaded)
    if (height == 0)
       height = 720;
 
-   fill_pathname_application_special(fontpath, sizeof(fontpath),
-         APPLICATION_SPECIAL_DIRECTORY_ASSETS_XMB_FONT);
+   /* Roboto ships next to the exe (see build.sh); fall back to XMB's. */
+   {
+      char app_dir[PATH_MAX_LENGTH];
+      fill_pathname_application_dir(app_dir, sizeof(app_dir));
+      fill_pathname_join_special(fontpath, app_dir,
+            "wrapper/fonts/Roboto-Medium.ttf", sizeof(fontpath));
+   }
+   if (!path_is_valid(fontpath))
+      fill_pathname_application_special(fontpath, sizeof(fontpath),
+            APPLICATION_SPECIAL_DIRECTORY_ASSETS_XMB_FONT);
    grid_st.font        = gfx_display_font_file(disp_get_ptr(),
          fontpath, height / 32.0f, is_threaded);
    grid_st.font_height = (float)height;
