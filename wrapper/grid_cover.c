@@ -316,10 +316,17 @@ static void cover_request(cover_entry_t *e, const char *url)
 static void cover_start(cover_entry_t *e)
 {
    char url[PATH_MAX_LENGTH];
-   char term[NAME_MAX_LENGTH * 3];
+   char *term = NULL;
 
-   net_http_urlencode_full(term, e->title, sizeof(term));
+   /* Encodes one value (net_http_urlencode_full expects a whole URL). */
+   net_http_urlencode(&term, e->title);
+   if (!term)
+   {
+      cover_finish(e, GRID_META_UNKNOWN, true);
+      return;
+   }
    snprintf(url, sizeof(url), COVER_API "/search/autocomplete/%s", term);
+   free(term);
 
    e->in_flight  = true;
    e->step       = COVER_STEP_SEARCH;
