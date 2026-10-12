@@ -38,6 +38,7 @@
 #include "grid_home.h"
 #include "grid_meta.h"
 #include "grid_cover.h"
+#include "grid_cores.h"
 
 #include "../configuration.h"
 #include "../core_info.h"
@@ -94,6 +95,7 @@ typedef struct
    unsigned art_w;
    unsigned art_h;
    bool art_tried;
+   bool pending;                      /* its core is still downloading */
 } grid_game_t;
 
 enum grid_tab_type
@@ -247,7 +249,16 @@ static void grid_system_label(const char *ext, char *s, size_t len)
       { "fds", "NES" },     { "n64", "N64" },      { "z64", "N64" },
       { "v64", "N64" },     { "md",  "GENESIS" },  { "gen", "GENESIS" },
       { "smd", "GENESIS" }, { "sms", "MASTER SYSTEM" },
-      { "gg",  "GAME GEAR" },{ "pce", "PC ENGINE" }, { "nds", "DS" }
+      { "gg",  "GAME GEAR" },{ "pce", "PC ENGINE" }, { "nds", "DS" },
+      { "dsi", "DS" },      { "ndd", "N64" },
+      { "rvz", "GAMECUBE" },{ "gcz", "GAMECUBE" }, { "gcm", "GAMECUBE" },
+      { "ciso","GAMECUBE" },{ "wbfs", "WII" },     { "wad", "WII" },
+      { "cso", "PSP" },     { "pbp", "PSP" },      { "3ds", "3DS" },
+      { "cci", "3DS" },     { "32x", "32X" },      { "a26", "ATARI 2600" },
+      { "a78", "ATARI 7800" },{ "lnx", "LYNX" },   { "ws",  "WONDERSWAN" },
+      { "wsc", "WONDERSWAN" },{ "vb",  "VIRTUAL BOY" },
+      { "ngp", "NEO GEO POCKET" },{ "ngc", "NEO GEO POCKET" },
+      { "col", "COLECOVISION" }
    };
    size_t i;
 
@@ -431,18 +442,30 @@ static void grid_scan(void)
 
       core_info_list_get_supported_cores(cores, path, &infos, &num_infos);
       if (num_infos == 0)
-         continue;
+      {
+         /* No core for it yet: fetch one if the system is clear, and show
+          * the game as pending (not playable) while it downloads. */
+         grid_cores_request(path);
+         if (grid_cores_state(path) != GRID_CORE_INSTALLING)
+            continue;
+      }
 
       memset(game, 0, sizeof(*game));
       strlcpy(game->path, path, sizeof(game->path));
-      /* TODO: let the user pick when several cores fit. */
-      strlcpy(game->core_path, infos[0].path, sizeof(game->core_path));
       grid_system_label(path_get_extension(path),
             game->system, sizeof(game->system));
 
-      /* infos points into a list that the next lookup re-sorts,
-       * so resolve the boxart now while it is valid. */
-      grid_find_art(game, &infos[0], path_basename(path));
+      if (num_infos == 0)
+         game->pending = true;
+      else
+      {
+         /* TODO: let the user pick when several cores fit. */
+         strlcpy(game->core_path, infos[0].path, sizeof(game->core_path));
+         /* infos points into a list that the next lookup re-sorts,
+          * so resolve the boxart now while it is valid. */
+         grid_find_art(game, &infos[0], path_basename(path));
+      }
+
       grid_apply_meta(game);
 
       grid_st.count++;
@@ -644,7 +667,7 @@ static void grid_grid_action(enum menu_action action)
             sel = n - 1;   /* partial last row */
          break;
       case MENU_ACTION_OK:
-         if (sel < n)
+         if (sel < n && !grid_st.games[grid_st.view[sel]].pending)
          {
             grid_game_t *game = &grid_st.games[grid_st.view[sel]];
             if (grid_is_running(game))
@@ -1221,7 +1244,7 @@ static void grid_draw_marquee(gfx_display_t *p_disp, void *userdata,
 static void grid_draw_image(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height,
       float x, float y, float w, float h,
-      uintptr_t *tex, unsigned tex_w, unsigned tex_h)
+      uintptr_t *tex, unsigned tex_w, unsigned tex_h, uint32_t tint)
 {
    float color[16];
    float s = w / tex_w;
@@ -1233,7 +1256,7 @@ static void grid_draw_image(gfx_display_t *p_disp, void *userdata,
    iw = tex_w * s;
    ih = tex_h * s;
 
-   grid_set_color(color, 0xffffffff);
+   grid_set_color(color, tint);
    gfx_display_draw_quad(p_disp, userdata, width, height,
          (int)(x + (w - iw) / 2.0f), (int)(y + (h - ih) / 2.0f),
          (unsigned)iw, (unsigned)ih, width, height, color, tex);
@@ -1686,7 +1709,7 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
       glyphs[n] = "Y"; labels[n++] = "Quit";
    }
    glyphs[n] = "X"; labels[n++] = "Search";
-   if (has_sel)
+   if (has_sel && !grid_st.games[grid_st.view[grid_st.selection]].pending)
    {
       glyphs[n] = "A";
       labels[n++] = grid_is_running(&grid_st.games[grid_st.view[grid_st.selection]])
@@ -1761,6 +1784,10 @@ bool grid_home_frame(video_frame_info_t *video_info)
       for (i = 0; i < grid_st.count; i++)
          grid_apply_meta(&grid_st.games[i]);
 
+   /* A missing core finished installing: its games can show now. */
+   if (grid_cores_poll())
+      grid_scan();
+
    grid_build_view();
 
    if (video_st->current_video && video_st->current_video->set_viewport)
@@ -1834,14 +1861,48 @@ bool grid_home_frame(video_frame_info_t *video_info)
       grid_draw_rounded(p_disp, userdata, width, height,
             x, y, tile, art_h, radius, COL_TILE);
 
-      /* Covers fill the tile; square icons sit centred in it. */
+      /* Covers fill the tile; square icons sit centred in it. Games whose
+       * emulator is still downloading are dimmed. */
       if (game->art && game->art_w && game->art_h)
          grid_draw_image(p_disp, userdata, width, height,
-               x, y, tile, art_h, &game->art, game->art_w, game->art_h);
+               x, y, tile, art_h, &game->art, game->art_w, game->art_h,
+               game->pending ? 0x5a5a5aff : 0xffffffff);
       else
          grid_draw_text(game->system, x + tile / 2.0f,
                grid_text_y(y + art_h * 0.45f, height, 1.0f), width, height,
                COL_TEXT_DIM, TEXT_ALIGN_CENTER, 1.0f);
+
+      /* Emulator downloading: a loading bar along the bottom of the tile,
+       * filled to the download progress (or sliding while unknown). */
+      if (game->pending)
+      {
+         float bh       = floorf(REF(3) + 0.5f);
+         float bpad     = floorf(tile * 0.08f);
+         float bx       = x + bpad;
+         float bw       = tile - 2.0f * bpad;
+         float by       = y + art_h - bpad - bh;
+         int   progress = grid_cores_progress(game->path);
+
+         grid_draw_rounded(p_disp, userdata, width, height,
+               bx, by, bw, bh, bh / 2.0f, 0x3a3a3cff);
+
+         if (progress >= 0)
+         {
+            if (progress > 0)
+               grid_draw_rounded(p_disp, userdata, width, height,
+                     bx, by, bw * (progress > 100 ? 100 : progress) / 100.0f,
+                     bh, bh / 2.0f, COL_CURSOR);
+         }
+         else
+         {
+            /* Unknown progress: a segment sliding back and forth. */
+            float t   = cpu_features_get_time_usec() / 1000000.0f;
+            float seg = bw * 0.3f;
+            float pos = (0.5f + 0.5f * sinf(t * 2.5f)) * (bw - seg);
+            grid_draw_rounded(p_disp, userdata, width, height,
+                  bx + pos, by, seg, bh, bh / 2.0f, COL_CURSOR);
+         }
+      }
 
       /* Running game: lime badge in the bottom-right corner. */
       if (grid_is_running(game))
