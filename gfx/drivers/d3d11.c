@@ -1294,8 +1294,10 @@ static void d3d11_font_render_msg(
 static const struct font_glyph* d3d11_font_get_glyph(void *data, uint32_t code)
 {
    d3d11_font_t* font = (d3d11_font_t*)data;
-   if (font && font->font_driver)
-      return font->font_driver->get_glyph((void*)font->font_driver, code);
+   /* RetroArchWrapper: upstream passed font_driver instead of font_data,
+    * crashing in the font renderer whenever this was called. */
+   if (font && font->font_driver && font->font_data)
+      return font->font_driver->get_glyph(font->font_data, code);
    return NULL;
 }
 

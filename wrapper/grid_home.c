@@ -3,21 +3,21 @@
  * Replaces XMB's main menu and Quick Menu with one screen:
  *
  *   [ Search for games...      ]                         16:24
- *   [L]  ALL GAMES 5   RECENT   GBA   SNES   NES   HACKS  [R]
+ *   [L]  ALL GAMES 5        GBA        SNES        NES      [R]
  *   +-----+ +-----+ +-----+ +-----+ +-----+
  *   |cover| |cover| |cover| |cover| |cover|   portrait covers
  *   +-----+ +-----+ +-----+ +-----+ +-----+
- *   [= Menu] [Quit]  Game title          (X) Search (A) Play (B) Back
+ *   Game title        (+) Settings (Y) Quit (X) Search (A) Play (B) Back
  *
  * Games are the files in the File Browser start directory (settings:
  * rgui_browser_directory) that an installed core supports. Titles and
  * icons come from RetroAchievements (grid_meta.c), covers from SteamGridDB
  * (grid_cover.c), falling back to libretro boxart and the file name.
  *
- * Controls: D-pad moves (down from the last row reaches the bottom bar),
- * L/R switch tabs, A plays/continues, B resumes the running game (or
- * clears the search), X searches, Start opens Settings (XMB). Back at
- * XMB's top level returns here.
+ * Controls: D-pad moves, L/R switch tabs, A plays/continues, B resumes
+ * the running game (or clears the search), X searches, Y quits the
+ * running game, Start opens Settings (XMB). Back at XMB's top level
+ * returns here.
  */
 
 #include <stdlib.h>
@@ -41,9 +41,7 @@
 
 #include "../configuration.h"
 #include "../core_info.h"
-#include "../defaults.h"
 #include "../file_path_special.h"
-#include "../playlist.h"
 #include "../runloop.h"
 #include "../content.h"
 #include "../tasks/task_content.h"
@@ -88,15 +86,12 @@ typedef struct
    unsigned art_w;
    unsigned art_h;
    bool art_tried;
-   bool is_hack;                      /* RetroAchievements "~Hack~" */
 } grid_game_t;
 
 enum grid_tab_type
 {
    TAB_ALL = 0,
-   TAB_RECENT,
-   TAB_SYSTEM,
-   TAB_HACKS
+   TAB_SYSTEM
 };
 
 typedef struct
@@ -137,6 +132,9 @@ static struct
    char font_path[2][PATH_MAX_LENGTH]; /* [0] Medium, [1] Bold */
    bool font_threaded;
    uintptr_t disc;          /* white anti-aliased circle, for rounded shapes */
+   uintptr_t shoulder[2];   /* L / R glyph shapes at their exact size */
+   unsigned shoulder_w;
+   unsigned shoulder_h;
    uintptr_t game_bg;       /* blurred snapshot of the paused game */
    unsigned game_bg_w;
    unsigned game_bg_h;
@@ -280,8 +278,7 @@ static bool grid_contains_noncase(const char *hay, const char *needle)
  * name. Returns the lookup state (PENDING while RetroAchievements hasn't
  * answered yet). */
 static enum grid_meta_state grid_resolve_title(const char *path,
-      char *title, size_t title_len, char *icon, size_t icon_len,
-      bool *is_hack)
+      char *title, size_t title_len, char *icon, size_t icon_len)
 {
    char ra_title[NAME_MAX_LENGTH];
    enum grid_meta_state state;
@@ -289,13 +286,9 @@ static enum grid_meta_state grid_resolve_title(const char *path,
    ra_title[0] = icon[0] = '\0';
    state       = grid_meta_get(path, ra_title, sizeof(ra_title),
          icon, icon_len);
-   *is_hack    = false;
 
    if (state == GRID_META_FOUND && !string_is_empty(ra_title))
-   {
-      *is_hack = string_starts_with(ra_title, "~Hack~");
       strlcpy(title, grid_skip_ra_tags(ra_title), title_len);
-   }
    else
    {
       strlcpy(title, path_basename(path), title_len);
@@ -371,7 +364,7 @@ static void grid_apply_meta(grid_game_t *game)
    cover[0] = '\0';
 
    if (grid_resolve_title(game->path, game->title, sizeof(game->title),
-            icon, sizeof(icon), &game->is_hack) != GRID_META_PENDING)
+            icon, sizeof(icon)) != GRID_META_PENDING)
       grid_cover_get(game->title, cover, sizeof(cover));
 
    art = !string_is_empty(cover) ? cover
@@ -492,49 +485,16 @@ static void grid_add_tab(enum grid_tab_type type, const char *label)
    grid_st.tab_count++;
 }
 
-static playlist_t *grid_history(void)
-{
-   return g_defaults.content_history;
-}
-
-/* Index of a game by path, or -1. */
-static int grid_find_game(const char *path)
-{
-   size_t i;
-   for (i = 0; i < grid_st.count; i++)
-      if (string_is_equal(grid_st.games[i].path, path))
-         return (int)i;
-   return -1;
-}
-
-/* Rebuilds the tab list (ALL, RECENT, systems, HACKS) from the games. */
+/* Rebuilds the tab list: ALL GAMES, then one per system present. */
 static void grid_build_tabs(void)
 {
    size_t i;
-   bool recent = false, hacks = false;
-   playlist_t *hist = grid_history();
 
    grid_st.tab_count = 0;
    grid_add_tab(TAB_ALL, "ALL GAMES");
 
-   for (i = 0; hist && i < playlist_size(hist) && !recent; i++)
-   {
-      const struct playlist_entry *entry = NULL;
-      playlist_get_index(hist, i, &entry);
-      if (entry && entry->path && grid_find_game(entry->path) >= 0)
-         recent = true;
-   }
-   if (recent)
-      grid_add_tab(TAB_RECENT, "RECENT");
-
    for (i = 0; i < grid_st.count; i++)
-   {
       grid_add_tab(TAB_SYSTEM, grid_st.games[i].system);
-      hacks |= grid_st.games[i].is_hack;
-   }
-
-   if (hacks)
-      grid_add_tab(TAB_HACKS, "HACKS");
 }
 
 static const grid_tab_t *grid_current_tab(void)
@@ -569,8 +529,6 @@ static bool grid_view_accepts(const grid_tab_t *tab, const grid_game_t *game,
 {
    if (tab->type == TAB_SYSTEM && !string_is_equal(tab->label, game->system))
       return false;
-   if (tab->type == TAB_HACKS && !game->is_hack)
-      return false;
    return grid_contains_noncase(game->title, search);
 }
 
@@ -588,31 +546,9 @@ static void grid_build_view(void)
    if (!grid_st.view)
       return;
 
-   if (tab->type == TAB_RECENT)
-   {
-      playlist_t *hist = grid_history();
-      for (i = 0; hist && i < playlist_size(hist); i++)
-      {
-         const struct playlist_entry *entry = NULL;
-         int idx;
-         size_t j;
-         bool dup = false;
-
-         playlist_get_index(hist, i, &entry);
-         if (!entry || !entry->path || (idx = grid_find_game(entry->path)) < 0)
-            continue;
-         for (j = 0; j < grid_st.view_count; j++)
-            dup |= grid_st.view[j] == (size_t)idx;
-         if (!dup && grid_contains_noncase(grid_st.games[idx].title, search))
-            grid_st.view[grid_st.view_count++] = (size_t)idx;
-      }
-   }
-   else
-   {
-      for (i = 0; i < grid_st.count; i++)
-         if (grid_view_accepts(tab, &grid_st.games[i], search))
-            grid_st.view[grid_st.view_count++] = i;
-   }
+   for (i = 0; i < grid_st.count; i++)
+      if (grid_view_accepts(tab, &grid_st.games[i], search))
+         grid_st.view[grid_st.view_count++] = i;
 
    if (grid_st.selection >= grid_st.view_count)
       grid_st.selection = grid_st.view_count ? grid_st.view_count - 1 : 0;
@@ -1072,6 +1008,137 @@ static void grid_flush_text(unsigned width, unsigned height)
    }
 }
 
+/* Draws a single character centred on (cx, cy) using the glyph's actual
+ * bounding box, so letters sit exactly in the middle of a button glyph. */
+static void grid_draw_char_centered(char ch, float cx, float cy,
+      unsigned width, unsigned height, uint32_t color, float scale)
+{
+   char str[2];
+   const struct font_glyph *g = NULL;
+   font_data_t *font          = grid_font(true, scale, height);
+
+   if (!font)
+      return;
+
+   str[0] = ch;
+   str[1] = '\0';
+
+   if (font->renderer && font->renderer->get_glyph)
+      g = font->renderer->get_glyph(font->renderer_data, (uint32_t)ch);
+
+   if (g && g->width && g->height)
+   {
+      /* Glyph box: left = pen + draw_offset_x, top = baseline + draw_offset_y */
+      float pen      = floorf(cx - g->draw_offset_x - g->width  / 2.0f + 0.5f);
+      float baseline = floorf(cy - g->draw_offset_y - g->height / 2.0f + 0.5f);
+      grid_draw_text_bold(str, pen, baseline, width, height, color,
+            TEXT_ALIGN_LEFT, scale);
+   }
+   else
+      grid_draw_text_bold(str, cx, grid_text_y(cy, height, scale),
+            width, height, color, TEXT_ALIGN_CENTER, scale);
+}
+
+/* Vertical gradient (top colour to bottom colour), e.g. a drop shadow. */
+static void grid_draw_vgradient(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height,
+      float x, float y, float w, float h, uint32_t top, uint32_t bottom)
+{
+   float color[16], c_top[16], c_bot[16];
+   int i;
+
+   grid_set_color(c_top, top);
+   grid_set_color(c_bot, bottom);
+
+   /* Quad vertices go bottom-left, bottom-right, top-left, top-right
+    * (the display driver's y axis points up). */
+   for (i = 0; i < 8; i++)
+   {
+      color[i]     = c_bot[i];
+      color[i + 8] = c_top[i];
+   }
+
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         (int)x, (int)y, (unsigned)w, (unsigned)h,
+         width, height, color, NULL);
+}
+
+/* L / R shoulder-button glyphs, rasterised at their exact on-screen size:
+ * a rounded rectangle with one large curved top corner (top-left for L,
+ * top-right for R), anti-aliased with a signed distance. */
+static void grid_create_shoulders(unsigned w, unsigned h)
+{
+   unsigned side, x, y;
+
+   for (side = 0; side < 2; side++)
+   {
+      struct texture_image ti;
+      float r_big   = h * 0.62f;
+      float r_small = h * 0.24f;
+      float hw      = w / 2.0f;
+      float hh      = h / 2.0f;
+
+      if (grid_st.shoulder[side])
+         video_driver_texture_unload(&grid_st.shoulder[side]);
+      grid_st.shoulder[side] = 0;
+
+      ti.width         = w;
+      ti.height        = h;
+      ti.supports_rgba = video_driver_supports_rgba();
+      ti.pixels        = (uint32_t*)malloc(w * h * sizeof(uint32_t));
+      if (!ti.pixels)
+         continue;
+
+      for (y = 0; y < h; y++)
+      {
+         for (x = 0; x < w; x++)
+         {
+            float px   = x + 0.5f - hw;
+            float py   = y + 0.5f - hh;
+            bool top   = py < 0.0f;
+            bool left  = px < 0.0f;
+            /* Big corner: top-left on L (side 0), top-right on R. */
+            float r    = (top && (side == 0 ? left : !left)) ? r_big : r_small;
+            float qx   = fabsf(px) - (hw - r);
+            float qy   = fabsf(py) - (hh - r);
+            float ox   = qx > 0.0f ? qx : 0.0f;
+            float oy   = qy > 0.0f ? qy : 0.0f;
+            float in   = (qx > qy ? qx : qy);
+            float dist = sqrtf(ox * ox + oy * oy) + (in < 0.0f ? in : 0.0f) - r;
+            float a    = 0.5f - dist;
+            if (a < 0.0f) a = 0.0f;
+            if (a > 1.0f) a = 1.0f;
+            ti.pixels[y * w + x] = ((uint32_t)(a * 255.0f) << 24) | 0x00ffffff;
+         }
+      }
+
+      video_driver_texture_load(&ti, TEXTURE_FILTER_NEAREST,
+            &grid_st.shoulder[side]);
+      free(ti.pixels);
+   }
+
+   grid_st.shoulder_w = w;
+   grid_st.shoulder_h = h;
+}
+
+static void grid_draw_shoulder(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, unsigned side, char letter,
+      float x, float y, unsigned w, unsigned h)
+{
+   float color[16];
+
+   if (grid_st.shoulder_w != w || grid_st.shoulder_h != h)
+      grid_create_shoulders(w, h);
+
+   grid_set_color(color, COL_GLYPH);
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         (int)x, (int)y, w, h, width, height, color,
+         grid_st.shoulder[side] ? &grid_st.shoulder[side] : NULL);
+
+   grid_draw_char_centered(letter, x + w / 2.0f, y + h / 2.0f + h * 0.04f,
+         width, height, COL_TEXT_DARK, 0.62f);
+}
+
 /* Draws text inside [x, x + w]. If it doesn't fit, it scrolls: pause,
  * scroll to the end, pause, jump back. key identifies what is being shown
  * so the scroll restarts when it changes. align applies when it fits. */
@@ -1164,10 +1231,11 @@ static float grid_draw_hint(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height, float x, float cy,
       const char *glyph, const char *label, bool measure_only)
 {
-   /* Circle a little taller than the label's capitals, bold letter. */
-   float scale  = 0.6f;
-   float d      = (float)(int)(height * 0.029f + 0.5f);
-   float gap    = height * 0.009f;
+   /* Even pixel sizes so the centre falls on a pixel boundary and the
+    * symbol inside can be centred exactly. */
+   float scale  = 0.7f;
+   float d      = 2.0f * floorf(height * 0.0165f + 0.5f);
+   float gap    = height * 0.01f;
    float lw     = grid_text_width(label, height, scale);
 
    if (!measure_only)
@@ -1177,9 +1245,25 @@ static float grid_draw_hint(gfx_display_t *p_disp, void *userdata,
 
       grid_draw_rounded(p_disp, userdata, width, height,
             gx, gy, d, d, d / 2.0f, COL_GLYPH);
-      grid_draw_text_bold(glyph, gx + d / 2.0f,
-            grid_text_y(gy + d / 2.0f, height, 0.56f),
-            width, height, COL_TEXT_DARK, TEXT_ALIGN_CENTER, 0.56f);
+
+      if (glyph[0] == '+')
+      {
+         /* Drawn as two bars: the font's '+' sits on the math axis, not
+          * centred, and its strokes blur at this size. */
+         float t   = 2.0f * floorf(d * 0.05f + 0.5f);
+         float len = 2.0f * floorf(d * 0.27f + 0.5f);
+         if (t < 2.0f) t = 2.0f;
+         grid_draw_rect(p_disp, userdata, width, height,
+               gx + (d - len) / 2.0f, gy + (d - t) / 2.0f, len, t,
+               COL_TEXT_DARK);
+         grid_draw_rect(p_disp, userdata, width, height,
+               gx + (d - t) / 2.0f, gy + (d - len) / 2.0f, t, len,
+               COL_TEXT_DARK);
+      }
+      else
+         grid_draw_char_centered(glyph[0], gx + d / 2.0f, gy + d / 2.0f,
+               width, height, COL_TEXT_DARK, 0.6f);
+
       grid_draw_text(label, gx + d + gap, grid_text_y(cy, height, scale),
             width, height, COL_TEXT, TEXT_ALIGN_LEFT, scale);
    }
@@ -1393,21 +1477,25 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
    const char *search = grid_search_text();
    bool typing        = menu_input_dialog_get_display_kb();
    unsigned cur       = grid_current_tab_index();
-   float row1         = height * 0.06f;
-   float row2         = height * 0.145f;
-   float pill_h       = height * 0.058f;
-   float pill_w       = width * 0.36f;
+   /* Proportions follow the reference: the search box and tabs fill the
+    * bar's two rows rather than floating in it. */
+   float row1         = bar_h * 0.31f;
+   float row2         = bar_h * 0.76f;
+   float pill_h       = floorf(bar_h * 0.36f + 0.5f);
+   float pill_w       = width * 0.355f;
    /* L / R: shoulder-button shape, wider than tall. */
-   float glyph        = (float)(int)(height * 0.032f + 0.5f);
-   float glyph_w      = (float)(int)(glyph * 1.45f + 0.5f);
-   float tabs_x0      = side + glyph_w + height * 0.025f;
-   float tabs_x1      = width - side - glyph_w - height * 0.025f;
-   float tab_scale    = 0.5f;
+   float glyph        = (float)(int)(bar_h * 0.2f + 0.5f);
+   float glyph_w      = (float)(int)(glyph * 1.35f + 0.5f);
+   float tabs_x0      = side + glyph_w + height * 0.018f;
+   float tabs_x1      = width - side - glyph_w - height * 0.018f;
+   float tab_scale    = 0.66f;
 
    grid_draw_rect(p_disp, userdata, width, height,
          0, 0, width, bar_h, COL_BAR);
-   grid_draw_rect(p_disp, userdata, width, height,
-         0, bar_h, width, height * 0.002f + 1.0f, COL_DIVIDER);
+
+   /* Soft drop shadow under the bar, over the grid. */
+   grid_draw_vgradient(p_disp, userdata, width, height,
+         0, floorf(bar_h), width, floorf(height * 0.022f), 0x000000b0, 0x00000000);
 
    /* Search box with a magnifier ring */
    {
@@ -1444,48 +1532,41 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
          /* Blinking caret while the keyboard is open. */
          bool caret = fmodf(cpu_features_get_time_usec() / 1000000.0f, 1.0f) < 0.5f;
          snprintf(text, sizeof(text), "%s%s", search, caret ? "|" : "");
-         grid_draw_text(text, tx, grid_text_y(row1, height, 0.65f),
-               width, height, COL_TEXT, TEXT_ALIGN_LEFT, 0.65f);
+         grid_draw_text(text, tx, grid_text_y(row1, height, 0.78f),
+               width, height, COL_TEXT, TEXT_ALIGN_LEFT, 0.78f);
       }
       else if (!string_is_empty(search))
-         grid_draw_text(search, tx, grid_text_y(row1, height, 0.65f),
-               width, height, COL_TEXT, TEXT_ALIGN_LEFT, 0.65f);
+         grid_draw_text(search, tx, grid_text_y(row1, height, 0.78f),
+               width, height, COL_TEXT, TEXT_ALIGN_LEFT, 0.78f);
       else
          grid_draw_text("Search for games...", tx,
-               grid_text_y(row1, height, 0.65f),
-               width, height, COL_TEXT_DIM, TEXT_ALIGN_LEFT, 0.65f);
+               grid_text_y(row1, height, 0.78f),
+               width, height, COL_TEXT_DIM, TEXT_ALIGN_LEFT, 0.78f);
    }
 
    /* Clock */
    now_t  = time(NULL);
    tm_now = localtime(&now_t);
    if (tm_now && strftime(clock, sizeof(clock), "%H:%M", tm_now))
-      grid_draw_text(clock, width - side, grid_text_y(row1, height, 0.8f),
-            width, height, COL_TEXT, TEXT_ALIGN_RIGHT, 0.8f);
+      grid_draw_text_bold(clock, width - side, grid_text_y(row1, height, 0.85f),
+            width, height, COL_TEXT, TEXT_ALIGN_RIGHT, 0.85f);
 
-   /* L / R glyphs: light rounded rectangles, bold dark letter */
+   /* L / R shoulder-button glyphs */
    {
       float gy = floorf(row2 - glyph / 2.0f + 0.5f);
-      float rx = width - side - glyph_w;
-      grid_draw_rounded(p_disp, userdata, width, height,
-            side, gy, glyph_w, glyph, glyph * 0.28f, COL_GLYPH);
-      grid_draw_text_bold("L", side + glyph_w / 2.0f,
-            grid_text_y(gy + glyph / 2.0f, height, 0.5f),
-            width, height, COL_TEXT_DARK, TEXT_ALIGN_CENTER, 0.5f);
-      grid_draw_rounded(p_disp, userdata, width, height,
-            rx, gy, glyph_w, glyph, glyph * 0.28f, COL_GLYPH);
-      grid_draw_text_bold("R", rx + glyph_w / 2.0f,
-            grid_text_y(gy + glyph / 2.0f, height, 0.5f),
-            width, height, COL_TEXT_DARK, TEXT_ALIGN_CENTER, 0.5f);
+      grid_draw_shoulder(p_disp, userdata, width, height, 0, 'L',
+            side, gy, (unsigned)glyph_w, (unsigned)glyph);
+      grid_draw_shoulder(p_disp, userdata, width, height, 1, 'R',
+            width - side - glyph_w, gy, (unsigned)glyph_w, (unsigned)glyph);
    }
 
    /* Tabs spread across the full width between L and R: first starts
     * after L, last ends before R, equal gaps between. The pill around the
     * current one pads its text by `pad`. */
    {
-      float pad    = height * 0.022f;   /* text to pill edge */
-      float min_sp = height * 0.05f;    /* tightest gap before sliding */
-      float ph     = height * 0.044f;
+      float ph     = floorf(bar_h * 0.235f + 0.5f); /* pill height */
+      float pad    = ph * 0.62f;        /* text to pill edge */
+      float min_sp = height * 0.04f;    /* tightest gap before sliding */
       float xs[GRID_MAX_TABS];
       float ws[GRID_MAX_TABS];
       char  counts[GRID_MAX_TABS][16];
@@ -1661,7 +1742,7 @@ bool grid_home_frame(video_frame_info_t *video_info)
    /* Layout scales with window size: 5 portrait covers per row. */
    side     = width * 0.027f;
    gap      = width * 0.02f;
-   top_h    = height * 0.19f;
+   top_h    = floorf(height * 0.175f);
    bot_h    = height * 0.12f;
    bot_y    = height - bot_h;
    grid_top = top_h + height * 0.04f;
@@ -1795,12 +1876,22 @@ void grid_home_context_reset(bool is_threaded)
 
 void grid_home_context_destroy(void)
 {
+   unsigned i;
+
    grid_free_textures();
    grid_free_game_bg();
 
    if (grid_st.disc)
       video_driver_texture_unload(&grid_st.disc);
    grid_st.disc = 0;
+
+   for (i = 0; i < 2; i++)
+   {
+      if (grid_st.shoulder[i])
+         video_driver_texture_unload(&grid_st.shoulder[i]);
+      grid_st.shoulder[i] = 0;
+   }
+   grid_st.shoulder_w = grid_st.shoulder_h = 0;
 
    grid_free_fonts();
    grid_st.font_screen_h = 0;
