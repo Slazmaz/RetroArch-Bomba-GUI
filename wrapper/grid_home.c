@@ -61,9 +61,10 @@
 /* The layout is measured from a 752x423 reference screenshot. REF(px)
  * converts a reference pixel length to this screen; CAP(px) gives the
  * font scale whose capital letters are px reference pixels tall
- * (scale 1.0 = height/32 em, Roboto cap height = 0.71 em). */
+ * (scale 1.0 = height/32 em). */
+#define GRID_FONT_CAP  0.70f /* Montserrat cap height, in em */
 #define REF(px)        ((float)(px) * (float)height / 423.0f)
-#define CAP(px)        ((float)(px) * 32.0f / (423.0f * 0.71f))
+#define CAP(px)        ((float)(px) * 32.0f / (423.0f * GRID_FONT_CAP))
 #define GRID_FONT_CACHE 16
 #define GRID_COVER_RADIUS 0.04f /* corner radius / tile width (reference) */
 
@@ -979,10 +980,10 @@ static void grid_draw_text_bold(const char *text, float x, float y,
 }
 
 /* Baseline y that vertically centres capital letters of the given scale
- * on cy (Roboto's cap height is ~0.71 em). */
+ * on cy. */
 static float grid_text_y(float cy, unsigned height, float scale)
 {
-   return cy + (height / 32.0f) * scale * 0.355f;
+   return cy + (height / 32.0f) * scale * (GRID_FONT_CAP / 2.0f);
 }
 
 static float grid_text_width_font(bool bold, const char *text,
@@ -1278,7 +1279,7 @@ static float grid_draw_hint(gfx_display_t *p_disp, void *userdata,
          /* Letter cap height ~54% of the circle, as in the reference. */
          grid_draw_char_centered(glyph[0], gx + d / 2.0f, gy + d / 2.0f,
                width, height, COL_TEXT_DARK,
-               d * 0.54f / (height / 32.0f) / 0.71f);
+               d * 0.54f / (height / 32.0f) / GRID_FONT_CAP);
 
       grid_draw_text(label, gx + d + gap, grid_text_y(cy, height, scale),
             width, height, COL_TEXT, TEXT_ALIGN_LEFT, scale);
@@ -1868,12 +1869,12 @@ void grid_home_context_reset(bool is_threaded)
    grid_home_context_destroy();
 
    /* Fonts load lazily per size (grid_font); just record where they are.
-    * Roboto ships next to the exe (see build.sh); fall back to XMB's. */
+    * Montserrat ships next to the exe (see build.sh); fall back to XMB's. */
    grid_st.font_threaded = is_threaded;
    fill_pathname_application_dir(app_dir, sizeof(app_dir));
 
    fill_pathname_join_special(grid_st.font_path[0], app_dir,
-         "wrapper/fonts/Roboto-Medium.ttf", sizeof(grid_st.font_path[0]));
+         "wrapper/fonts/Montserrat-Medium.ttf", sizeof(grid_st.font_path[0]));
    if (!path_is_valid(grid_st.font_path[0]))
       fill_pathname_application_special(grid_st.font_path[0],
             sizeof(grid_st.font_path[0]),
@@ -1881,7 +1882,7 @@ void grid_home_context_reset(bool is_threaded)
 
    /* Bold variant; without it bold text uses the regular font. */
    fill_pathname_join_special(grid_st.font_path[1], app_dir,
-         "wrapper/fonts/Roboto-Bold.ttf", sizeof(grid_st.font_path[1]));
+         "wrapper/fonts/Montserrat-Bold.ttf", sizeof(grid_st.font_path[1]));
    if (!path_is_valid(grid_st.font_path[1]))
       grid_st.font_path[1][0] = '\0';
 
