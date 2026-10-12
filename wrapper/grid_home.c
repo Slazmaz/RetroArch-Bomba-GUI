@@ -89,7 +89,7 @@ typedef struct
    char path[PATH_MAX_LENGTH];
    char core_path[PATH_MAX_LENGTH];
    char title[NAME_MAX_LENGTH];
-   char system[16];                   /* tab label, e.g. "SNES" */
+   char system[40];                   /* tab label, e.g. "SUPER NINTENDO" */
    char boxart_path[PATH_MAX_LENGTH]; /* libretro-thumbnails fallback */
    char art_path[PATH_MAX_LENGTH];    /* what is shown */
    uintptr_t art;
@@ -108,7 +108,7 @@ enum grid_tab_type
 typedef struct
 {
    enum grid_tab_type type;
-   char label[32];
+   char label[40];
 } grid_tab_t;
 
 static struct
@@ -119,7 +119,8 @@ static struct
    /* Current tab + search, as a list of indices into games */
    grid_tab_t tabs[GRID_MAX_TABS];
    unsigned tab_count;
-   char tab_label[32];      /* current tab, kept across rebuilds */
+   char tab_label[40];      /* current tab, kept across rebuilds */
+   unsigned tab_first;      /* first tab shown when they don't all fit */
    size_t *view;
    size_t view_count;
    size_t selection;        /* index into view */
@@ -272,36 +273,43 @@ static const char *grid_disc_system(const char *path, const char *ext)
    {
       uint32_t type = ((uint32_t)b[0x48] << 24) | ((uint32_t)b[0x49] << 16)
                     | ((uint32_t)b[0x4A] <<  8) |  (uint32_t)b[0x4B];
-      return type == 2 ? "WII" : type == 1 ? "GAMECUBE" : NULL;
+      return type == 2 ? "NINTENDO WII" : type == 1 ? "NINTENDO GAMECUBE" : NULL;
    }
 
    if (b[0x18] == 0x5D && b[0x19] == 0x1C && b[0x1A] == 0x9E && b[0x1B] == 0xA3)
-      return "WII";
+      return "NINTENDO WII";
    if (b[0x1C] == 0xC2 && b[0x1D] == 0x33 && b[0x1E] == 0x9F && b[0x1F] == 0x3D)
-      return "GAMECUBE";
+      return "NINTENDO GAMECUBE";
 
    return NULL; /* e.g. a PSP/PS2 ISO */
 }
 
-/* Tab label for a file extension. */
+/* Tab label (full system name) for a file extension. */
 static void grid_system_label(const char *ext, char *s, size_t len)
 {
    static const struct { const char *ext, *label; } map[] = {
-      { "gba", "GBA" },     { "gb",  "GAME BOY" }, { "gbc", "GBC" },
-      { "sfc", "SNES" },    { "smc", "SNES" },     { "nes", "NES" },
-      { "fds", "NES" },     { "n64", "N64" },      { "z64", "N64" },
-      { "v64", "N64" },     { "md",  "GENESIS" },  { "gen", "GENESIS" },
-      { "smd", "GENESIS" }, { "sms", "MASTER SYSTEM" },
-      { "gg",  "GAME GEAR" },{ "pce", "PC ENGINE" }, { "nds", "DS" },
-      { "dsi", "DS" },      { "ndd", "N64" },
-      { "rvz", "GAMECUBE" },{ "gcz", "GAMECUBE" }, { "gcm", "GAMECUBE" },
-      { "ciso","GAMECUBE" },{ "wbfs", "WII" },     { "wad", "WII" },
-      { "cso", "PSP" },     { "pbp", "PSP" },      { "3ds", "3DS" },
-      { "cci", "3DS" },     { "32x", "32X" },      { "a26", "ATARI 2600" },
-      { "a78", "ATARI 7800" },{ "lnx", "LYNX" },   { "ws",  "WONDERSWAN" },
-      { "wsc", "WONDERSWAN" },{ "vb",  "VIRTUAL BOY" },
-      { "ngp", "NEO GEO POCKET" },{ "ngc", "NEO GEO POCKET" },
-      { "col", "COLECOVISION" }
+      { "gba",  "GAME BOY ADVANCE" },  { "gb",   "GAME BOY" },
+      { "gbc",  "GAME BOY COLOR" },    { "sfc",  "SUPER NINTENDO" },
+      { "smc",  "SUPER NINTENDO" },    { "nes",  "NINTENDO ENTERTAINMENT SYSTEM" },
+      { "fds",  "FAMICOM DISK SYSTEM" },
+      { "n64",  "NINTENDO 64" },       { "z64",  "NINTENDO 64" },
+      { "v64",  "NINTENDO 64" },       { "ndd",  "NINTENDO 64" },
+      { "nds",  "NINTENDO DS" },       { "dsi",  "NINTENDO DS" },
+      { "3ds",  "NINTENDO 3DS" },      { "cci",  "NINTENDO 3DS" },
+      { "rvz",  "NINTENDO GAMECUBE" }, { "gcz",  "NINTENDO GAMECUBE" },
+      { "gcm",  "NINTENDO GAMECUBE" }, { "ciso", "NINTENDO GAMECUBE" },
+      { "wbfs", "NINTENDO WII" },      { "wad",  "NINTENDO WII" },
+      { "vb",   "VIRTUAL BOY" },
+      { "md",   "SEGA GENESIS" },      { "gen",  "SEGA GENESIS" },
+      { "smd",  "SEGA GENESIS" },      { "sms",  "SEGA MASTER SYSTEM" },
+      { "gg",   "SEGA GAME GEAR" },    { "32x",  "SEGA 32X" },
+      { "cso",  "PLAYSTATION PORTABLE" },{ "pbp", "PLAYSTATION PORTABLE" },
+      { "pce",  "PC ENGINE" },
+      { "a26",  "ATARI 2600" },        { "a78",  "ATARI 7800" },
+      { "lnx",  "ATARI LYNX" },
+      { "ws",   "WONDERSWAN" },        { "wsc",  "WONDERSWAN COLOR" },
+      { "ngp",  "NEO GEO POCKET" },    { "ngc",  "NEO GEO POCKET COLOR" },
+      { "col",  "COLECOVISION" }
    };
    size_t i;
 
@@ -1655,78 +1663,147 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
    /* Tabs spread across the full row: the first pill starts 14px after
     * L and the last label ends 25px before R (as RACING does in the
     * reference); the space between is shared evenly, never less than the
-    * reference's 50px. Text is padded 16px inside the pill and the count
-    * follows its label 9.5px later. */
+    * reference's 50px. Text is padded 16px inside the pill; the selected
+    * tab shows its game count 9.5px after its label.
+    *
+    * If they don't all fit, a window of tabs is shown with "+N MORE" in
+    * place of the hidden ones on either side; it slides as the selection
+    * moves past its edge. */
    {
       float ph     = floorf(REF(17) + 0.5f); /* pill height = glyph height */
       float pad    = REF(16);
-      float space  = REF(50);
+      float min_sp = REF(50);
       float cgap   = REF(9.5);
       float last_x = width - side - glyph_w - REF(25); /* last text end */
-      float xs[GRID_MAX_TABS];
+      float avail  = last_x - (tabs_x0 + pad);
+      unsigned n   = grid_st.tab_count;
       float ws[GRID_MAX_TABS];
-      char  counts[GRID_MAX_TABS][16];
-      float x      = tabs_x0 + pad;
-      float sum    = 0.0f;
-      float shift  = 0.0f;
+      char  count[16];
+      char  more_l[24], more_r[24];
+      float more_lw = 0.0f, more_rw = 0.0f;
+      unsigned first = 0, last = n ? n - 1 : 0;
+      float sum    = 0.0f, used, space, x;
+      unsigned items;
 
-      for (i = 0; i < grid_st.tab_count; i++)
+      snprintf(count, sizeof(count), "%u", (unsigned)grid_st.view_count);
+
+      for (i = 0; i < n; i++)
       {
-         counts[i][0] = '\0';
-         if (grid_st.tabs[i].type == TAB_ALL)
-            snprintf(counts[i], sizeof(counts[i]), "%u",
-                  (unsigned)grid_st.count);
-
          ws[i] = grid_text_width_bold(grid_st.tabs[i].label, height, tab_scale);
-         if (counts[i][0])
-            ws[i] += cgap + grid_text_width_bold(counts[i], height, tab_scale);
+         if (i == cur)
+            ws[i] += cgap + grid_text_width_bold(count, height, tab_scale);
          sum  += ws[i];
       }
 
-      if (grid_st.tab_count > 1)
+      /* Pick the visible window [first, last]. */
+      if (n && sum + (n - 1) * min_sp > avail)
       {
-         float even = (last_x - (tabs_x0 + pad) - sum)
-                    / (grid_st.tab_count - 1);
-         if (even > space)
-            space = even;
+         first = grid_st.tab_first;
+         if (first > cur)
+            first = cur;
+
+         for (;;)
+         {
+            unsigned k;
+
+            more_l[0] = '\0';
+            more_lw   = 0.0f;
+            used      = 0.0f;
+            if (first > 0)
+            {
+               snprintf(more_l, sizeof(more_l), "+%u MORE", first);
+               more_lw = grid_text_width_bold(more_l, height, tab_scale);
+               used    = more_lw + min_sp;
+            }
+
+            /* Add tabs while they fit, keeping room for a right "+N MORE"
+             * unless the tab is the last one. */
+            last = first;
+            for (k = first; k < n; k++)
+            {
+               float need = used + (k > first ? min_sp : 0.0f) + ws[k];
+               float rsv  = 0.0f;
+               if (k + 1 < n)
+               {
+                  char tmp[24];
+                  snprintf(tmp, sizeof(tmp), "+%u MORE", n - 1 - k);
+                  rsv = min_sp + grid_text_width_bold(tmp, height, tab_scale);
+               }
+               if (k > first && need + rsv > avail)
+                  break;
+               used = need;
+               last = k;
+            }
+
+            if (cur <= last || first >= cur)
+               break;
+            first++;
+         }
+
+         grid_st.tab_first = first;
+      }
+      else
+         grid_st.tab_first = 0;
+
+      more_r[0] = '\0';
+      more_rw   = 0.0f;
+      if (n && last + 1 < n)
+      {
+         snprintf(more_r, sizeof(more_r), "+%u MORE", n - 1 - last);
+         more_rw = grid_text_width_bold(more_r, height, tab_scale);
+      }
+      if (first == 0)
+      {
+         more_l[0] = '\0';
+         more_lw   = 0.0f;
       }
 
-      for (i = 0; i < grid_st.tab_count; i++)
+      /* Spread the visible items evenly. */
+      sum   = more_lw + more_rw;
+      items = (more_l[0] ? 1 : 0) + (more_r[0] ? 1 : 0);
+      for (i = first; n && i <= last; i++)
       {
-         xs[i] = x;
-         x    += ws[i] + space;
+         sum += ws[i];
+         items++;
+      }
+      space = items > 1 ? (avail - sum) / (items - 1) : 0.0f;
+      if (space < min_sp)
+         space = min_sp;
+
+      x = tabs_x0 + pad;
+
+      if (more_l[0])
+      {
+         grid_draw_text_bold(more_l, x, grid_text_y(REF(63.5), height,
+                  tab_scale), width, height, COL_TEXT_DIM, TEXT_ALIGN_LEFT,
+               tab_scale);
+         x += more_lw + space;
       }
 
-      /* Too many tabs to fit: slide so the current one is visible. Limits
-       * are on the label text; a pill around the last label still clears
-       * R (25px gap > 16px padding). */
-      if (grid_st.tab_count && xs[cur] + ws[cur] > last_x)
-         shift = xs[cur] + ws[cur] - last_x;
-
-      for (i = 0; i < grid_st.tab_count; i++)
+      for (i = first; n && i <= last; i++)
       {
-         float tx = xs[i] - shift;
-
-         if (tx - pad < tabs_x0 - 1.0f || tx + ws[i] > last_x + 1.0f)
-            continue;
-
          if (i == cur)
+         {
             grid_draw_rounded(p_disp, userdata, width, height,
-                  tx - pad, floorf(REF(55) + 0.5f), ws[i] + 2.0f * pad, ph,
+                  x - pad, floorf(REF(55) + 0.5f), ws[i] + 2.0f * pad, ph,
                   ph / 2.0f, COL_TAB_PILL);
+            grid_draw_text_bold(count,
+                  x + ws[i] - grid_text_width_bold(count, height, tab_scale),
+                  grid_text_y(REF(63.5), height, tab_scale), width, height,
+                  0x6a6b72ff, TEXT_ALIGN_LEFT, tab_scale);
+         }
 
-         grid_draw_text_bold(grid_st.tabs[i].label, tx,
+         grid_draw_text_bold(grid_st.tabs[i].label, x,
                grid_text_y(REF(63.5), height, tab_scale), width, height,
                i == cur ? COL_TEXT_DARK : COL_TEXT, TEXT_ALIGN_LEFT, tab_scale);
 
-         if (counts[i][0])
-            grid_draw_text_bold(counts[i],
-                  tx + grid_text_width_bold(grid_st.tabs[i].label, height,
-                     tab_scale) + cgap,
-                  grid_text_y(REF(63.5), height, tab_scale), width, height,
-                  i == cur ? 0x6a6b72ff : COL_TEXT_DIM, TEXT_ALIGN_LEFT,
-                  tab_scale);
+         x += ws[i] + space;
       }
+
+      if (more_r[0])
+         grid_draw_text_bold(more_r, x, grid_text_y(REF(63.5), height,
+                  tab_scale), width, height, COL_TEXT_DIM, TEXT_ALIGN_LEFT,
+               tab_scale);
    }
 }
 
