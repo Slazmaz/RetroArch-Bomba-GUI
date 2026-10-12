@@ -47,8 +47,8 @@
 
 #define GRID_MAX_GAMES 1024
 
-/* Colours (RGBA) - carbon background, white bar, Joy-Con accents */
-#define COL_BG          0x262626ff /* fallback if the carbon texture fails */
+/* Colours (RGBA) - gradient background, white bar, Joy-Con accents */
+#define COL_BG          0x0e0f16ff /* base under the moving glows */
 #define COL_TILE        0xffffffff
 #define COL_TEXT        0x2d2d2dff /* on the white bar */
 #define COL_TEXT_DIM    0x7a7a7aff
@@ -118,9 +118,11 @@ static struct
    font_data_t *font;
    float font_height;   /* video height the font was sized for */
    uintptr_t disc;      /* white anti-aliased circle, for rounded shapes */
-   uintptr_t carbon;    /* screen-sized carbon fibre background */
-   unsigned carbon_w;
-   unsigned carbon_h;
+   uintptr_t glow;      /* soft white blob, for the moving gradient */
+   uintptr_t game_bg;   /* blurred snapshot of the paused game */
+   unsigned game_bg_w;
+   unsigned game_bg_h;
+   bool game_bg_tried;
    char scanned_dir[PATH_MAX_LENGTH];
 
    /* Running game, for the bar */
@@ -439,8 +441,19 @@ static void grid_update_running(void)
 /* Input                                                                  */
 /* ---------------------------------------------------------------------- */
 
+static void grid_free_game_bg(void)
+{
+   if (grid_st.game_bg)
+      video_driver_texture_unload(&grid_st.game_bg);
+   grid_st.game_bg       = 0;
+   grid_st.game_bg_tried = false;
+}
+
 void grid_home_toggle(bool menu_on)
 {
+   /* Fresh snapshot of the game each time the menu opens. */
+   grid_free_game_bg();
+
    if (menu_on)
    {
       grid_st.xmb = false;
@@ -646,54 +659,258 @@ static void grid_create_disc(void)
    free(ti.pixels);
 }
 
-/* Carbon fibre weave at screen size: a checkerboard of thread bundles,
- * alternating horizontal/vertical, each shaded like a rounded thread. */
-static void grid_create_carbon(unsigned width, unsigned height)
+/* Soft white blob: alpha fades smoothly from the centre to the edge.
+ * Drawn large and tinted, overlapping blobs read as a blurred gradient. */
+static void grid_create_glow(void)
 {
    struct texture_image ti;
+   const unsigned size = 128;
+   const float r       = size / 2.0f;
    unsigned x, y;
-   unsigned cell = height / 180;   /* 6px at 1080p */
-   const float pi = 3.14159265f;
 
-   if (grid_st.carbon)
-      video_driver_texture_unload(&grid_st.carbon);
-   grid_st.carbon   = 0;
-   grid_st.carbon_w = width;
-   grid_st.carbon_h = height;
-
-   if (cell < 3)
-      cell = 3;
-
-   ti.width         = width;
-   ti.height        = height;
+   ti.width         = size;
+   ti.height        = size;
    ti.supports_rgba = video_driver_supports_rgba();
-   ti.pixels        = (uint32_t*)malloc(width * height * sizeof(uint32_t));
+   ti.pixels        = (uint32_t*)malloc(size * size * sizeof(uint32_t));
    if (!ti.pixels)
       return;
 
-   for (y = 0; y < height; y++)
+   for (y = 0; y < size; y++)
    {
-      unsigned cy = y / cell;
-      float    fy = (y % cell + 0.5f) / cell;
-
-      for (x = 0; x < width; x++)
+      for (x = 0; x < size; x++)
       {
-         unsigned cx = x / cell;
-         float    fx = (x % cell + 0.5f) / cell;
-         /* Horizontal bundles shade across y, vertical ones across x. */
-         bool horiz  = ((cx + cy) & 1) == 0;
-         float f     = horiz ? fy : fx;
-         float shade = sinf(f * pi);              /* 0 at edges, 1 centre */
-         float sheen = horiz ? 1.0f : 0.8f;       /* weave catches light */
-         uint32_t v  = (uint32_t)(24.0f + shade * 22.0f * sheen);
-
-         /* Grey: identical in RGBA and BGRA. */
-         ti.pixels[y * width + x] = 0xff000000 | (v << 16) | (v << 8) | v;
+         float dx = x + 0.5f - r;
+         float dy = y + 0.5f - r;
+         float a  = 1.0f - sqrtf(dx * dx + dy * dy) / r;
+         if (a < 0.0f) a = 0.0f;
+         a = a * a * (3.0f - 2.0f * a);           /* smoothstep */
+         ti.pixels[y * size + x] = ((uint32_t)(a * 255.0f) << 24) | 0x00ffffff;
       }
    }
 
-   video_driver_texture_load(&ti, TEXTURE_FILTER_NEAREST, &grid_st.carbon);
+   video_driver_texture_load(&ti, TEXTURE_FILTER_LINEAR, &grid_st.glow);
    free(ti.pixels);
+}
+
+/* One box-blur pass over an RGB float image, horizontally then
+ * vertically, radius r. */
+static void grid_box_blur(float *img, float *tmp, unsigned w, unsigned h, int r)
+{
+   unsigned x, y;
+   int k, c;
+
+   for (y = 0; y < h; y++)
+      for (x = 0; x < w; x++)
+         for (c = 0; c < 3; c++)
+         {
+            float sum = 0.0f;
+            for (k = -r; k <= r; k++)
+            {
+               int sx = (int)x + k;
+               if (sx < 0) sx = 0;
+               if (sx >= (int)w) sx = w - 1;
+               sum += img[(y * w + sx) * 3 + c];
+            }
+            tmp[(y * w + x) * 3 + c] = sum / (2 * r + 1);
+         }
+
+   for (y = 0; y < h; y++)
+      for (x = 0; x < w; x++)
+         for (c = 0; c < 3; c++)
+         {
+            float sum = 0.0f;
+            for (k = -r; k <= r; k++)
+            {
+               int sy = (int)y + k;
+               if (sy < 0) sy = 0;
+               if (sy >= (int)h) sy = h - 1;
+               sum += tmp[(sy * w + x) * 3 + c];
+            }
+            img[(y * w + x) * 3 + c] = sum / (2 * r + 1);
+         }
+}
+
+/* Reads one source pixel of the game's frame as RGB 0-255. */
+static void grid_read_pixel(const uint8_t *row, unsigned x,
+      enum retro_pixel_format fmt, float *rgb)
+{
+   if (fmt == RETRO_PIXEL_FORMAT_XRGB8888)
+   {
+      uint32_t p = ((const uint32_t*)row)[x];
+      rgb[0] = (p >> 16) & 0xff;
+      rgb[1] = (p >>  8) & 0xff;
+      rgb[2] =  p        & 0xff;
+   }
+   else if (fmt == RETRO_PIXEL_FORMAT_RGB565)
+   {
+      uint16_t p = ((const uint16_t*)row)[x];
+      rgb[0] = ((p >> 11) & 0x1f) * (255.0f / 31.0f);
+      rgb[1] = ((p >>  5) & 0x3f) * (255.0f / 63.0f);
+      rgb[2] = ( p        & 0x1f) * (255.0f / 31.0f);
+   }
+   else /* 0RGB1555 */
+   {
+      uint16_t p = ((const uint16_t*)row)[x];
+      rgb[0] = ((p >> 10) & 0x1f) * (255.0f / 31.0f);
+      rgb[1] = ((p >>  5) & 0x1f) * (255.0f / 31.0f);
+      rgb[2] = ( p        & 0x1f) * (255.0f / 31.0f);
+   }
+}
+
+/* Snapshot of the paused game's last frame: shrunk, blurred and dimmed,
+ * uploaded as a small texture that is stretched over the screen. Only
+ * works for software-rendered cores (hardware cores keep no CPU copy). */
+static void grid_capture_game_bg(void)
+{
+   struct texture_image ti;
+   video_driver_state_t *video_st = video_state_get_ptr();
+   const uint8_t *src             = (const uint8_t*)video_st->frame_cache_data;
+   unsigned sw                    = video_st->frame_cache_width;
+   unsigned sh                    = video_st->frame_cache_height;
+   size_t pitch                   = video_st->frame_cache_pitch;
+   enum retro_pixel_format fmt    = video_st->pix_fmt;
+   const unsigned dw              = 96;
+   unsigned dh, x, y, i;
+   float *img, *tmp;
+
+   grid_st.game_bg_tried = true;
+
+   if (!src || src == RETRO_HW_FRAME_BUFFER_VALID || !sw || !sh || !pitch)
+      return;
+
+   dh = (unsigned)(dw * (float)sh / sw + 0.5f);
+   if (dh < 1)
+      dh = 1;
+
+   img = (float*)calloc(dw * dh * 3, sizeof(float));
+   tmp = (float*)calloc(dw * dh * 3, sizeof(float));
+   ti.pixels = (uint32_t*)malloc(dw * dh * sizeof(uint32_t));
+
+   if (img && tmp && ti.pixels)
+   {
+      /* Shrink: average each block of source pixels. */
+      for (y = 0; y < dh; y++)
+      {
+         unsigned y0 = y * sh / dh, y1 = (y + 1) * sh / dh;
+         for (x = 0; x < dw; x++)
+         {
+            unsigned x0 = x * sw / dw, x1 = (x + 1) * sw / dw;
+            unsigned sx, sy, n = 0;
+            float acc[3] = { 0.0f, 0.0f, 0.0f };
+
+            if (y1 <= y0) y1 = y0 + 1;
+            if (x1 <= x0) x1 = x0 + 1;
+
+            for (sy = y0; sy < y1 && sy < sh; sy++)
+               for (sx = x0; sx < x1 && sx < sw; sx++)
+               {
+                  float rgb[3];
+                  grid_read_pixel(src + sy * pitch, sx, fmt, rgb);
+                  acc[0] += rgb[0];
+                  acc[1] += rgb[1];
+                  acc[2] += rgb[2];
+                  n++;
+               }
+
+            for (i = 0; i < 3; i++)
+               img[(y * dw + x) * 3 + i] = n ? acc[i] / n : 0.0f;
+         }
+      }
+
+      /* Three box passes approximate a Gaussian blur. */
+      for (i = 0; i < 3; i++)
+         grid_box_blur(img, tmp, dw, dh, 3);
+
+      /* Dim so the grid and text stay readable on top. */
+      for (i = 0; i < dw * dh; i++)
+      {
+         uint32_t r = (uint32_t)(img[i * 3 + 0] * 0.55f);
+         uint32_t g = (uint32_t)(img[i * 3 + 1] * 0.55f);
+         uint32_t b = (uint32_t)(img[i * 3 + 2] * 0.55f);
+
+         /* RGBA-capable drivers take R in the low byte, others ARGB. */
+         ti.pixels[i] = video_driver_supports_rgba()
+            ? (0xff000000 | (b << 16) | (g << 8) | r)
+            : (0xff000000 | (r << 16) | (g << 8) | b);
+      }
+
+      ti.width         = dw;
+      ti.height        = dh;
+      ti.supports_rgba = video_driver_supports_rgba();
+
+      video_driver_texture_load(&ti, TEXTURE_FILTER_LINEAR, &grid_st.game_bg);
+      grid_st.game_bg_w = dw;
+      grid_st.game_bg_h = dh;
+   }
+
+   free(img);
+   free(tmp);
+   free(ti.pixels);
+}
+
+/* Background: the blurred paused game if there is one, otherwise soft
+ * coloured glows drifting over a dark base. */
+static void grid_draw_background(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, bool game_running)
+{
+   /* Joy-Con-ish colours; alpha keeps overlaps soft. */
+   static const struct
+   {
+      uint32_t color;
+      float sx, sy, phase;
+   } glows[] = {
+      { 0x0ab9e68c, 0.11f, 0.07f, 0.0f }, /* blue   */
+      { 0xff3c2870, 0.08f, 0.10f, 2.1f }, /* red    */
+      { 0x7b3cff80, 0.06f, 0.09f, 4.2f }, /* purple */
+      { 0x00c89670, 0.09f, 0.05f, 1.3f }, /* teal   */
+      { 0xe6a0ff50, 0.05f, 0.08f, 3.4f }  /* pink   */
+   };
+   float color[16];
+   unsigned i;
+   float t;
+
+   if (game_running && !grid_st.game_bg && !grid_st.game_bg_tried)
+      grid_capture_game_bg();
+
+   if (game_running && grid_st.game_bg)
+   {
+      /* Cover the screen, keeping the game's aspect ratio. */
+      float s  = (float)width / grid_st.game_bg_w;
+      float bw, bh;
+      if (grid_st.game_bg_h * s < height)
+         s = (float)height / grid_st.game_bg_h;
+      bw = grid_st.game_bg_w * s;
+      bh = grid_st.game_bg_h * s;
+
+      grid_set_color(color, 0xffffffff);
+      gfx_display_draw_quad(p_disp, userdata, width, height,
+            (int)((width - bw) / 2.0f), (int)((height - bh) / 2.0f),
+            (unsigned)bw, (unsigned)bh, width, height, color,
+            &grid_st.game_bg);
+      return;
+   }
+
+   grid_set_color(color, COL_BG);
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         0, 0, width, height, width, height, color, NULL);
+
+   if (!grid_st.glow)
+      return;
+
+   t = cpu_features_get_time_usec() / 1000000.0f;
+
+   for (i = 0; i < sizeof(glows) / sizeof(glows[0]); i++)
+   {
+      float size = height * 1.3f;
+      float cx   = width  * (0.5f + 0.38f * sinf(t * glows[i].sx * 6.2832f + glows[i].phase));
+      float cy   = height * (0.5f + 0.38f * cosf(t * glows[i].sy * 6.2832f + glows[i].phase * 1.7f));
+
+      grid_set_color(color, glows[i].color);
+      gfx_display_draw_quad(p_disp, userdata, width, height,
+            (int)(cx - size / 2.0f), (int)(cy - size / 2.0f),
+            (unsigned)size, (unsigned)size, width, height, color,
+            &grid_st.glow);
+   }
 }
 
 /* Opaque rounded rectangle: three strips plus four corner circles. */
@@ -1049,21 +1266,8 @@ bool grid_home_frame(video_frame_info_t *video_info)
    }
 
    /* Background (opaque, also over a paused game) */
-   if (grid_st.carbon_w != width || grid_st.carbon_h != height)
-      grid_create_carbon(width, height);
-
-   if (grid_st.carbon)
-   {
-      grid_set_color(color, 0xffffffff);
-      gfx_display_draw_quad(p_disp, userdata, width, height,
-            0, 0, width, height, width, height, color, &grid_st.carbon);
-   }
-   else
-   {
-      grid_set_color(color, COL_BG);
-      gfx_display_draw_quad(p_disp, userdata, width, height,
-            0, 0, width, height, width, height, color, NULL);
-   }
+   grid_draw_background(p_disp, userdata, width, height,
+         video_info->libretro_running);
 
    /* Header: title left, clock right */
    grid_draw_text("Games", left, height * 0.09f, width, height,
@@ -1188,6 +1392,7 @@ void grid_home_context_reset(bool is_threaded)
    grid_st.font_height = (float)height;
 
    grid_create_disc();
+   grid_create_glow();
 }
 
 void grid_home_context_destroy(void)
@@ -1199,10 +1404,11 @@ void grid_home_context_destroy(void)
       video_driver_texture_unload(&grid_st.disc);
    grid_st.disc = 0;
 
-   if (grid_st.carbon)
-      video_driver_texture_unload(&grid_st.carbon);
-   grid_st.carbon   = 0;
-   grid_st.carbon_w = grid_st.carbon_h = 0;
+   if (grid_st.glow)
+      video_driver_texture_unload(&grid_st.glow);
+   grid_st.glow = 0;
+
+   grid_free_game_bg();
 
    if (grid_st.font)
       font_driver_free(grid_st.font);
