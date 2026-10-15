@@ -114,8 +114,8 @@ if ($Command.Count -gt 1) {
 # Swap Steam's RetroArch for the custom build (see build.sh) when present.
 # Data folders in build\ are junctions into Steam's install, and the config
 # is Steam's own, so saves, cores and settings stay shared.
-# This script lives in src\wrapper\scripts; $root is the RetroArchWrapper folder.
-$root = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path
+# This script lives in wrapper\scripts; $root is the repo root.
+$root = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
 $customExe = Join-Path $root "build\retroarch.exe"
 
 if (
@@ -134,7 +134,7 @@ if (
     $buildRev = if (Test-Path $buildRevFile) { (Get-Content $buildRevFile -TotalCount 1).Trim() }
 
     if ($steamRev -and $steamRev -ne $buildRev) {
-        $env:RA_WRAPPER_MSG = "RetroArch update available - run update.cmd in RetroArchWrapper"
+        $env:RA_WRAPPER_MSG = "RetroArch update available - run wrapper\scripts\update.cmd"
     }
 
     if (-not ($argsToPass -contains "--config" -or $argsToPass -contains "-c")) {

@@ -7,10 +7,10 @@ export MSYSTEM=MINGW64
 source /etc/profile
 set -e
 
-# The rebase below briefly removes this script from src, so run from a
-# temp copy. ROOT is the RetroArchWrapper folder (script is in src/wrapper/scripts).
+# The rebase below briefly removes this script from the tree, so run from a
+# temp copy. ROOT is the repo root (script is in wrapper/scripts).
 if [ -z "$RAWRAPPER_ROOT" ]; then
-   export RAWRAPPER_ROOT="$(cd "$(dirname "$0")/../../.." && pwd)"
+   export RAWRAPPER_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
    copy="$(mktemp --suffix=.sh)"
    cp "$0" "$copy"
    exec bash "$copy" "$@"
@@ -18,9 +18,9 @@ fi
 trap 'rm -f "$0"' EXIT
 
 ROOT="$RAWRAPPER_ROOT"
-STEAM_RA="$ROOT/../RetroArch"
+STEAM_RA="$ROOT/../../RetroArch"
 
-cd "$ROOT/src"
+cd "$ROOT"
 
 new_rev=$(awk '/^Rev:/ {print $2}' "$STEAM_RA/build.txt")
 old_rev=$(git rev-parse upstream)
@@ -31,7 +31,7 @@ if [ -z "$new_rev" ]; then
 fi
 
 if [ -n "$(git status --porcelain)" ]; then
-   echo "src has uncommitted changes. Commit them to the 'custom' branch first." >&2
+   echo "Uncommitted changes. Commit them to the 'custom' branch first." >&2
    git status --short >&2
    exit 1
 fi
@@ -48,8 +48,8 @@ if [ "$new_rev" != "$old_rev" ]; then
    fi
 
    git tag -f upstream "$new_rev" > /dev/null
-   "$ROOT/src/wrapper/scripts/build.sh" --reconfigure
+   "$ROOT/wrapper/scripts/build.sh" --reconfigure
 else
    echo "Source already at ${new_rev:0:7}; rebuilding."
-   "$ROOT/src/wrapper/scripts/build.sh"
+   "$ROOT/wrapper/scripts/build.sh"
 fi
