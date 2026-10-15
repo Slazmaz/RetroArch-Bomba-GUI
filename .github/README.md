@@ -1,7 +1,7 @@
 # Bomba GUI
 
 **⚠️ WARNING - This project was vibe coded with a dash of extra slop.**
-**Courtesy of Claude Opus 5.5. Enjoy to your own dismay!**
+**Courtesy of Claude Opus 5.5. ⚠️**
 
 A modern console-style GUI for RetroArch. Designed for ease of use, and fitted
 with extra tools, including [Eden](https://eden-emu.dev/) integration. Made
