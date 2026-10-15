@@ -1,5 +1,9 @@
 #!/bin/bash
-# Builds the custom RetroArch fork and stages it into ./build.
+# Builds the custom RetroArch fork and stages it into ./dist, laid out as
+# an install: bomba.exe (the launcher), an empty bomba-settings.ini, and
+# app\ with the program (exe, its DLLs, mist, Bomba's assets, launcher
+# cores) and a template retroarch.cfg. No user data. dist is what gets
+# distributed, and what install.sh copies into an install.
 # Run from an MSYS2 MINGW64 shell, or:
 #   F:\msys64\usr\bin\bash.exe -l bomba/scripts/build.sh
 export MSYSTEM=MINGW64
@@ -8,7 +12,9 @@ set -e
 
 # This script lives in bomba/scripts; ROOT is the repo root.
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-STEAM_RA="$ROOT/../RetroArch"
+DIST="$ROOT/dist"
+APP="$DIST/app"
+source "$ROOT/bomba/scripts/steam_ra.sh"
 # mist headers are vendored in bomba/mist; the dll to link against is Steam's.
 export MIST_PATH="$ROOT/bomba/mist"
 cp -u "$STEAM_RA/mist.dll" "$MIST_PATH/"
@@ -22,38 +28,59 @@ fi
 
 make -j"$(nproc)" MIST_PATH="$MIST_PATH"
 
-if tasklist //FI "IMAGENAME eq retroarch.exe" | grep -qi retroarch.exe; then
-   echo "RetroArch is running; close it and run this again to install the build." >&2
-   exit 1
-fi
-
-mkdir -p "$ROOT/build"
-cp retroarch.exe "$ROOT/build/"
+rm -rf "$DIST"
+mkdir -p "$APP"
+cp retroarch.exe "$APP/"
 # Assets Bomba's code loads from next to the exe (fonts, icons).
-mkdir -p "$ROOT/build/bomba/fonts" "$ROOT/build/bomba/icons"
-cp -u bomba/fonts/* "$ROOT/build/bomba/fonts/"
-cp -u bomba/icons/* "$ROOT/build/bomba/icons/"
+mkdir -p "$APP/bomba/fonts" "$APP/bomba/icons"
+cp bomba/fonts/* "$APP/bomba/fonts/"
+cp bomba/icons/* "$APP/bomba/icons/"
 
 # Launcher cores, built separately from RetroArch's makefile.
-mkdir -p "$ROOT/build/cores" "$ROOT/build/info"
+mkdir -p "$APP/cores" "$APP/info"
 gcc -O2 -Wall -shared -static-libgcc -I"$ROOT/libretro-common/include" \
-   -o "$ROOT/build/cores/eden_libretro.dll" bomba/cores/eden/eden_libretro.c -ldwmapi -lgdi32 -lole32
-gcc -O2 -Wall -static-libgcc -o "$ROOT/build/cores/eden_padinfo.exe" bomba/cores/eden/eden_padinfo.c
-cp bomba/cores/eden/eden_libretro.info "$ROOT/build/info/"
+   -o "$APP/cores/eden_libretro.dll" bomba/cores/eden/eden_libretro.c -ldwmapi -lgdi32 -lole32
+gcc -O2 -Wall -static-libgcc -o "$APP/cores/eden_padinfo.exe" bomba/cores/eden/eden_padinfo.c
+cp bomba/cores/eden/eden_libretro.info "$APP/info/"
+
+# bomba.exe (started by hand or by Steam's launch option) runs launch.ps1;
+# RetroArch's icon.
+windres -I bomba/launcher bomba/launcher/bomba_launcher.rc \
+   -O coff -o "$ROOT/obj-unix/bomba_launcher.res"
+gcc -O2 -Wall -municode -mwindows -static-libgcc -o "$DIST/bomba.exe" \
+   bomba/launcher/bomba_launcher.c "$ROOT/obj-unix/bomba_launcher.res"
+cp bomba/scripts/launch.ps1 "$APP/"
+# The user's files, empty: settings (see bomba_settings.h), and RetroArch's
+# config pointing at the install's top folders.
+cp bomba/bomba-settings.ini "$DIST/"
+cp bomba/retroarch.cfg "$APP/"
 
 # Upstream revision this build is based on; the launch script compares it to Steam's.
-git rev-parse refs/tags/upstream > "$ROOT/build/build-rev.txt"
+git rev-parse refs/tags/upstream > "$APP/build-rev.txt"
 
-# Copy MinGW runtime DLLs the exe depends on (skip Windows system DLLs).
-# Repeat until ldd resolves nothing from /mingw64, to catch nested deps.
-cd "$ROOT/build"
-for _ in 1 2 3 4 5; do
-   missing=$(ldd ./retroarch.exe | awk '/\/mingw64\// {print $3}' | sort -u)
-   [ -z "$missing" ] && break
-   for dll in $missing; do cp -u "$dll" "$ROOT/build/"; done
+# Copy the MinGW DLLs the exe depends on, and theirs: every imported DLL
+# that /mingw64/bin has (Windows' own aren't there). Read from the import
+# tables, not ldd, which reports a DLL found anywhere on PATH as found.
+deps()
+{
+   objdump -p "$1" | awk '/DLL Name:/ {print $3}'
+}
+queue=$(deps "$APP/retroarch.exe")
+while [ -n "$queue" ]; do
+   next=""
+   for dll in $queue; do
+      src="/mingw64/bin/$dll"
+      if [ -f "$src" ] && [ ! -f "$APP/$dll" ]; then
+         cp "$src" "$APP/"
+         next="$next $(deps "$src")"
+      fi
+   done
+   queue="$next"
 done
 
-# mist.dll + steam_appid.txt come from Steam's install.
-cp -u "$STEAM_RA/mist.dll" "$STEAM_RA/steam_appid.txt" "$ROOT/build/"
+# mist (Steam's helper process) + steam_appid.txt come from Steam's install.
+cp "$STEAM_RA/mist.dll" "$STEAM_RA/steam_appid.txt" "$APP/"
+mkdir -p "$APP/mist"
+cp -r "$STEAM_RA/mist/." "$APP/mist/"
 
-echo "Built: $ROOT/build/retroarch.exe"
+echo "Built: $DIST (install it with bomba/scripts/install.cmd)"

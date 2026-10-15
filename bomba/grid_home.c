@@ -53,8 +53,8 @@
 #include "grid_cover.h"
 #include "grid_cores.h"
 #include "grid_profile.h"
-#include "grid_social.h"
-#include "bomba_multiplayer.h"
+#include "bomba_steamnet.h"
+#include "bomba_settings.h"
 #include "grid_updates.h"
 #include "grid_switch.h"
 #include "grid_cheevos.h"
@@ -214,8 +214,6 @@ enum grid_bar_item
 {
    BAR_PROFILE = 0,
    BAR_SETTINGS,
-   BAR_FRIENDS,
-   BAR_MULTIPLAYER,
    BAR_UPDATES,
    BAR_SEARCH,
    BAR_COUNT
@@ -226,34 +224,12 @@ enum grid_panel
 {
    PANEL_NONE = 0,
    PANEL_PROFILES,
-   PANEL_FRIENDS,
    PANEL_ICONS,    /* picture picker for a profile */
    PANEL_GAME_MENU,/* dropdown for the selected game (+) */
    PANEL_CHEEVOS,  /* the game's achievements */
    PANEL_ART,      /* choosing the game's cover art or wallpaper */
-   PANEL_UPDATES,  /* Downloads: updates and things to install */
-   PANEL_MULTIPLAYER /* hosting / joining a room, or the session on */
+   PANEL_UPDATES   /* Installs: updates and things to install */
 };
-
-/* Multiplayer screen's pages: Host or Join, then that one's details, or
- * (while a session is on) the session with End session. */
-enum grid_mp_page
-{
-   MP_PAGE_CHOOSE = 0,
-   MP_PAGE_FORM,
-   MP_PAGE_SESSION
-};
-
-/* Rows of its details page. */
-enum grid_mp_row
-{
-   MP_ROW_ADDRESS = 0,
-   MP_ROW_PORT,
-   MP_ROW_PASSWORD,
-   MP_ROW_PLAYERS,
-   MP_ROW_START
-};
-#define GRID_MP_MAX_ROWS 5
 
 /* Game menu entries, in order. Settings are its console's (its emulator's
  * settings, bindings, which emulator); Quit game shows only for the
@@ -461,19 +437,7 @@ static const char *grid_cheevo_sort_label[CHEEVO_SORT_COUNT] = {
    "Default", "Most points", "Rarest"
 };
 
-/* Following screen: R sorts. */
-enum grid_friend_sort
-{
-   FRIEND_SORT_ACTIVE = 0,   /* most recently active first */
-   FRIEND_SORT_NAME,
-   FRIEND_SORT_COUNT
-};
-
-static const char *grid_friend_sort_label[FRIEND_SORT_COUNT] = {
-   "Recently active", "Name"
-};
-
-/* Downloads screen: L filters (everything, or one section: filter f
+/* Installs screen: L filters (everything, or one section: filter f
  * shows enum grid_update_section f - 1), R sorts, Y searches. */
 enum grid_dl_filter
 {
@@ -500,7 +464,7 @@ static const char *grid_dl_sort_label[DL_SORT_COUNT] = {
    "Status", "Name", "Newest"
 };
 
-#define GRID_DL_COLS 2       /* Downloads screen columns */
+#define GRID_DL_COLS 2       /* Installs screen columns */
 #define GRID_DL_UPDATE_ALL ((size_t)-1) /* its "Update all" card */
 /* Removing a core: X held on its card this long (usec), like Exit. */
 #define GRID_DL_HOLD     1000000
@@ -511,12 +475,8 @@ enum grid_kb
    KB_SEARCH = 0,
    KB_PROFILE_NAME,
    KB_MENU,         /* RetroArch's own text entry, in the Settings screen */
-   KB_DOWNLOADS,    /* the Downloads screen's search */
-   KB_MULTIPLAYER   /* a Multiplayer details row (grid_st.mp_edit) */
+   KB_DOWNLOADS     /* the Installs screen's search */
 };
-
-#define GRID_MAX_FRIENDS 64
-#define GRID_FRIEND_COLS 3  /* Following screen columns */
 
 static struct
 {
@@ -573,15 +533,14 @@ static struct
    uintptr_t badge_tex[GRID_MAX_CHEEVOS];
    bool badge_tried[GRID_MAX_CHEEVOS];
 
-   /* Achievements / Following screens: their filter and sort, and the
+   /* Achievements / Installs screens: their filter and sort, and the
     * resulting order (indices into their lists; panel_sel indexes it). */
    enum grid_cheevo_filter cheevo_filter;
    enum grid_cheevo_sort cheevo_sort;
-   enum grid_friend_sort friend_sort;
    enum grid_dl_filter dl_filter;
    enum grid_dl_sort dl_sort;
    char dl_search[128];
-   /* X held on a Downloads card to remove it (as Exit's hold): the item,
+   /* X held on an Installs card to remove it (as Exit's hold): the item,
     * when X went down (0: not held), the red ring's blend in and progress
     * last drawn, and when the full ring was first drawn. */
    size_t dl_hold_item;
@@ -592,16 +551,9 @@ static struct
    size_t list_view[GRID_MAX_CHEEVOS];
    size_t list_count;
 
-   /* Multiplayer screen: its page, whether its details are for hosting
-    * (else joining), the details as typed so far (port "" = the
-    * emulator's own), and the row the keyboard is typing into. */
-   enum grid_mp_page mp_page;
-   bool mp_host;
-   char mp_address[256];
-   char mp_port[8];
-   char mp_password[128];
-   unsigned mp_players;
-   enum grid_mp_row mp_edit;
+   /* Multiplayer guest: the game started for the host's
+    * ("system\ttitle"), so it starts once. */
+   char mp_started[320];
 
    /* Profile pictures (circle-clipped), reloaded when the path changes. */
    uintptr_t profile_tex[GRID_PROFILE_MAX];
@@ -658,17 +610,10 @@ static struct
    uintptr_t disc;          /* white anti-aliased circle, for rounded shapes */
    /* Top-left bar icons (from bomba/icons). */
    grid_icon_t icon_exit;
-   grid_icon_t icon_friends;
    grid_icon_t icon_settings;
    grid_icon_t icon_search;
    grid_icon_t icon_trophy;  /* achievement progress, in the bottom bar */
-   grid_icon_t icon_download;/* Downloads, in the icon bar */
-   grid_icon_t icon_globe;   /* Multiplayer, in the icon bar */
-   grid_icon_t icon_host;    /* Multiplayer screen's Host card */
-   grid_icon_t icon_join;    /* ...and Join card */
-   /* Friends' avatars, by position in the friends list. */
-   uintptr_t avatar[GRID_MAX_FRIENDS];
-   bool avatar_tried[GRID_MAX_FRIENDS];
+   grid_icon_t icon_download;/* Installs, in the icon bar */
    /* Background of the selected game. */
    grid_bg_t bg;
    char bg_key[PATH_MAX_LENGTH];   /* what bg shows: "", GRID_BG_GAME or a
@@ -1198,6 +1143,8 @@ static void grid_launch(const grid_game_t *game)
 
    /* Its console's game buttons, as RetroArch's remap for this game. */
    grid_controls_apply(game->system, game->core_path, game->path);
+   /* A multiplayer host's guests start it too, once it runs. */
+   bomba_steamnet_set_game(game->system, game->title);
 
    task_push_load_content_with_new_core_from_menu(
          game->core_path, game->path, &content_info,
@@ -1559,26 +1506,16 @@ static void grid_open_panel(enum grid_panel panel)
 
    if (panel == PANEL_PROFILES)
       grid_st.panel_sel = grid_profile_current() + GRID_STRIP_FIRST;
-   else if (panel == PANEL_FRIENDS)
-      grid_social_refresh();
    else if (panel == PANEL_UPDATES)
    {
-      /* Opens on the updates if any wait, else on everything; the search
-       * starts empty. */
+      /* Opens on everything, the search empty. */
       grid_updates_check(false, grid_running_core());
-      grid_st.dl_filter    = grid_updates_available()
-         ? DL_FILTER_UPDATES : DL_FILTER_ALL;
+      grid_st.dl_filter    = DL_FILTER_ALL;
       grid_st.dl_search[0] = '\0';
-   }
-   else if (panel == PANEL_MULTIPLAYER)
-   {
-      /* The session if one is on, else Host / Join (on Host). */
-      grid_st.mp_page = bomba_mp_mode() != BOMBA_MP_NONE
-         ? MP_PAGE_SESSION : MP_PAGE_CHOOSE;
    }
 }
 
-/* Downloads screen's search: filters live while typing. */
+/* Installs screen's search: filters live while typing. */
 static const char *grid_dl_search_text(void)
 {
    if (menu_input_dialog_get_display_kb() && grid_st.kb == KB_DOWNLOADS)
@@ -1601,7 +1538,7 @@ static void grid_dl_start_search(void)
 {
    menu_input_ctx_line_t line;
 
-   line.label         = "Search downloads";
+   line.label         = "Search installs";
    line.label_setting = "";
    line.type          = 0;
    line.idx           = 0;
@@ -1611,126 +1548,46 @@ static void grid_dl_start_search(void)
    menu_input_dialog_start(&line);
 }
 
-/* Multiplayer details page's rows, in order; returns how many. Joining
- * asks for the room's address; hosting for how many players. */
-static unsigned grid_mp_rows(enum grid_mp_row *rows)
+/* A guest starts the host's game once it is known and nothing runs; the
+ * same one isn't started again after it is quit. */
+static void grid_mp_follow_host(void)
 {
-   unsigned n = 0;
+   const char *system = bomba_steamnet_host_system();
+   const char *title  = bomba_steamnet_host_title();
+   char key[sizeof(grid_st.mp_started)];
+   size_t i;
 
-   if (!grid_st.mp_host)
-      rows[n++] = MP_ROW_ADDRESS;
-   rows[n++] = MP_ROW_PORT;
-   rows[n++] = MP_ROW_PASSWORD;
-   if (grid_st.mp_host)
-      rows[n++] = MP_ROW_PLAYERS;
-   rows[n++] = MP_ROW_START;
-   return n;
-}
-
-/* Host or Join chosen: its details, starting from the last room's (but
- * never a password). */
-static void grid_mp_open_form(bool host)
-{
-   settings_t *settings = config_get_ptr();
-
-   grid_st.mp_host   = host;
-   grid_st.mp_page   = MP_PAGE_FORM;
-   grid_st.panel_sel = 0;
-   strlcpy(grid_st.mp_address, settings->paths.bomba_mp_address,
-         sizeof(grid_st.mp_address));
-   grid_st.mp_port[0] = '\0';
-   if (settings->uints.bomba_mp_port)
-      snprintf(grid_st.mp_port, sizeof(grid_st.mp_port), "%u",
-            settings->uints.bomba_mp_port);
-   grid_st.mp_password[0] = '\0';
-   grid_st.mp_players     = settings->uints.bomba_mp_max_players;
-   if (     grid_st.mp_players < BOMBA_MP_MAX_PLAYERS_MIN
-         || grid_st.mp_players > BOMBA_MP_MAX_PLAYERS_MAX)
-      grid_st.mp_players = 8;
-}
-
-static void grid_mp_text_done(void *userdata, const char *line)
-{
-   if (line)
+   if (bomba_steamnet_state() != BOMBA_STEAMNET_JOINED)
    {
-      char text[256];
-      char *s = text, *e;
-
-      /* No spaces round it (an address pasted with them). */
-      strlcpy(text, line, sizeof(text));
-      while (*s == ' ')
-         s++;
-      e = s + strlen(s);
-      while (e > s && e[-1] == ' ')
-         *--e = '\0';
-
-      switch (grid_st.mp_edit)
-      {
-         case MP_ROW_ADDRESS:
-            strlcpy(grid_st.mp_address, s, sizeof(grid_st.mp_address));
-            break;
-         case MP_ROW_PORT:
-         {
-            /* Empty: the emulator's own; otherwise 1-65535, or unchanged. */
-            char *end           = NULL;
-            unsigned long port  = strtoul(s, &end, 10);
-            if (!*s)
-               grid_st.mp_port[0] = '\0';
-            else if (end && !*end && port >= 1 && port <= 65535)
-               snprintf(grid_st.mp_port, sizeof(grid_st.mp_port), "%lu", port);
-            break;
-         }
-         case MP_ROW_PASSWORD:
-            strlcpy(grid_st.mp_password, s, sizeof(grid_st.mp_password));
-            break;
-         default:
-            break;
-      }
-   }
-   menu_input_dialog_end();
-   grid_st.kb = KB_SEARCH;
-}
-
-/* Types into a details row, starting from what it holds. */
-static void grid_mp_edit(enum grid_mp_row row)
-{
-   menu_input_ctx_line_t line;
-   const char *cur = row == MP_ROW_ADDRESS ? grid_st.mp_address
-                   : row == MP_ROW_PORT    ? grid_st.mp_port
-                   :                         grid_st.mp_password;
-
-   line.label         = row == MP_ROW_ADDRESS ? "Room address"
-                      : row == MP_ROW_PORT    ? "Port (empty: the emulator's own)"
-                      :                         "Room password (empty: none)";
-   line.label_setting = "";
-   line.type          = 0;
-   line.idx           = 0;
-   line.cb            = grid_mp_text_done;
-
-   grid_st.mp_edit = row;
-   grid_st.kb      = KB_MULTIPLAYER;
-   if (menu_input_dialog_start(&line) && !string_is_empty(cur))
-      input_keyboard_line_append(&input_state_get_ptr()->keyboard_line,
-            cur, strlen(cur));
-}
-
-/* Host / Join on the details page: the session starts (joining needs an
- * address first). */
-static void grid_mp_start(void)
-{
-   if (!grid_st.mp_host && string_is_empty(grid_st.mp_address))
-   {
-      grid_st.panel_sel = 0;
-      grid_mp_edit(MP_ROW_ADDRESS);
+      grid_st.mp_started[0] = '\0';
       return;
    }
+   if (string_is_empty(title) || grid_content_running())
+      return;
+   snprintf(key, sizeof(key), "%s\t%s", system, title);
+   if (string_is_equal(key, grid_st.mp_started))
+      return;
+   strlcpy(grid_st.mp_started, key, sizeof(grid_st.mp_started));
 
-   bomba_mp_start(grid_st.mp_host ? BOMBA_MP_HOST : BOMBA_MP_JOIN,
-         grid_st.mp_address, (unsigned)strtoul(grid_st.mp_port, NULL, 10),
-         grid_st.mp_password, grid_st.mp_players);
-   grid_st.mp_password[0] = '\0';
-   grid_st.mp_page        = MP_PAGE_SESSION;
-   grid_st.panel_sel      = 0;
+   for (i = 0; i < grid_st.count; i++)
+   {
+      const grid_game_t *g = &grid_st.games[i];
+      if (     string_is_equal(g->system, system)
+            && string_is_equal_case_insensitive(g->title, title)
+            && !g->pending)
+      {
+         grid_launch(g);
+         return;
+      }
+   }
+
+   {
+      char msg[320];
+      snprintf(msg, sizeof(msg), "Multiplayer: the host plays %s, "
+            "which isn't in your library", title);
+      runloop_msg_queue_push(msg, strlen(msg), 1, 300, true, NULL,
+            MESSAGE_QUEUE_ICON_DEFAULT, MESSAGE_QUEUE_CATEGORY_INFO);
+   }
 }
 
 /* The running game's core (what can't be replaced right now), or NULL. */
@@ -2946,15 +2803,6 @@ static int grid_list_cmp(const void *pa, const void *pb)
       if (grid_st.cheevo_sort == CHEEVO_SORT_RAREST && a->rarity != b->rarity)
          return a->rarity < b->rarity ? -1 : 1;
    }
-   else if (grid_st.panel == PANEL_FRIENDS)
-   {
-      const grid_friend_t *a = grid_social_get(ia);
-      const grid_friend_t *b = grid_social_get(ib);
-      if (grid_st.friend_sort == FRIEND_SORT_NAME)
-         r = grid_strcmp_noncase(a->name, b->name);
-      else if (a->when != b->when)
-         return a->when > b->when ? -1 : 1;
-   }
    else if (grid_st.panel == PANEL_UPDATES)
    {
       const grid_update_t *a = grid_updates_get(ia);
@@ -2975,7 +2823,7 @@ static int grid_list_cmp(const void *pa, const void *pb)
    return ia < ib ? -1 : ia > ib ? 1 : 0;
 }
 
-/* Rebuilds list_view for the achievements or Following screen from its
+/* Rebuilds list_view for the achievements or Installs screen from its
  * filter and sort. */
 static void grid_build_list_view(void)
 {
@@ -2994,12 +2842,6 @@ static void grid_build_list_view(void)
             continue;
          grid_st.list_view[grid_st.list_count++] = i;
       }
-   }
-   else if (grid_st.panel == PANEL_FRIENDS)
-   {
-      n = grid_social_count();
-      for (i = 0; i < n && grid_st.list_count < GRID_MAX_CHEEVOS; i++)
-         grid_st.list_view[grid_st.list_count++] = i;
    }
    else if (grid_st.panel == PANEL_UPDATES)
    {
@@ -3021,7 +2863,7 @@ static void grid_build_list_view(void)
    qsort(grid_st.list_view, grid_st.list_count, sizeof(size_t),
          grid_list_cmp);
 
-   /* Downloads: an "Update all" card first while more than one update
+   /* Installs: an "Update all" card first while more than one update
     * waits (in All and Updates, not while searching). */
    if (     grid_st.panel == PANEL_UPDATES
          && (grid_st.dl_filter == DL_FILTER_ALL
@@ -3041,7 +2883,7 @@ static void grid_build_list_view(void)
          ? (unsigned)grid_st.list_count - 1 : 0;
 }
 
-/* L / R on the achievements or Following screen: next filter / sort. */
+/* L / R on the achievements or Installs screen: next filter / sort. */
 static void grid_list_cycle(bool filter)
 {
    if (grid_st.panel == PANEL_CHEEVOS)
@@ -3053,9 +2895,6 @@ static void grid_list_cycle(bool filter)
          grid_st.cheevo_sort = (enum grid_cheevo_sort)
             ((grid_st.cheevo_sort + 1) % CHEEVO_SORT_COUNT);
    }
-   else if (grid_st.panel == PANEL_FRIENDS && !filter)
-      grid_st.friend_sort = (enum grid_friend_sort)
-         ((grid_st.friend_sort + 1) % FRIEND_SORT_COUNT);
    else if (grid_st.panel == PANEL_UPDATES)
    {
       if (filter)
@@ -3136,7 +2975,7 @@ static void grid_open_picker(unsigned profile)
  * letting go or moving off it first cancels. Called every frame, on the
  * main thread: quitting with a game open saves its state, which can't
  * be done from the video thread. */
-/* X held on a Downloads card: removes its core the same way (letting go,
+/* X held on an Installs card: removes its core the same way (letting go,
  * or the selection or screen changing, first cancels). */
 static void grid_dl_hold_iterate(void)
 {
@@ -3167,6 +3006,7 @@ static void grid_dl_hold_iterate(void)
 void grid_home_iterate(void)
 {
    grid_dl_hold_iterate();
+   grid_mp_follow_host();
 
    if (!grid_st.exit_hold_start)
       return;
@@ -3401,112 +3241,6 @@ static void grid_panel_action(enum menu_action action)
             break;
       }
    }
-   else if (grid_st.panel == PANEL_MULTIPLAYER)
-   {
-      enum grid_mp_row rows[GRID_MP_MAX_ROWS];
-      unsigned n = grid_mp_rows(rows);
-
-      switch (grid_st.mp_page)
-      {
-         case MP_PAGE_CHOOSE:     /* Join (0) | Host (1), side by side */
-            if (action == MENU_ACTION_LEFT || action == MENU_ACTION_UP)
-               sel = 0;
-            else if (action == MENU_ACTION_RIGHT || action == MENU_ACTION_DOWN)
-               sel = 1;
-            else if (action == MENU_ACTION_OK)
-            {
-               grid_mp_open_form(sel == 1);
-               return;
-            }
-            else if (action == MENU_ACTION_CANCEL)
-               grid_st.panel = PANEL_NONE;
-            break;
-         case MP_PAGE_FORM:
-            if (sel >= n)
-               sel = n - 1;
-            switch (action)
-            {
-               case MENU_ACTION_UP:
-                  if (sel > 0)
-                     sel--;
-                  break;
-               case MENU_ACTION_DOWN:
-                  if (sel + 1 < n)
-                     sel++;
-                  break;
-               case MENU_ACTION_LEFT:
-               case MENU_ACTION_RIGHT:
-                  if (rows[sel] == MP_ROW_PLAYERS)
-                  {
-                     if (     action == MENU_ACTION_LEFT
-                           && grid_st.mp_players > BOMBA_MP_MAX_PLAYERS_MIN)
-                        grid_st.mp_players--;
-                     else if (action == MENU_ACTION_RIGHT
-                           && grid_st.mp_players < BOMBA_MP_MAX_PLAYERS_MAX)
-                        grid_st.mp_players++;
-                  }
-                  break;
-               case MENU_ACTION_OK:
-                  if (rows[sel] == MP_ROW_START)
-                     grid_mp_start();
-                  else if (rows[sel] == MP_ROW_PLAYERS)
-                     grid_st.mp_players = grid_st.mp_players
-                        < BOMBA_MP_MAX_PLAYERS_MAX
-                        ? grid_st.mp_players + 1 : BOMBA_MP_MAX_PLAYERS_MIN;
-                  else
-                     grid_mp_edit(rows[sel]);
-                  return;
-               case MENU_ACTION_CANCEL: /* back to Host / Join */
-                  grid_st.mp_page = MP_PAGE_CHOOSE;
-                  sel             = grid_st.mp_host ? 1 : 0;
-                  break;
-               default:
-                  break;
-            }
-            break;
-         case MP_PAGE_SESSION:    /* one button: End session */
-            sel = 0;
-            if (action == MENU_ACTION_OK)
-            {
-               bomba_mp_end();
-               grid_st.mp_page = MP_PAGE_CHOOSE;
-            }
-            else if (action == MENU_ACTION_CANCEL)
-               grid_st.panel = PANEL_NONE;
-            break;
-      }
-   }
-   else /* PANEL_FRIENDS: a grid of GRID_FRIEND_COLS columns */
-   {
-      size_t n = grid_st.list_count;
-
-      switch (action)
-      {
-         case MENU_ACTION_LEFT:
-            if (sel % GRID_FRIEND_COLS > 0)
-               sel--;
-            break;
-         case MENU_ACTION_RIGHT:
-            if (sel % GRID_FRIEND_COLS + 1 < GRID_FRIEND_COLS && sel + 1 < n)
-               sel++;
-            break;
-         case MENU_ACTION_UP:
-            if (sel >= GRID_FRIEND_COLS)
-               sel -= GRID_FRIEND_COLS;
-            break;
-         case MENU_ACTION_DOWN:
-            if (sel + GRID_FRIEND_COLS < n)
-               sel += GRID_FRIEND_COLS;
-            else if (n && sel / GRID_FRIEND_COLS < (n - 1) / GRID_FRIEND_COLS)
-               sel = (unsigned)n - 1;   /* partial last row */
-            break;
-         case MENU_ACTION_CANCEL:
-            grid_st.panel = PANEL_NONE;
-            break;
-         default:
-            break;
-      }
-   }
 
    grid_st.panel_sel = sel;
 }
@@ -3532,12 +3266,6 @@ static void grid_bar_action(enum menu_action action)
          {
             case BAR_PROFILE:
                grid_open_panel(PANEL_PROFILES);
-               break;
-            case BAR_FRIENDS:
-               grid_open_panel(PANEL_FRIENDS);
-               break;
-            case BAR_MULTIPLAYER:
-               grid_open_panel(PANEL_MULTIPLAYER);
                break;
             case BAR_SETTINGS:
                grid_open_settings();
@@ -4434,7 +4162,7 @@ static uintptr_t *grid_rect_arc_texture(int w, int h, int r, int gap,
    return &grid_rect_arc_tex;
 }
 
-/* grid_draw_hold_ring for a rounded rect (a Downloads card). */
+/* grid_draw_hold_ring for a rounded rect (an Installs card). */
 static void grid_draw_hold_rect(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height, float x, float y, float w, float h,
       float r, float t, float blend)
@@ -6001,7 +5729,7 @@ static void grid_draw_profile_avatar(gfx_display_t *p_disp, void *userdata,
          d * 0.42f / (height / 32.0f) / GRID_FONT_CAP);
 }
 
-/* Top row: icon bar on the left (profile, friends, settings, search; the
+/* Top row: icon bar on the left (profile, settings, installs, search; the
  * search icon grows into a search box while searching); on the right
  * "[L] console count", a divider and "[R] sort order". No bar behind it:
  * it sits on the background. */
@@ -6011,16 +5739,14 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
    /* All positions/sizes in reference pixels (see REF/CAP). */
    float side         = REF(20);
    float row1         = REF(31);          /* row centre */
-   /* Screens that take the grid's place (Settings, Following,
-    * achievements, art, pictures, Downloads) can't reach the icon bar: no
-    * clock, profile or icons there, leaving the row to the screen. */
+   /* Screens that take the grid's place (Settings, achievements, art,
+    * pictures, Installs) can't reach the icon bar: no clock, profile or
+    * icons there, leaving the row to the screen. */
    bool full_screen   = grid_settings_shown()
-                     || grid_st.panel == PANEL_FRIENDS
                      || grid_st.panel == PANEL_CHEEVOS
                      || grid_st.panel == PANEL_ART
                      || grid_st.panel == PANEL_ICONS
-                     || grid_st.panel == PANEL_UPDATES
-                     || grid_st.panel == PANEL_MULTIPLAYER;
+                     || grid_st.panel == PANEL_UPDATES;
 
    /* Icon bar: 27px circles, 9px apart. */
    if (!full_screen)
@@ -6225,12 +5951,8 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
          if (i == BAR_SEARCH)
             w = d + (open_w - d) * grid_st.search_open;
 
-         /* (Downloads and Multiplayer with their dot draw their own,
-          * notched.) */
-         if (     sel
-               && !(i == BAR_UPDATES && grid_updates_available())
-               && !(i == BAR_MULTIPLAYER
-                  && bomba_mp_mode() != BOMBA_MP_NONE))
+         /* (Installs with its dot draws its own, notched.) */
+         if (sel && !(i == BAR_UPDATES && grid_updates_available()))
             grid_draw_cursor(p_disp, userdata, width, height,
                   x, y, w, d, d / 2.0f);
 
@@ -6242,29 +5964,19 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
                   grid_draw_profile_avatar(p_disp, userdata, width, height,
                         grid_profile_current(), x, y, d);
                break;
-            case BAR_FRIENDS:
-               grid_icon_button_draw(p_disp, userdata, width, height,
-                     &grid_st.icon_friends, x, y, (unsigned)d, 0.50f,
-                     COL_DIVIDER, COL_TEXT);
-               break;
             case BAR_SETTINGS:
                grid_icon_button_draw(p_disp, userdata, width, height,
                      &grid_st.icon_settings, x, y, (unsigned)d, 0.6f,
                      COL_DIVIDER, COL_TEXT);
                break;
-            case BAR_MULTIPLAYER:
             case BAR_UPDATES:
             {
                /* A blue dot at the top right, set in a see-through notch
                 * cut out of the button (and of the selection ring round
-                * it): while updates wait, or a multiplayer session is
-                * on. */
-               bool mp       = i == BAR_MULTIPLAYER;
-               grid_icon_t *ic = mp ? &grid_st.icon_globe
-                                    : &grid_st.icon_download;
-               bool dot      = mp ? bomba_mp_mode() != BOMBA_MP_NONE
-                                  : grid_updates_available() > 0;
-               float frac    = mp ? 0.68f : 0.53f;
+                * it): while updates wait. */
+               grid_icon_t *ic = &grid_st.icon_download;
+               bool dot        = grid_updates_available() > 0;
+               float frac      = 0.53f;
                if (dot)
                {
                   /* Centred on the circle's edge, up and right at 45
@@ -6367,7 +6079,7 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
       float gy        = floorf(row1 - key_h / 2.0f + 0.5f);
       float ty        = grid_text_y(row1, height, ls);
       /* What L and R do depends on the screen: the games grid's console
-       * and sort, the achievements' filter and sort, Following's sort, or
+       * and sort, the achievements' or Installs' filter and sort, or
        * nothing (NULL: not shown). */
       const char *srt = grid_sort_label[grid_st.sort];
       const char *con = grid_current_tab()->label;
@@ -6461,10 +6173,6 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
             snprintf(count, sizeof(count), "%u",
                   (unsigned)grid_st.list_count);
             break;
-         case PANEL_FRIENDS:
-            srt = grid_friend_sort_label[grid_st.friend_sort];
-            con = NULL;
-            break;
          case PANEL_UPDATES:
             srt = grid_dl_sort_label[grid_st.dl_sort];
             con = grid_dl_filter_label[grid_st.dl_filter];
@@ -6474,7 +6182,6 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
             break;
          case PANEL_ART:
          case PANEL_ICONS:
-         case PANEL_MULTIPLAYER:
             srt = con = NULL;
             break;
          default:
@@ -6638,31 +6345,6 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
    else if (grid_st.panel == PANEL_ICONS)
    {
       glyphs[n] = "A"; labels[n++] = "Choose";
-      glyphs[n] = "B"; labels[n++] = "Back";
-   }
-   else if (grid_st.panel == PANEL_FRIENDS)
-   {
-      glyphs[n] = "B"; labels[n++] = "Back";
-   }
-   else if (grid_st.panel == PANEL_MULTIPLAYER)
-   {
-      if (grid_st.mp_page == MP_PAGE_FORM)
-      {
-         enum grid_mp_row rows[GRID_MP_MAX_ROWS];
-         unsigned rn          = grid_mp_rows(rows);
-         enum grid_mp_row row = rows[grid_st.panel_sel < rn
-            ? grid_st.panel_sel : rn - 1];
-         glyphs[n] = "A";
-         labels[n++] = row == MP_ROW_START
-            ? (grid_st.mp_host ? "Host" : "Join")
-            : row == MP_ROW_PLAYERS ? "Change" : "Edit";
-      }
-      else
-      {
-         glyphs[n] = "A";
-         labels[n++] = grid_st.mp_page == MP_PAGE_SESSION
-            ? "End session" : "Select";
-      }
       glyphs[n] = "B"; labels[n++] = "Back";
    }
    else if (grid_st.panel == PANEL_UPDATES)
@@ -6912,422 +6594,6 @@ static void grid_draw_picker_screen(gfx_display_t *p_disp, void *userdata,
       grid_draw_text("Game icons appear here as they download from SteamGridDB",
             width / 2.0f, grid_text_y(top + d + REF(40), height, ts),
             width, height, COL_TEXT_DIM, TEXT_ALIGN_CENTER, ts);
-}
-
-/* "3m ago", "5h ago", "2d ago" (empty if unknown). */
-static void grid_format_ago(time_t when, char *s, size_t len)
-{
-   time_t now = time(NULL);
-   long secs  = (long)(now - when);
-
-   s[0] = '\0';
-   if (!when)
-      return;
-   if (secs < 60)
-      strlcpy(s, "now", len);
-   else if (secs < 3600)
-      snprintf(s, len, "%ldm ago", secs / 60);
-   else if (secs < 86400)
-      snprintf(s, len, "%ldh ago", secs / 3600);
-   else
-      snprintf(s, len, "%ldd ago", secs / 86400);
-}
-
-static void grid_free_avatars(void)
-{
-   unsigned i;
-   for (i = 0; i < GRID_MAX_FRIENDS; i++)
-   {
-      if (grid_st.avatar[i])
-         video_driver_texture_unload(&grid_st.avatar[i]);
-      grid_st.avatar[i]       = 0;
-      grid_st.avatar_tried[i] = false;
-   }
-}
-
-/* "Multiplayer": its own screen in place of the game grid. Host / Join as
- * two cards; then that one's details as rows (label left, value right)
- * ending in its button; or, while a session is on, the session and End
- * session. */
-static void grid_draw_multiplayer_screen(gfx_display_t *p_disp,
-      void *userdata, unsigned width, unsigned height)
-{
-   float top    = REF(46);
-   float head_h = REF(24);
-   float cw     = REF(380) < width - REF(70) ? REF(380) : width - REF(70);
-   float cx     = floorf((width - cw) / 2.0f + 0.5f);
-   float ts     = CAP(GRID_TEXT_CAP);
-   float ss     = CAP(GRID_TEXT_CAP - 2);
-   /* Each page is centred on the screen. */
-   float mid_y  = height / 2.0f;
-   float y;
-   float rad    = REF(10);
-   const char *parts[2];
-   char status[300];
-   unsigned np = 0;
-
-   parts[np++] = "Multiplayer";
-   status[0]   = '\0';
-   if (grid_st.mp_page == MP_PAGE_SESSION)
-   {
-      if (bomba_mp_mode() == BOMBA_MP_HOST)
-         strlcpy(status, "Hosting", sizeof(status));
-      else
-         snprintf(status, sizeof(status), "In %s's room",
-               bomba_mp_address());
-   }
-   else if (grid_st.mp_page == MP_PAGE_FORM)
-      strlcpy(status, grid_st.mp_host ? "Host a room" : "Join a room",
-            sizeof(status));
-   if (status[0])
-      parts[np++] = status;
-   grid_draw_screen_heading(p_disp, userdata, width, height, parts, np);
-
-   if (grid_st.mp_page == MP_PAGE_CHOOSE)
-   {
-      /* Join (0) on the left, Host (1) on the right. */
-      static const char *titles[2] = { "Join a room", "Host a room" };
-      static const char *subs[2]   = {
-         "Play in someone's room", "Others join your game" };
-      float gap    = REF(12);
-      float card_w = floorf((cw - gap) / 2.0f);
-      float card_h = floorf(REF(120));
-      float id     = REF(34);
-      unsigned k;
-
-      y = mid_y - card_h / 2.0f;
-      for (k = 0; k < 2; k++)
-      {
-         float kx  = floorf(cx + k * (card_w + gap) + 0.5f);
-         float ky  = floorf(y + 0.5f);
-         float mid = kx + card_w / 2.0f;
-
-         if (k == grid_st.panel_sel)
-            grid_draw_cursor(p_disp, userdata, width, height,
-                  kx, ky, card_w, card_h, rad);
-         grid_draw_shape(p_disp, userdata, width, height,
-               kx, ky, card_w, card_h, rad, COL_DIVIDER);
-         grid_icon_draw(p_disp, userdata, width, height,
-               k ? &grid_st.icon_host : &grid_st.icon_join,
-               mid, ky + REF(37), id, COL_TEXT);
-         grid_draw_text(titles[k], mid,
-               grid_text_y(ky + REF(77), height, ts), width, height,
-               COL_TEXT, TEXT_ALIGN_CENTER, ts);
-         grid_draw_text(subs[k], mid,
-               grid_text_y(ky + REF(96), height, ss), width, height,
-               COL_TEXT_SOFT, TEXT_ALIGN_CENTER, ss);
-      }
-      return;
-   }
-
-   if (grid_st.mp_page == MP_PAGE_FORM)
-   {
-      enum grid_mp_row rows[GRID_MP_MAX_ROWS];
-      unsigned k, n = grid_mp_rows(rows);
-      float row_h   = floorf(REF(32));
-      float gap     = REF(8);
-      float pad     = REF(14);
-
-      /* The rows, and the button set REF(8) further down. */
-      y = mid_y - (n * row_h + (n - 1) * gap + REF(8)) / 2.0f;
-      for (k = 0; k < n; k++)
-      {
-         float ry  = floorf(y + k * (row_h + gap) + 0.5f);
-         float mid = ry + row_h / 2.0f;
-         bool sel  = k == grid_st.panel_sel;
-         const char *label = NULL;
-         char value[160];
-
-         value[0] = '\0';
-         if (rows[k] == MP_ROW_START)
-         {
-            /* Its button, set apart below the rows. */
-            ry  += REF(8);
-            mid += REF(8);
-            if (sel)
-               grid_draw_cursor(p_disp, userdata, width, height,
-                     cx, ry, cw, row_h, row_h / 2.0f);
-            grid_draw_shape(p_disp, userdata, width, height,
-                  cx, ry, cw, row_h, row_h / 2.0f, COL_DIVIDER);
-            grid_draw_text(grid_st.mp_host ? "Start hosting" : "Join",
-                  cx + cw / 2.0f, grid_text_y(mid, height, ts), width, height,
-                  COL_TEXT, TEXT_ALIGN_CENTER, ts);
-            continue;
-         }
-
-         switch (rows[k])
-         {
-            case MP_ROW_ADDRESS:
-               label = "Room address";
-               strlcpy(value, string_is_empty(grid_st.mp_address)
-                     ? "Not set" : grid_st.mp_address, sizeof(value));
-               break;
-            case MP_ROW_PORT:
-               label = "Port";
-               strlcpy(value, string_is_empty(grid_st.mp_port)
-                     ? "Default" : grid_st.mp_port, sizeof(value));
-               break;
-            case MP_ROW_PASSWORD:
-            {
-               size_t i, len = strlen(grid_st.mp_password);
-               label = "Password";
-               if (!len)
-                  strlcpy(value, "None", sizeof(value));
-               else
-               {
-                  for (i = 0; i < len && i + 1 < sizeof(value) && i < 16; i++)
-                     value[i] = '*';
-                  value[i] = '\0';
-               }
-               break;
-            }
-            case MP_ROW_PLAYERS:
-               label = "Players";
-               snprintf(value, sizeof(value), "<  %u  >", grid_st.mp_players);
-               break;
-            default:
-               break;
-         }
-
-         if (sel)
-            grid_draw_cursor(p_disp, userdata, width, height,
-                  cx, ry, cw, row_h, rad);
-         grid_draw_shape(p_disp, userdata, width, height,
-               cx, ry, cw, row_h, rad, COL_DIVIDER);
-         grid_draw_text(label, cx + pad, grid_text_y(mid, height, ts),
-               width, height, COL_TEXT, TEXT_ALIGN_LEFT, ts);
-         grid_draw_text(value, cx + cw - pad, grid_text_y(mid, height, ts),
-               width, height, COL_TEXT_SOFT, TEXT_ALIGN_RIGHT, ts);
-      }
-      return;
-   }
-
-   /* The session. */
-   {
-      char line[320];
-      float lh     = REF(20);
-      float pad    = REF(14);
-      unsigned nl  = 0;
-      const char *lines[4];
-      char port[48], pw[48], players[48];
-      float card_h, bh = floorf(REF(32)), by;
-      unsigned k;
-
-      if (bomba_mp_mode() == BOMBA_MP_HOST)
-         strlcpy(line, "You're hosting a room", sizeof(line));
-      else
-         snprintf(line, sizeof(line), "Joined the room at %s",
-               bomba_mp_address());
-      lines[nl++] = line;
-      if (bomba_mp_port())
-         snprintf(port, sizeof(port), "Port %u", bomba_mp_port());
-      else
-         strlcpy(port, "Port: the emulator's own", sizeof(port));
-      lines[nl++] = port;
-      strlcpy(pw, bomba_mp_has_password() ? "With a password"
-            : "No password", sizeof(pw));
-      lines[nl++] = pw;
-      if (bomba_mp_mode() == BOMBA_MP_HOST)
-      {
-         snprintf(players, sizeof(players), "Up to %u players",
-               bomba_mp_max_players());
-         lines[nl++] = players;
-      }
-
-      card_h = 2.0f * pad + nl * lh;
-      /* The card, the note under it and End session, centred. */
-      y      = mid_y - (card_h + REF(38) + bh) / 2.0f;
-      grid_draw_shape(p_disp, userdata, width, height,
-            cx, floorf(y + 0.5f), cw, card_h, rad, COL_DIVIDER);
-      for (k = 0; k < nl; k++)
-         grid_draw_text(lines[k], cx + pad,
-               grid_text_y(y + pad + (k + 0.5f) * lh, height,
-                  k ? ss : ts), width, height,
-               k ? COL_TEXT_SOFT : COL_TEXT, TEXT_ALIGN_LEFT, k ? ss : ts);
-
-      grid_draw_text(grid_content_running()
-            ? "The game already running keeps playing as it started; "
-              "games you start next play online"
-            : "Games you start now play online, until you end the session "
-              "or close RetroArch",
-            width / 2.0f, grid_text_y(y + card_h + REF(18), height, ss),
-            width, height, COL_TEXT_DIM, TEXT_ALIGN_CENTER, ss);
-
-      by = floorf(y + card_h + REF(38) + 0.5f);
-      grid_draw_cursor(p_disp, userdata, width, height,
-            cx, by, cw, bh, bh / 2.0f);
-      grid_draw_shape(p_disp, userdata, width, height,
-            cx, by, cw, bh, bh / 2.0f, COL_DIVIDER);
-      grid_draw_text("End session", cx + cw / 2.0f,
-            grid_text_y(by + bh / 2.0f, height, ts), width, height,
-            COL_DANGER, TEXT_ALIGN_CENTER, ts);
-   }
-}
-
-/* "Following": its own screen in place of the game grid (over the same
- * background). A grid of GRID_FRIEND_COLS cards, one per person followed
- * on RetroAchievements: avatar, then their name and, below it, the game
- * they last played (and what they were doing), with how long ago. */
-static void grid_draw_friends_screen(gfx_display_t *p_disp, void *userdata,
-      unsigned width, unsigned height)
-{
-   static size_t first_row = 0;
-   size_t i, n;
-   float left      = REF(35);
-   float top       = REF(46);
-   float area_h    = REF(318);
-   float head_h    = REF(24);                 /* "Following" heading */
-   float cgap      = REF(10);
-   float card_w    = (width - 2.0f * left - (GRID_FRIEND_COLS - 1) * cgap)
-                     / GRID_FRIEND_COLS;
-   float card_h    = REF(54);
-   float ad        = floorf(REF(36));         /* avatar */
-   float cpad      = REF(9);
-   float ts        = CAP(GRID_TEXT_CAP);
-   float ss        = CAP(GRID_TEXT_CAP - 2);
-   const char *msg = NULL;
-   size_t rows, sel_row;
-   float gy;
-
-   grid_build_list_view();
-   n  = grid_st.list_count;
-   gy = top + head_h;
-
-   {
-      const char *parts[2];
-      char people[32];
-      unsigned np = 0;
-      parts[np++] = "Following";
-      if (grid_social_count())
-      {
-         snprintf(people, sizeof(people), "%u people",
-               (unsigned)grid_social_count());
-         parts[np++] = people;
-      }
-      grid_draw_screen_heading(p_disp, userdata, width, height, parts, np);
-   }
-
-   switch (grid_social_state())
-   {
-      case GRID_SOCIAL_LOGGED_OUT:
-         msg = "Log in to RetroAchievements in Settings to see who you follow";
-         break;
-      case GRID_SOCIAL_LOADING:
-         msg = "Loading...";
-         break;
-      case GRID_SOCIAL_ERROR:
-         if (!n)
-            msg = "Couldn't reach RetroAchievements";
-         break;
-      default:
-         if (!n)
-            msg = "You aren't following anyone yet";
-         break;
-   }
-
-   if (msg)
-   {
-      grid_draw_text(msg, width / 2.0f,
-            grid_text_y(top + area_h / 2.0f, height, ts), width, height,
-            COL_TEXT_SOFT, TEXT_ALIGN_CENTER, ts);
-      return;
-   }
-
-   /* Keep the selected row visible. */
-   rows = (size_t)((area_h - head_h + cgap) / (card_h + cgap));
-   if (rows < 1)
-      rows = 1;
-   sel_row = grid_st.panel_sel / GRID_FRIEND_COLS;
-   if (sel_row < first_row)
-      first_row = sel_row;
-   else if (sel_row >= first_row + rows)
-      first_row = sel_row - rows + 1;
-   grid_draw_scrollbar(p_disp, userdata, width, height, gy, area_h - head_h,
-         first_row, rows, (n + GRID_FRIEND_COLS - 1) / GRID_FRIEND_COLS);
-
-   for (i = first_row * GRID_FRIEND_COLS;
-         i < n && i < (first_row + rows) * GRID_FRIEND_COLS; i++)
-   {
-      size_t src             = grid_st.list_view[i]; /* list index */
-      const grid_friend_t *f = grid_social_get(src);
-      size_t col = i % GRID_FRIEND_COLS;
-      size_t row = i / GRID_FRIEND_COLS - first_row;
-      float cx   = floorf(left + col * (card_w + cgap) + 0.5f);
-      float cy   = floorf(gy + row * (card_h + cgap) + 0.5f);
-      float mid  = cy + card_h / 2.0f;
-      float tx   = cx + cpad + ad + REF(10);
-      float tw   = cx + card_w - cpad - tx;
-      char ago[32], line[320];
-      float agow;
-
-      if (!f)
-         break;
-
-      if (i == grid_st.panel_sel)
-         grid_draw_cursor(p_disp, userdata, width, height,
-               cx, cy, card_w, card_h, REF(10));
-      grid_draw_shape(p_disp, userdata, width, height,
-            cx, cy, card_w, card_h, REF(10), COL_DIVIDER);
-
-      /* Avatar, clipped to a circle when it loads. */
-      if (     src < GRID_MAX_FRIENDS && !grid_st.avatar_tried[src]
-            && !string_is_empty(f->avatar))
-      {
-         unsigned aw, ah;
-         grid_st.avatar_tried[src] = true;
-         grid_load_rounded_texture(f->avatar, &grid_st.avatar[src],
-               &aw, &ah, 0.5f, 1.0f);
-      }
-      if (src < GRID_MAX_FRIENDS && grid_st.avatar[src])
-         grid_draw_icon(p_disp, userdata, width, height, &grid_st.avatar[src],
-               cx + cpad + ad / 2.0f, mid, ad, 0xffffffff);
-      else
-         grid_draw_shape(p_disp, userdata, width, height,
-               cx + cpad, mid - ad / 2.0f, ad, ad, ad / 2.0f, COL_DIVIDER);
-
-      /* Name, with how long ago on the right. */
-      grid_format_ago(f->when, ago, sizeof(ago));
-      agow = grid_text_width(ago, height, ss);
-      grid_draw_text(ago, cx + card_w - cpad,
-            grid_text_y(mid - REF(7), height, ss), width, height,
-            COL_TEXT_SOFT, TEXT_ALIGN_RIGHT, ss);
-
-      /* Last played: "Game - what they were doing". */
-      {
-         char last[336];
-         float nw = tw - agow - REF(8); /* name width, left of "ago" */
-
-         if (!string_is_empty(f->game) && !string_is_empty(f->activity))
-            snprintf(last, sizeof(last), "%s - %s", f->game, f->activity);
-         else
-            strlcpy(last, !string_is_empty(f->activity) ? f->activity
-                  : !string_is_empty(f->game) ? f->game
-                  : "No recent activity", sizeof(last));
-
-         if (i == grid_st.panel_sel)
-         {
-            /* Selected: lines too long to fit scroll, so all of it can
-             * be read. */
-            grid_draw_marquee(p_disp, userdata, true, f->name,
-                  tx, grid_text_y(mid - REF(7), height, ts), nw,
-                  width, height, COL_TEXT, ts, TEXT_ALIGN_LEFT, f->name);
-            grid_draw_marquee(p_disp, userdata, false, last,
-                  tx, grid_text_y(mid + REF(8), height, ss), tw,
-                  width, height, COL_TEXT_SOFT, ss, TEXT_ALIGN_LEFT,
-                  f->activity);
-         }
-         else
-         {
-            grid_fit_text(true, f->name, nw, height, ts, line, sizeof(line));
-            grid_draw_text_bold(line, tx,
-                  grid_text_y(mid - REF(7), height, ts),
-                  width, height, COL_TEXT, TEXT_ALIGN_LEFT, ts);
-            grid_fit_text(false, last, tw, height, ss, line, sizeof(line));
-            grid_draw_text(line, tx, grid_text_y(mid + REF(8), height, ss),
-                  width, height, COL_TEXT_SOFT, TEXT_ALIGN_LEFT, ss);
-         }
-      }
-   }
 }
 
 /* A texture filling the rect (x, y, w, h) on whole pixels. */
@@ -7866,7 +7132,7 @@ static void grid_draw_cheevos_screen(gfx_display_t *p_disp, void *userdata,
    }
 }
 
-/* Downloads: what L's filter shows (All, Updates, Installable, Up to
+/* Installs: what L's filter shows (All, Updates, Installable, Up to
  * date) as cards in two columns, R's order, narrowed by the Y search.
  * A card: the name
  * (bold) with its console (or Emulator / Core) on the right, then how it
@@ -7899,8 +7165,8 @@ static void grid_draw_downloads_screen(gfx_display_t *p_disp,
    grid_build_list_view();
    shown = grid_st.list_count;
 
-   /* Downloads | 3 updates | Checking... | "search" */
-   parts[np++] = "Downloads";
+   /* Installs | 3 updates | Checking... | "search" */
+   parts[np++] = "Installs";
    if (avail)
    {
       snprintf(waiting, sizeof(waiting), "%u update%s waiting", avail,
@@ -9226,18 +8492,18 @@ bool grid_home_frame(video_frame_info_t *video_info)
    video_driver_state_t *video_st = video_state_get_ptr();
    settings_t *settings           = config_get_ptr();
    bool in_settings               = grid_settings_shown();
-   /* The Settings, Following, achievements, art, picture and Downloads
-    * screens take the games grid's place. */
+   /* The Settings, achievements, art, picture and Installs screens take
+    * the games grid's place. */
    bool show_games                = !in_settings
-                                 && grid_st.panel != PANEL_FRIENDS
                                  && grid_st.panel != PANEL_CHEEVOS
                                  && grid_st.panel != PANEL_ART
                                  && grid_st.panel != PANEL_ICONS
-                                 && grid_st.panel != PANEL_UPDATES
-                                 && grid_st.panel != PANEL_MULTIPLAYER;
+                                 && grid_st.panel != PANEL_UPDATES;
 
    /* Point saves at the current profile (once). */
    grid_profile_init();
+   /* bomba-settings.ini: keys and the RetroAchievements login (once). */
+   bomba_settings_init();
 
    /* A console control's bind wait just ended: show what was pressed. */
    grid_cc_bind_poll();
@@ -9258,11 +8524,7 @@ bool grid_home_frame(video_frame_info_t *video_info)
    /* Blur downloaded banners ahead of time, on the worker thread. */
    grid_blur_poll();
 
-   /* Followed users' list or avatars changed: reload their pictures. */
-   if (grid_social_poll())
-      grid_free_avatars();
-
-   /* Downloads: looked for at start (and again now and then), so the
+   /* Installs: looked for at start (and again now and then), so the
     * download button can show a dot. Nothing installs unless picked; when
     * something has, reload core info so its games show (or play). */
    grid_updates_check(false, grid_running_core());
@@ -9405,12 +8667,8 @@ bool grid_home_frame(video_frame_info_t *video_info)
          grid_draw_art_screen(p_disp, userdata, width, height);
       else if (grid_st.panel == PANEL_ICONS)
          grid_draw_picker_screen(p_disp, userdata, width, height);
-      else if (grid_st.panel == PANEL_UPDATES)
-         grid_draw_downloads_screen(p_disp, userdata, width, height);
-      else if (grid_st.panel == PANEL_MULTIPLAYER)
-         grid_draw_multiplayer_screen(p_disp, userdata, width, height);
       else
-         grid_draw_friends_screen(p_disp, userdata, width, height);
+         grid_draw_downloads_screen(p_disp, userdata, width, height);
    }
    else if (grid_st.view_count == 0)
    {
@@ -9582,21 +8840,10 @@ bool grid_home_frame(video_frame_info_t *video_info)
    {
       /* A setting's text entry: what is asked and what's typed so far,
        * over the keyboard (the grid's own prompts show in place). */
-      if (grid_st.kb == KB_MENU || grid_st.kb == KB_MULTIPLAYER)
+      if (grid_st.kb == KB_MENU)
       {
          char prompt[sizeof(grid_st.box_msg)];
-         char stars[129];
          const char *buf = menu_input_dialog_get_buffer();
-         /* A room password shows as stars. */
-         if (     grid_st.kb == KB_MULTIPLAYER && buf
-               && grid_st.mp_edit == MP_ROW_PASSWORD)
-         {
-            size_t i, len = strlen(buf);
-            for (i = 0; i < len && i + 1 < sizeof(stars); i++)
-               stars[i] = '*';
-            stars[i] = '\0';
-            buf      = stars;
-         }
          snprintf(prompt, sizeof(prompt), "%s\n%s",
                menu_state_get_ptr()->input_dialog_kb_label,
                buf ? buf : "");
@@ -9652,8 +8899,6 @@ void grid_home_context_reset(bool is_threaded)
             sizeof(icons));
       fill_pathname_join_special(path, icons, "power.png", sizeof(path));
       grid_icon_load(&grid_st.icon_exit, path);
-      fill_pathname_join_special(path, icons, "friends.png", sizeof(path));
-      grid_icon_load(&grid_st.icon_friends, path);
       fill_pathname_join_special(path, icons, "settings.png", sizeof(path));
       grid_icon_load(&grid_st.icon_settings, path);
       fill_pathname_join_special(path, icons, "search.png", sizeof(path));
@@ -9662,12 +8907,6 @@ void grid_home_context_reset(bool is_threaded)
       grid_icon_load(&grid_st.icon_trophy, path);
       fill_pathname_join_special(path, icons, "download.png", sizeof(path));
       grid_icon_load(&grid_st.icon_download, path);
-      fill_pathname_join_special(path, icons, "globe.png", sizeof(path));
-      grid_icon_load(&grid_st.icon_globe, path);
-      fill_pathname_join_special(path, icons, "host.png", sizeof(path));
-      grid_icon_load(&grid_st.icon_host, path);
-      fill_pathname_join_special(path, icons, "join.png", sizeof(path));
-      grid_icon_load(&grid_st.icon_join, path);
    }
 }
 
@@ -9676,7 +8915,6 @@ void grid_home_context_destroy(void)
    grid_free_textures();
    grid_bg_free_all();
    grid_bg_tex_free_all();
-   grid_free_avatars();
    grid_free_profile_textures();
    grid_free_rings();
    grid_free_badges();
@@ -9690,14 +8928,10 @@ void grid_home_context_destroy(void)
    grid_close_picker();
 
    grid_icon_free(&grid_st.icon_exit);
-   grid_icon_free(&grid_st.icon_friends);
    grid_icon_free(&grid_st.icon_settings);
    grid_icon_free(&grid_st.icon_search);
    grid_icon_free(&grid_st.icon_trophy);
    grid_icon_free(&grid_st.icon_download);
-   grid_icon_free(&grid_st.icon_globe);
-   grid_icon_free(&grid_st.icon_host);
-   grid_icon_free(&grid_st.icon_join);
 
    if (grid_st.disc)
       video_driver_texture_unload(&grid_st.disc);

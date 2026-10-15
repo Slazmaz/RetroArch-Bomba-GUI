@@ -17,20 +17,153 @@
 #include "verbosity.h"
 
 #include "steam.h"
+#include "../bomba/bomba_steamnet.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#include <stdlib.h>
+#endif
 
 static bool mist_initialized                = false;
 static bool mist_showing_osk                = false;
 static steam_core_dlc_list_t *mist_dlc_list = NULL;
 static enum presence last_presence          = PRESENCE_NONE;
 
+#ifdef _WIN32
+/* Steam injects its overlay into the process it starts, and that passes it
+ * on to the processes it starts; a launch script (cmd) can lose it, and
+ * then mist's own SteamAPI_Init loads the overlay into mist.exe, which
+ * draws nothing. Load it here if missing, before any window or graphics
+ * context exists, the same way steam_api does. */
+static void steam_load_overlay(void)
+{
+   HKEY key;
+   char steam_path[MAX_PATH];
+   char dll_path[MAX_PATH + 32];
+   DWORD size        = sizeof(steam_path);
+   DWORD type        = 0;
+   const char *appid = getenv("SteamAppId");
+
+   if (GetModuleHandleA("gameoverlayrenderer64.dll"))
+      return;
+   /* Only when Steam launched us; the overlay needs the game id. */
+   if (!appid || !*appid)
+      return;
+   if (!getenv("SteamGameId"))
+      SetEnvironmentVariableA("SteamGameId", appid);
+   if (!getenv("SteamOverlayGameId"))
+      SetEnvironmentVariableA("SteamOverlayGameId", appid);
+
+   if (RegOpenKeyExA(HKEY_CURRENT_USER, "Software\\Valve\\Steam",
+         0, KEY_READ, &key) != ERROR_SUCCESS)
+      return;
+   if (RegQueryValueExA(key, "SteamPath", NULL, &type,
+         (LPBYTE)steam_path, &size) != ERROR_SUCCESS || type != REG_SZ)
+   {
+      RegCloseKey(key);
+      return;
+   }
+   RegCloseKey(key);
+   steam_path[sizeof(steam_path) - 1] = '\0';
+
+   snprintf(dll_path, sizeof(dll_path), "%s\\gameoverlayrenderer64.dll",
+         steam_path);
+
+   if (LoadLibraryA(dll_path))
+      RARCH_LOG("[Steam] Loaded overlay from \"%s\".\n", dll_path);
+   else
+      RARCH_ERR("[Steam] Failed to load overlay \"%s\" (%lu).\n",
+            dll_path, GetLastError());
+}
+
+/* n bytes at rva of a loaded module, as its dll file has them. */
+static bool steam_module_file_bytes(HMODULE mod, DWORD rva,
+      unsigned char *out, DWORD n)
+{
+   char path[MAX_PATH];
+   IMAGE_DOS_HEADER *dos = (IMAGE_DOS_HEADER*)mod;
+   IMAGE_NT_HEADERS *nt  = (IMAGE_NT_HEADERS*)((BYTE*)mod + dos->e_lfanew);
+   IMAGE_SECTION_HEADER *s = IMAGE_FIRST_SECTION(nt);
+   LARGE_INTEGER pos;
+   DWORD got  = 0;
+   bool ok    = false;
+   HANDLE f;
+   WORD i;
+
+   for (i = 0; i < nt->FileHeader.NumberOfSections; i++, s++)
+      if (     rva >= s->VirtualAddress
+            && rva + n <= s->VirtualAddress + s->SizeOfRawData)
+         break;
+   if (     i == nt->FileHeader.NumberOfSections
+         || !GetModuleFileNameA(mod, path, sizeof(path)))
+      return false;
+
+   f = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+         0, NULL);
+   if (f == INVALID_HANDLE_VALUE)
+      return false;
+   pos.QuadPart = s->PointerToRawData + (rva - s->VirtualAddress);
+   if (     SetFilePointerEx(f, pos, NULL, FILE_BEGIN)
+         && ReadFile(f, out, n, &got, NULL) && got == n)
+      ok = true;
+   CloseHandle(f);
+   return ok;
+}
+
+/* The overlay detours XInputGetStateEx (ordinal 100), which the xinput
+ * joypad driver reads the guide button through, and drops the guide
+ * button, so it can't open the menu. Whether the overlay came in with
+ * Steam's injection or steam_load_overlay, put the function's start back
+ * as the dll file has it (its first bytes hold no addresses to relocate). */
+static void steam_keep_guide_button(void)
+{
+   static const char *xinput_dlls[] = { "xinput1_4.dll", "xinput1_3.dll" };
+   size_t i;
+
+   if (!GetModuleHandleA("gameoverlayrenderer64.dll"))
+      return;
+
+   for (i = 0; i < 2; i++)
+   {
+      unsigned char *fn, orig[16];
+      HMODULE x;
+      DWORD old;
+
+      if (     !(x = LoadLibraryA(xinput_dlls[i]))
+            || !(fn = (unsigned char*)GetProcAddress(x, (LPCSTR)100))
+            || !steam_module_file_bytes(x, (DWORD)(fn - (unsigned char*)x),
+                  orig, sizeof(orig)))
+         continue;
+
+      if (     memcmp(fn, orig, sizeof(orig))
+            && VirtualProtect(fn, sizeof(orig), PAGE_EXECUTE_READWRITE, &old))
+      {
+         memcpy(fn, orig, sizeof(orig));
+         VirtualProtect(fn, sizeof(orig), old, &old);
+         FlushInstructionCache(GetCurrentProcess(), fn, sizeof(orig));
+         RARCH_LOG("[Steam] Kept the guide button in %s.\n", xinput_dlls[i]);
+      }
+   }
+}
+#endif
+
 void steam_init(void)
 {
-   MistResult result = mist_subprocess_init();
+   MistResult result;
+
+#ifdef _WIN32
+   steam_load_overlay();
+   steam_keep_guide_button();
+#endif
+
+   result = mist_subprocess_init();
 
    if (MIST_IS_SUCCESS(result))
       mist_initialized = true;
    else
       RARCH_ERR("[Steam] Failed to initialize mist subprocess (%d-%d).\n", MIST_UNPACK_RESULT(result));
+
+   bomba_steamnet_init();
 }
 
 void steam_poll(void)
@@ -42,6 +175,9 @@ void steam_poll(void)
    static bool has_poll_errored          = false;
    static bool has_rich_presence_enabled = false;
    MistResult result                     = mist_poll();
+
+   bomba_steamnet_poll();
+
    if (MIST_IS_ERROR(result))
    {
       if (has_poll_errored)
@@ -366,7 +502,29 @@ bool steam_has_osk_open(void)
    return mist_showing_osk;
 }
 
+/* Bomba: how friends join this player's multiplayer session ("" when there
+ * is none), as the rich presence key Steam reads for "Invite to Game" and
+ * "Join Game". Set through mist, which owns the game's rich presence and
+ * clears all of it, so it is put back after every update. */
+static char steam_connect[64];
+
+void steam_set_connect(const char *connect)
+{
+   strlcpy(steam_connect, connect ? connect : "", sizeof(steam_connect));
+   if (mist_initialized)
+      mist_steam_friends_set_rich_presence("connect", steam_connect);
+}
+
+static void steam_update_presence_inner(enum presence presence, bool force);
+
 void steam_update_presence(enum presence presence, bool force)
+{
+   steam_update_presence_inner(presence, force);
+   if (mist_initialized && steam_connect[0])
+      mist_steam_friends_set_rich_presence("connect", steam_connect);
+}
+
+static void steam_update_presence_inner(enum presence presence, bool force)
 {
    settings_t* settings = config_get_ptr();
 
@@ -543,7 +701,10 @@ void steam_update_presence(enum presence presence, bool force)
 
 void steam_deinit(void)
 {
-   MistResult result = mist_subprocess_deinit();
+   MistResult result;
+
+   bomba_steamnet_deinit();
+   result = mist_subprocess_deinit();
 
    /* Free the cached dlc list */
    if (mist_dlc_list)

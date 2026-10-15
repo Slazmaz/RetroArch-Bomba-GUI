@@ -2722,10 +2722,14 @@ endif
 OBJ += bomba/bomba_notify.o
 ifeq ($(HAVE_XMB), 1)
    OBJ += bomba/grid_home.o bomba/grid_meta.o bomba/grid_cover.o \
-          bomba/grid_cores.o bomba/grid_profile.o bomba/grid_social.o \
+          bomba/grid_cores.o bomba/grid_profile.o \
           bomba/grid_cheevos.o bomba/grid_controls.o \
           bomba/grid_coreopts.o bomba/grid_updates.o \
-          bomba/grid_switch.o bomba/bomba_multiplayer.o
+          bomba/grid_switch.o bomba/bomba_multiplayer.o \
+          bomba/bomba_settings.o
+endif
+ifeq ($(HAVE_MIST), 1)
+   OBJ += bomba/bomba_steamnet.o
 endif
 
 ### Shared rich presence code for Discord and Steam
