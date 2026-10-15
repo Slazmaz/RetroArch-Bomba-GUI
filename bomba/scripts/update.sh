@@ -22,8 +22,25 @@ STEAM_RA="$ROOT/../RetroArch"
 
 cd "$ROOT"
 
+# Files our commits delete (RetroArch's community files, see .github/README.md)
+# stay deleted when upstream edits them: resolve those conflicts and carry on.
+# Fails on any other conflict, with the rebase still in progress.
+keep_deletions()
+{
+   local conflicts deleted
+   while [ -d "$(git rev-parse --git-path rebase-merge)" ]; do
+      conflicts=$(git diff --name-only --diff-filter=U)
+      deleted=$(git status --porcelain | awk '$1 == "UD" {print $2}')
+      if [ -z "$conflicts" ] || [ "$conflicts" != "$deleted" ]; then
+         return 1
+      fi
+      git rm -q -- $deleted
+      GIT_EDITOR=true git rebase --continue > /dev/null || true
+   done
+}
+
 new_rev=$(awk '/^Rev:/ {print $2}' "$STEAM_RA/build.txt")
-old_rev=$(git rev-parse upstream)
+old_rev=$(git rev-parse refs/tags/upstream)
 
 if [ -z "$new_rev" ]; then
    echo "Could not read Rev from $STEAM_RA/build.txt" >&2
@@ -38,9 +55,10 @@ fi
 
 if [ "$new_rev" != "$old_rev" ]; then
    echo "Updating ${old_rev:0:7} -> ${new_rev:0:7}"
-   git fetch --depth 1 origin "$new_rev"
+   git fetch --depth 1 upstream "$new_rev"
 
-   if ! git rebase --onto "$new_rev" upstream master; then
+   if ! git rebase --onto "$new_rev" refs/tags/upstream master \
+         && ! keep_deletions; then
       git rebase --abort
       echo "Our changes conflict with the new RetroArch version." >&2
       echo "Nothing was changed; the current build keeps working." >&2
