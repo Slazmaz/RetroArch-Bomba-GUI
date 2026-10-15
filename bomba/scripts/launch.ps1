@@ -100,48 +100,99 @@ public static class WindowHelper
 }
 "@
 
-if (-not $Command -or $Command.Count -eq 0) {
-    exit 1
-}
-
-$exe = $Command[0]
+# This script sits in the install's app\ folder, next to the retroarch.exe
+# and retroarch.cfg it always runs; the install's own folders (settings,
+# saves...) are one up, where bomba.exe starts this. Steam's launch option
+# passes its own RetroArch first (%command%); that is replaced, keeping its
+# arguments.
+$app  = $PSScriptRoot
+$root = Split-Path -Parent $app
+$steamExe = $null
 $argsToPass = @()
 
-if ($Command.Count -gt 1) {
-    $argsToPass = $Command[1..($Command.Count - 1)]
+if ($Command -and $Command.Count -gt 0) {
+    if ((Split-Path -Leaf $Command[0]) -ieq "retroarch.exe") {
+        $steamExe = $Command[0]
+        if ($Command.Count -gt 1) {
+            $argsToPass = $Command[1..($Command.Count - 1)]
+        }
+    }
+    else {
+        $argsToPass = $Command
+    }
 }
 
-# Swap Steam's RetroArch for the custom build (see build.sh) when present.
-# Data folders in build\ are junctions into Steam's install, and the config
-# is Steam's own, so saves, cores and settings stay shared.
-# This script lives in bomba\scripts; $root is the repo root.
-$root = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
-$customExe = Join-Path $root "build\retroarch.exe"
+# Steam starts the game with "+connect_lobby <id>" to join a friend's
+# multiplayer session (Join Game, an accepted invite). RetroArch would take
+# it for content; the fork reads the lobby from BOMBA_CONNECT_LOBBY.
+$kept = @()
+for ($i = 0; $i -lt $argsToPass.Count; $i++) {
+    if ($argsToPass[$i] -eq "+connect_lobby" -and $i + 1 -lt $argsToPass.Count) {
+        $env:BOMBA_CONNECT_LOBBY = $argsToPass[$i + 1]
+        $i++
+    }
+    else {
+        $kept += $argsToPass[$i]
+    }
+}
+$argsToPass = $kept
 
-if (
-    (Split-Path -Leaf $exe) -ieq "retroarch.exe" -and
-    (Test-Path $customExe)
-) {
-    $steamDir = Split-Path -Parent $exe
-    $steamConfig = Join-Path $steamDir "retroarch.cfg"
+$exe = Join-Path $app "retroarch.exe"
 
-    # Tell the user (via the fork's on-screen messages) when Steam has
-    # shipped a newer RetroArch than the custom build is based on.
-    $steamRev = Select-String -Path (Join-Path $steamDir "build.txt") -Pattern '^Rev:\s*(\S+)' |
+# Saves, save states and core settings live in Steam's RetroArch folder,
+# where Steam Cloud backs them up: here they are links to it. Started by
+# Steam, its RetroArch (%command%) says where that folder is. Started by
+# hand, the links from the last Steam start stay; never started by Steam,
+# they are ordinary folders here, whose files join Steam's on the first
+# Steam start: where Steam's folder has the same file, Steam's stays and
+# this one goes to <folder>_old (saves_old...).
+if ($steamExe) {
+    $steamRa = Split-Path -Parent $steamExe
+    foreach ($dir in "saves", "states", "config") {
+        $link   = Join-Path $root $dir
+        $target = Join-Path $steamRa $dir
+        $old    = Join-Path $root "${dir}_old"
+        New-Item -ItemType Directory -Force $target | Out-Null
+        $item = Get-Item -LiteralPath $link -Force -ErrorAction SilentlyContinue
+        if ($item -and -not $item.LinkType) {
+            $ok = $true
+            foreach ($f in Get-ChildItem -LiteralPath $link -Recurse -File -Force) {
+                $rel  = $f.FullName.Substring($link.Length + 1)
+                $dest = Join-Path $target $rel
+                if (Test-Path -LiteralPath $dest) { $dest = Join-Path $old $rel }
+                New-Item -ItemType Directory -Force (Split-Path -Parent $dest) | Out-Null
+                try { Move-Item -LiteralPath $f.FullName -Destination $dest -ErrorAction Stop }
+                catch { $ok = $false }
+            }
+            # Anything left (a file in use): keep the folder as it is.
+            if (-not $ok) { continue }
+            Remove-Item -LiteralPath $link -Recurse -Force
+        }
+        elseif ($item) {
+            if (($item.Target -join "") -eq $target) { continue }
+            cmd /c rmdir "$link" | Out-Null # removes only the link
+        }
+        cmd /c mklink /J "$link" "$target" | Out-Null
+    }
+}
+
+# Tell the user (via the fork's on-screen messages) when Steam has shipped
+# a newer RetroArch than this build is based on.
+if ($steamExe) {
+    $steamBuild = Join-Path (Split-Path -Parent $steamExe) "build.txt"
+    $steamRev = Select-String -Path $steamBuild -Pattern '^Rev:\s*(\S+)' -ErrorAction SilentlyContinue |
         ForEach-Object { $_.Matches[0].Groups[1].Value } |
         Select-Object -First 1
-    $buildRevFile = Join-Path $root "build\build-rev.txt"
+    $buildRevFile = Join-Path $app "build-rev.txt"
     $buildRev = if (Test-Path $buildRevFile) { (Get-Content $buildRevFile -TotalCount 1).Trim() }
 
-    if ($steamRev -and $steamRev -ne $buildRev) {
-        $env:BOMBA_MSG = "RetroArch update available - run bomba\scripts\update.cmd"
+    if ($steamRev -and $buildRev -and $steamRev -ne $buildRev) {
+        $env:BOMBA_MSG = "RetroArch update available"
     }
+}
 
-    if (-not ($argsToPass -contains "--config" -or $argsToPass -contains "-c")) {
-        $argsToPass = @("--config", $steamConfig) + $argsToPass
-    }
-
-    $exe = $customExe
+if (-not ($argsToPass -contains "--config" -or $argsToPass -contains "-c")) {
+    $argsToPass = @("--config", (Join-Path $app "retroarch.cfg")) + $argsToPass
 }
 
 $workingDir = Split-Path -Parent $exe

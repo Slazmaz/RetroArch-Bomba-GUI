@@ -1,5 +1,7 @@
 # Bomba: build output (Switch keys, profiles, API keys live here)
 /build/
+# Bomba: build.sh's staged program (see bomba/scripts/build.sh)
+/dist/
 
 *.o
 *.obj
@@ -184,6 +186,8 @@ obj-unix/
 *.FileListAbsolute.txt
 *.res
 retroarch.cfg
+# Bomba: the install's template config (see bomba/scripts/build.sh)
+!/bomba/retroarch.cfg
 Makefile.local
 pkg/msvc/**/ARM
 pkg/msvc/**/ARM64

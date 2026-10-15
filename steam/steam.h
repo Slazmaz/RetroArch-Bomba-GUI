@@ -55,6 +55,8 @@ bool steam_open_osk(void);
 bool steam_has_osk_open(void);
 
 void steam_update_presence(enum presence presence, bool force);
+/* Bomba: the rich presence "connect" string friends join through. */
+void steam_set_connect(const char *connect);
 
 /* Located in tasks/task_steam.c */
 void task_push_steam_core_dlc_install(AppId app_id, const char *name);

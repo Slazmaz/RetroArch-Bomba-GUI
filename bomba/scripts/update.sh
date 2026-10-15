@@ -18,7 +18,7 @@ fi
 trap 'rm -f "$0"' EXIT
 
 ROOT="$BOMBA_ROOT"
-STEAM_RA="$ROOT/../RetroArch"
+source "$ROOT/bomba/scripts/steam_ra.sh"
 
 cd "$ROOT"
 

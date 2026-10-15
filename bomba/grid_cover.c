@@ -1,8 +1,8 @@
 /* Bomba: portrait covers from SteamGridDB for the game grid.
  *
- * Needs the user's SteamGridDB API key in
- *    <retroarch.exe dir>/bomba/steamgriddb.key
- * Without it, covers are disabled and the grid keeps its square icons.
+ * Needs the user's SteamGridDB API key (steamgriddb_api_key in
+ * bomba-settings.ini, see bomba_settings.h). Without it, covers are
+ * disabled and the grid keeps its square icons.
  *
  * For each game title: search SteamGridDB, take the top-voted 600x900
  * static PNG/JPEG grid, download it. Results are cached in
@@ -24,6 +24,7 @@
 #include <formats/rpng.h>
 
 #include "grid_cover.h"
+#include "bomba_settings.h"
 #include "../configuration.h"
 
 void grid_title_fix_article(char *s)
@@ -95,26 +96,7 @@ static struct
 
 static void cover_load_key(void)
 {
-   char path[PATH_MAX_LENGTH];
-   char app_dir[PATH_MAX_LENGTH];
-   void *buf   = NULL;
-   int64_t len = 0;
-   char key[64];
-   char *p;
-
-   fill_pathname_application_dir(app_dir, sizeof(app_dir));
-   fill_pathname_join_special(path, app_dir,
-         "bomba/steamgriddb.key", sizeof(path));
-
-   if (!path_is_valid(path) || !filestream_read_file(path, &buf, &len))
-      return;
-
-   strlcpy(key, (const char*)buf, sizeof(key));
-   free(buf);
-
-   /* Trim whitespace/newlines. */
-   for (p = key; *p && *p != '\r' && *p != '\n' && *p != ' '; p++);
-   *p = '\0';
+   const char *key = bomba_settings_steamgriddb_key();
 
    if (string_is_empty(key))
       return;

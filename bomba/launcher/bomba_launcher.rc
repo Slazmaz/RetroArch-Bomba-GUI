@@ -1,0 +1,2 @@
+// bomba.exe's icon: RetroArch's own (as media/rarch.rc gives retroarch.exe).
+1 ICON "../../media/retroarch.ico"

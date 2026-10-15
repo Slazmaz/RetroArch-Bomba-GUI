@@ -12,54 +12,25 @@
 #include <string/stdstring.h>
 
 #include "bomba_multiplayer.h"
-#include "grid_profile.h"
-#include "../configuration.h"
+#ifdef HAVE_MIST
+#include "bomba_steamnet.h"
+#endif
 
-/* The session: only in memory, so it ends with RetroArch. */
-static struct
+enum bomba_mp_mode bomba_mp_mode(void)
 {
-   enum bomba_mp_mode mode;
-   char address[256];
-   unsigned port;
-   char password[128];
-   unsigned max_players;
-} mp;
-
-void bomba_mp_start(enum bomba_mp_mode mode, const char *address,
-      unsigned port, const char *password, unsigned max_players)
-{
-   settings_t *settings = config_get_ptr();
-
-   if (max_players < BOMBA_MP_MAX_PLAYERS_MIN)
-      max_players = BOMBA_MP_MAX_PLAYERS_MIN;
-   if (max_players > BOMBA_MP_MAX_PLAYERS_MAX)
-      max_players = BOMBA_MP_MAX_PLAYERS_MAX;
-
-   mp.mode        = mode;
-   mp.port        = port;
-   mp.max_players = max_players;
-   strlcpy(mp.address,  mode == BOMBA_MP_JOIN && address ? address : "",
-         sizeof(mp.address));
-   strlcpy(mp.password, password ? password : "", sizeof(mp.password));
-
-   /* The screen starts from these next time. */
-   if (mode == BOMBA_MP_JOIN)
-      strlcpy(settings->paths.bomba_mp_address, mp.address,
-            sizeof(settings->paths.bomba_mp_address));
-   settings->uints.bomba_mp_port        = port;
-   settings->uints.bomba_mp_max_players = max_players;
+#ifdef HAVE_MIST
+   switch (bomba_steamnet_state())
+   {
+      case BOMBA_STEAMNET_HOSTING:
+         return BOMBA_MP_HOST;
+      case BOMBA_STEAMNET_JOINED:
+         return BOMBA_MP_JOIN;
+      default:
+         break;
+   }
+#endif
+   return BOMBA_MP_NONE;
 }
-
-void bomba_mp_end(void)
-{
-   memset(&mp, 0, sizeof(mp));
-}
-
-enum bomba_mp_mode bomba_mp_mode(void) { return mp.mode; }
-const char *bomba_mp_address(void)       { return mp.address; }
-unsigned bomba_mp_port(void)             { return mp.port; }
-bool bomba_mp_has_password(void)         { return mp.password[0] != '\0'; }
-unsigned bomba_mp_max_players(void)      { return mp.max_players; }
 
 static void mp_setenv(const char *name, const char *value)
 {
@@ -75,17 +46,23 @@ static void mp_setenv(const char *name, const char *value)
 
 void bomba_mp_export_env(void)
 {
+   enum bomba_mp_mode mode = bomba_mp_mode();
    char num[16];
-   bool on = mp.mode != BOMBA_MP_NONE;
 
-   mp_setenv("BOMBA_MP_MODE", mp.mode == BOMBA_MP_HOST ? "host"
-         : mp.mode == BOMBA_MP_JOIN ? "join" : NULL);
-   mp_setenv("BOMBA_MP_ADDRESS",  on ? mp.address  : NULL);
-   mp_setenv("BOMBA_MP_PASSWORD", on ? mp.password : NULL);
-   snprintf(num, sizeof(num), "%u", mp.port);
-   mp_setenv("BOMBA_MP_PORT", on && mp.port ? num : NULL);
-   snprintf(num, sizeof(num), "%u", mp.max_players);
-   mp_setenv("BOMBA_MP_MAX", on ? num : NULL);
-   mp_setenv("BOMBA_MP_NAME", on
-         ? grid_profile_name(grid_profile_current()) : NULL);
+   mp_setenv("BOMBA_MP_MODE", mode == BOMBA_MP_HOST ? "host"
+         : mode == BOMBA_MP_JOIN ? "join" : NULL);
+   mp_setenv("BOMBA_MP_PASSWORD", NULL);
+#ifdef HAVE_MIST
+   /* A guest's room is the tunnel's local end; the host's is the
+    * emulator's own port, where the tunnel delivers. */
+   mp_setenv("BOMBA_MP_ADDRESS", mode == BOMBA_MP_JOIN ? "127.0.0.1" : NULL);
+   snprintf(num, sizeof(num), "%u", bomba_steamnet_local_port());
+   mp_setenv("BOMBA_MP_PORT", mode == BOMBA_MP_JOIN ? num : NULL);
+   snprintf(num, sizeof(num), "%u", BOMBA_STEAMNET_MAX_PLAYERS);
+   mp_setenv("BOMBA_MP_MAX", mode == BOMBA_MP_HOST ? num : NULL);
+   mp_setenv("BOMBA_MP_NAME", mode != BOMBA_MP_NONE
+         ? bomba_steamnet_my_name() : NULL);
+#else
+   (void)num;
+#endif
 }

@@ -329,6 +329,31 @@ static wchar_t *child_environment(void)
    return out;
 }
 
+/* CreateProcessW for Eden and its helpers. RetroArch loads Steam's overlay,
+ * which detours kernel32's CreateProcessW to inject itself into every child;
+ * inside Eden (and eden_padinfo) the overlay hides the controller from SDL.
+ * KernelBase's export is the untouched implementation, so the children start
+ * clean. The overlay still draws over Eden through RetroArch's window. */
+typedef BOOL (WINAPI *create_process_w_t)(LPCWSTR, LPWSTR,
+      LPSECURITY_ATTRIBUTES, LPSECURITY_ATTRIBUTES, BOOL, DWORD, LPVOID,
+      LPCWSTR, LPSTARTUPINFOW, LPPROCESS_INFORMATION);
+
+static BOOL spawn_process(LPCWSTR app, LPWSTR cmd, BOOL inherit,
+      DWORD flags, LPVOID env, LPCWSTR dir, LPSTARTUPINFOW si,
+      LPPROCESS_INFORMATION pi)
+{
+   static create_process_w_t create;
+   if (!create)
+   {
+      HMODULE kb = GetModuleHandleW(L"kernelbase.dll");
+      if (kb)
+         create = (create_process_w_t)GetProcAddress(kb, "CreateProcessW");
+      if (!create)
+         create = CreateProcessW;
+   }
+   return create(app, cmd, NULL, NULL, inherit, flags, env, dir, si, pi);
+}
+
 /* ---------------------------------------------------------------------- */
 /* Controller: Player 1 on the first game controller                      */
 /* ---------------------------------------------------------------------- */
@@ -505,7 +530,7 @@ static void write_controls(char **buf, size_t *len)
    /* The environment Eden will get, so it sees what Eden will see. */
    {
       wchar_t *env = child_environment();
-      BOOL ok = CreateProcessW(NULL, cmd, NULL, NULL, TRUE,
+      BOOL ok = spawn_process(NULL, cmd, TRUE,
             CREATE_NO_WINDOW | (env ? CREATE_UNICODE_ENVIRONMENT : 0),
             env, NULL, &si, &pi);
       free(env);
@@ -968,8 +993,11 @@ static bool start_room(const wchar_t *exe, const wchar_t *workdir, const wchar_t
    _snwprintf(ban_path, MAX_PATH * 2, L"%ls\\user\\room-ban-list.txt", workdir);
    ban_path[MAX_PATH * 2 - 1] = L'\0';
 
+   /* On loopback only: players arrive through RetroArch's Steam tunnel
+    * (bomba_steamnet.c), so nothing is opened to the network and Windows
+    * Firewall has nothing to ask. */
    _snwprintf(cmd, MAX_PATH * 8,
-         L"\"%ls\" --room -n \"%ls\" -p %u -m %u -g \"%ls\" -b \"%ls\"%ls%ls%ls%ls",
+         L"\"%ls\" --room -s 127.0.0.1 -n \"%ls\" -p %u -m %u -g \"%ls\" -b \"%ls\"%ls%ls%ls%ls",
          exe, name, mp.port, mp.max_members, game, ban_path, password,
          log_path[0] ? L" -l \"" : L"", log_path, log_path[0] ? L"\"" : L"");
    cmd[MAX_PATH * 8 - 1] = L'\0';
@@ -987,7 +1015,7 @@ static bool start_room(const wchar_t *exe, const wchar_t *workdir, const wchar_t
    si.cb = sizeof(si);
    {
       wchar_t *env = child_environment();
-      BOOL ok = CreateProcessW(exe, cmd, NULL, NULL, FALSE,
+      BOOL ok = spawn_process(exe, cmd, FALSE,
             CREATE_SUSPENDED | CREATE_NO_WINDOW
             | (env ? CREATE_UNICODE_ENVIRONMENT : 0), env, workdir, &si, &pi);
       free(env);
@@ -1740,7 +1768,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    {
       /* Without Steam's SDL settings, see child_environment. */
       wchar_t *env = child_environment();
-      BOOL ok = CreateProcessW(exe, cmdline, NULL, NULL, FALSE,
+      BOOL ok = spawn_process(exe, cmdline, FALSE,
             env ? CREATE_UNICODE_ENVIRONMENT : 0, env, workdir, &si, &pi);
       free(env);
       if (!ok)
