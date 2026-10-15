@@ -142,6 +142,10 @@
 #include "menu/menu_driver.h"
 #include "menu/menu_input.h"
 #endif
+#ifdef HAVE_XMB
+#include "bomba/grid_home.h"
+#include "bomba/bomba_multiplayer.h"
+#endif
 
 #if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
 #include "menu/menu_shader.h"
@@ -7899,6 +7903,11 @@ bool core_load_game(retro_ctx_load_content_info_t *load_info)
 
    set_save_state_in_background(false);
 
+#ifdef HAVE_XMB
+   /* The grid's Multiplayer settings, for launcher cores. */
+   bomba_mp_export_env();
+#endif
+
    if (load_info && load_info->special)
       game_loaded = runloop_st->current_core.retro_load_game_special(
             load_info->special->id, load_info->info, load_info->content->size);
@@ -8241,6 +8250,18 @@ void runloop_path_set_redirect(settings_t *settings,
             msg_hash_to_str(MENU_ENUM_LABEL_VALUE_NO_CORE)))
 #endif
       {
+         /* Bomba: saves are sorted by console ("SNES"), so
+          * switching emulators keeps them; by core when the file type
+          * doesn't tell the console. Save states stay per core: their
+          * format is the core's own. */
+         const char *save_folder = sysinfo->library_name;
+#ifdef HAVE_XMB
+         char console[64];
+         if (grid_home_console_for_file(path_get(RARCH_PATH_CONTENT),
+                  console, sizeof(console)))
+            save_folder = console;
+#endif
+
          /* Per-core and/or per-content-directory saves */
          if (     (sort_savefiles || sort_savefiles_by_content)
                && !string_is_empty(new_savefile_dir))
@@ -8253,12 +8274,12 @@ void runloop_path_set_redirect(settings_t *settings,
                      content_dir_name,
                      sizeof(new_savefile_dir));
 
-            /* Append library_name to the save location */
+            /* Append the console (or library_name) to the save location */
             if (sort_savefiles)
                fill_pathname_join(
                      new_savefile_dir,
                      new_savefile_dir,
-                     sysinfo->library_name,
+                     save_folder,
                      sizeof(new_savefile_dir));
 
             /* If path doesn't exist, try to create it,

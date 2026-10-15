@@ -180,6 +180,7 @@ typedef struct disp_widget_msg
    float hourglass_rotation;
    float hourglass_timer; /* float alignment */
    float expiration_timer; /* float alignment */
+   float bomba_y;        /* drawn top edge; < 0 until first drawn */
 
    uint16_t flags;
    int8_t task_progress;
@@ -394,6 +395,10 @@ void gfx_widgets_ai_service_overlay_unload(void);
 #ifdef HAVE_CHEEVOS
 void gfx_widgets_update_cheevos_appearance(void);
 void gfx_widgets_push_achievement(const char *title, const char* subtitle, const char *badge);
+/* As above; icon is shown when badge is NULL or not loaded yet
+ * (MENU_WIDGETS_ICON_LAST for a text-only card). */
+void gfx_widgets_push_achievement_icon(const char *title, const char* subtitle,
+      const char *badge, enum gfx_widgets_icon icon);
 void gfx_widgets_set_leaderboard_display(unsigned id, const char* value);
 void gfx_widgets_clear_leaderboard_displays(void);
 void gfx_widgets_set_challenge_display(unsigned id, const char* badge);
@@ -401,6 +406,8 @@ void gfx_widgets_clear_challenge_displays(void);
 void gfx_widget_set_achievement_progress(const char* badge, const char* progress);
 void gfx_widget_set_cheevos_disconnect(bool visible);
 void gfx_widget_set_cheevos_set_loading(bool visible);
+/* Height the achievement card covers at the top of the screen (0 if none). */
+float gfx_widget_achievement_popup_reserved(void);
 #endif
 
 /* TODO/FIXME/WARNING: Not thread safe! */

@@ -5242,6 +5242,23 @@ static unsigned input_combo_type_onkeyup_lut[INPUT_COMBO_LAST] =
 } \
 
 
+/* Whether the menu's OK button was down at the last menu_event. */
+static bool menu_driver_ok_down = false;
+
+bool menu_driver_ok_held(void)
+{
+   return menu_driver_ok_down;
+}
+
+/* Whether the menu's scan button (joypad Y) was down at the last
+ * menu_event. */
+static bool menu_driver_scan_down = false;
+
+bool menu_driver_scan_held(void)
+{
+   return menu_driver_scan_down;
+}
+
 unsigned menu_event(
       settings_t *settings,
       input_bits_t *p_input,
@@ -5327,6 +5344,9 @@ unsigned menu_event(
       ok_current = ok_trigger = ok_trigger_release = 0;
 
    ok_old                                          = ok_current;
+   menu_driver_ok_down                             = ok_current ? true : false;
+   menu_driver_scan_down                           = BIT256_GET_PTR(p_input,
+         RETRO_DEVICE_ID_JOYPAD_Y) ? true : false;
 
    /* Get pointer (mouse + touchscreen) input
     * Note: Must be done regardless of menu screensaver

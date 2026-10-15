@@ -1463,10 +1463,14 @@ static bool content_load(content_ctx_info_t *info,
       /* Note: Have to read settings value here
        * (It will be invalid if we try to read
        *  it earlier...) */
+      /* Bomba: no big game-name splash on launch; the grid
+       * already showed the game. */
+#if 0
       settings_t *settings              = config_get_ptr();
       bool show_load_content_animation  = settings && settings->bools.menu_show_load_content_animation;
       if (show_load_content_animation)
          gfx_widget_start_load_content_animation();
+#endif
    }
 #endif
 #endif

@@ -706,6 +706,9 @@ unsigned menu_event(
       input_bits_t *p_trigger_input,
       bool display_kb);
 
+bool menu_driver_ok_held(void);
+bool menu_driver_scan_held(void);
+
 /* Gets called when we want to toggle the menu.
  * If the menu is already running, it will be turned off.
  * If the menu is off, then the menu will be started.

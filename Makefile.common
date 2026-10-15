@@ -2718,11 +2718,14 @@ ifeq ($(HAVE_MIST), 1)
    OBJ += steam/steam.o tasks/task_steam.o
 endif
 
-### RetroArchWrapper additions
-OBJ += wrapper/wrapper_notify.o
+### Bomba additions
+OBJ += bomba/bomba_notify.o
 ifeq ($(HAVE_XMB), 1)
-   OBJ += wrapper/grid_home.o wrapper/grid_meta.o wrapper/grid_cover.o \
-          wrapper/grid_cores.o
+   OBJ += bomba/grid_home.o bomba/grid_meta.o bomba/grid_cover.o \
+          bomba/grid_cores.o bomba/grid_profile.o bomba/grid_social.o \
+          bomba/grid_cheevos.o bomba/grid_controls.o \
+          bomba/grid_coreopts.o bomba/grid_updates.o \
+          bomba/grid_switch.o bomba/bomba_multiplayer.o
 endif
 
 ### Shared rich presence code for Discord and Steam

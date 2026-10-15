@@ -21,18 +21,33 @@
 #include "../gfx_widgets.h"
 
 #include "../../cheevos/cheevos.h"
+#include "../../bomba/grid_home.h"
 
 #define CHEEVO_LBOARD_ARRAY_SIZE 4
 #define CHEEVO_CHALLENGE_ARRAY_SIZE 8
 
-#define CHEEVO_LBOARD_DISPLAY_PADDING 3
+/* Bomba look, in the grid's reference pixels (height / 423) */
+#define TRACKER_REF(px)          ((float)(px) * (float)video_height / 423.0f)
+#define TRACKER_MARGIN           8
+#define TRACKER_SPACING          4
+#define TRACKER_HEIGHT           18
+#define TRACKER_PAD              6
+#define TRACKER_RADIUS           5
+#define TRACKER_BADGE            20
+#define TRACKER_TEXT_CAP         6.5f
+#define TRACKER_SMALL_CAP        5.0f
+
+#define TRACKER_COL_BACKDROP     0x000000c0
+#define TRACKER_COL_TEXT         0xecececff
+#define TRACKER_COL_DIM          0xb4b4b9ff
+#define TRACKER_COL_WARN         0xff8a65ff
 
 #define CHEEVO_PROGRESS_TRACKER_DURATION 2000
 
 struct leaderboard_display_info
 {
    unsigned id;
-   unsigned width;
+   unsigned width; /* unused: measured each frame in the Bomba font */
    char display[24]; /* should never exceed 12 bytes, but aligns the structure at 32 bytes */
 };
 
@@ -67,6 +82,7 @@ struct gfx_widget_leaderboard_display_state
    unsigned challenge_count;
    uint16_t char_width[CHEEVO_LBOARD_LAST_FIXED_CHAR - CHEEVO_LBOARD_FIRST_FIXED_CHAR + 1];
    uint16_t fixed_char_width;
+   unsigned char_width_height; /* screen height char_width was measured at */
    uint16_t loading;
    bool disconnected;
 };
@@ -109,6 +125,81 @@ static void gfx_widget_leaderboard_display_context_destroy(void)
    state->challenge_count = 0;
 }
 
+/* Width of a tracker value in the Bomba font, with digits all as wide
+ * as the widest one so a running timer doesn't jitter. */
+static float gfx_widget_leaderboard_display_value_width(
+      gfx_widget_leaderboard_display_state_t *state, const char *value,
+      unsigned video_height)
+{
+   float width = 0.0f;
+
+   /* Measure the fixed characters once per screen height. */
+   if (state->char_width_height != video_height)
+   {
+      char buffer[2] = "0";
+      int j;
+      state->fixed_char_width = 0;
+      for (j = 0; j < (int)ARRAY_SIZE(state->char_width); ++j)
+      {
+         buffer[0] = (char)(j + CHEEVO_LBOARD_FIRST_FIXED_CHAR);
+         state->char_width[j] = (uint16_t)(grid_overlay_text_width(true,
+                  buffer, video_height, TRACKER_TEXT_CAP) + 0.5f);
+         if (buffer[0] >= '0' && buffer[0] <= '9'
+               && state->char_width[j] > state->fixed_char_width)
+            state->fixed_char_width = state->char_width[j];
+      }
+      state->char_width_height = video_height;
+   }
+
+   while (*value)
+   {
+      const char c = *value++;
+      if (c >= '0' && c <= '9')
+         width += state->fixed_char_width;
+      else if (c >= CHEEVO_LBOARD_FIRST_FIXED_CHAR && c <= CHEEVO_LBOARD_LAST_FIXED_CHAR)
+         width += state->char_width[c - CHEEVO_LBOARD_FIRST_FIXED_CHAR];
+      else
+      {
+         char buffer[2] = "0";
+         buffer[0] = c;
+         width += grid_overlay_text_width(true, buffer, video_height,
+               TRACKER_TEXT_CAP);
+      }
+   }
+
+   return width;
+}
+
+/* Icon texture or badge, faded with the rest (default icon if none). */
+static void gfx_widget_leaderboard_display_draw_image(
+      const video_frame_info_t *video_info, gfx_display_t *p_disp,
+      dispgfx_widget_t *p_dispwidget, uintptr_t image,
+      enum gfx_widgets_icon icon, float x, float y, float size)
+{
+   static float pure_white[16] = {
+      1.00, 1.00, 1.00, 1.00,
+      1.00, 1.00, 1.00, 1.00,
+      1.00, 1.00, 1.00, 1.00,
+      1.00, 1.00, 1.00, 1.00,
+   };
+   uintptr_t tex = image ? image
+      : p_dispwidget->gfx_widgets_icons_textures[icon];
+
+   if (!tex)
+      return;
+
+   gfx_widgets_draw_icon(video_info->userdata, p_disp,
+         video_info->width, video_info->height,
+         (unsigned)size, (unsigned)size, tex, x, y,
+         0.0f, /* rad */
+         1.0f, /* cos(rad)   = cos(0)  = 1.0f */
+         0.0f, /* sine(rad)  = sine(0) = 0.0f */
+         pure_white);
+}
+
+/* Everything stacks up from the bottom right corner as small pills on the
+ * menus' translucent black: timers (bottom), challenge badges, progress,
+ * then the RetroAchievements connection status. */
 static void gfx_widget_leaderboard_display_frame(void* data, void* userdata)
 {
    gfx_widget_leaderboard_display_state_t *state = &p_w_leaderboard_display_st;
@@ -126,138 +217,101 @@ static void gfx_widget_leaderboard_display_frame(void* data, void* userdata)
 #endif
 
    {
-      static float pure_white[16] = {
-         1.00, 1.00, 1.00, 1.00,
-         1.00, 1.00, 1.00, 1.00,
-         1.00, 1.00, 1.00, 1.00,
-         1.00, 1.00, 1.00, 1.00,
-      };
-      unsigned i, x;
+      unsigned i;
       dispgfx_widget_t         *p_dispwidget = (dispgfx_widget_t*)userdata;
       const video_frame_info_t *video_info   = (const video_frame_info_t*)data;
       gfx_display_t *p_disp                  = (gfx_display_t*)video_info->disp_userdata;
+      gfx_display_ctx_driver_t *dispctx      = p_disp->dispctx;
       const unsigned video_width             = video_info->width;
       const unsigned video_height            = video_info->height;
-      const unsigned spacing                 = MIN(video_width, video_height) / 64;
-      const unsigned widget_height           = p_dispwidget->gfx_widget_fonts.regular.line_height + (CHEEVO_LBOARD_DISPLAY_PADDING - 1) * 2;
-      unsigned y                             = video_height;
+      const float margin                     = TRACKER_REF(TRACKER_MARGIN);
+      const float spacing                    = TRACKER_REF(TRACKER_SPACING);
+      const float pill_h                     = TRACKER_REF(TRACKER_HEIGHT);
+      const float pad                        = TRACKER_REF(TRACKER_PAD);
+      const float radius                     = TRACKER_REF(TRACKER_RADIUS);
+      float x;
+      float y                                = video_height - margin;
       char buffer[2] = "0";
       const char* ptr;
-      float char_x, char_y;
 
-      gfx_display_set_alpha(p_dispwidget->backdrop_orig, DEFAULT_BACKDROP);
-      gfx_display_set_alpha(pure_white, 1.0f);
+      if (dispctx && dispctx->blend_begin)
+         dispctx->blend_begin(video_info->userdata);
 
+      /* Timers / scores: the value in even-width digits */
       for (i = 0; i < state->tracker_count; ++i)
       {
-         const unsigned widget_width = state->tracker_info[i].width;
-         x                           = video_width - widget_width - spacing;
-         y                          -= (widget_height + spacing);
+         float char_x;
+         float value_w = gfx_widget_leaderboard_display_value_width(state,
+               state->tracker_info[i].display, video_height);
+         float w       = value_w + pad * 2.0f;
 
-         /* Backdrop */
-         gfx_display_draw_quad(
-               p_disp,
-               video_info->userdata,
-               video_width, video_height,
-               (int)x, (int)y, widget_width, widget_height,
-               video_width, video_height,
-               p_dispwidget->backdrop_orig,
-               NULL);
+         x  = video_width - margin - w;
+         y -= pill_h;
 
-         /* Text */
-         char_x = (float)(x + CHEEVO_LBOARD_DISPLAY_PADDING);
-         char_y = (float)(y + widget_height - (CHEEVO_LBOARD_DISPLAY_PADDING - 1)
-               - p_dispwidget->gfx_widget_fonts.regular.line_descender);
+         grid_overlay_shape(p_disp, video_info->userdata,
+               video_width, video_height, x, y, w, pill_h,
+               radius, TRACKER_COL_BACKDROP);
 
-         ptr = state->tracker_info[i].display;
+         char_x = x + pad;
+         ptr    = state->tracker_info[i].display;
          while (*ptr)
          {
-            float next_char_x = char_x + state->fixed_char_width;
+            float next_char_x;
             const char c = *ptr++;
-            if (c >= CHEEVO_LBOARD_FIRST_FIXED_CHAR && c <= CHEEVO_LBOARD_LAST_FIXED_CHAR)
-            {
-               unsigned char_width = state->char_width[c - CHEEVO_LBOARD_FIRST_FIXED_CHAR];
-               if (c >= '0' && c <= '9')
-               {
-                  float padding = (float)(state->fixed_char_width - char_width) / 2.0;
-                  char_x += padding;
-               }
-               else
-                  next_char_x = char_x + char_width;
-            }
+            buffer[0]    = c;
 
-            buffer[0] = c;
-            gfx_widgets_draw_text(&p_dispwidget->gfx_widget_fonts.regular,
-                  buffer, char_x, char_y,
-                  video_width, video_height,
-                  TEXT_COLOR_INFO, TEXT_ALIGN_LEFT, true);
+            if (c >= '0' && c <= '9')
+            {
+               /* centre each digit in the widest digit's slot */
+               unsigned char_width = state->char_width[c - CHEEVO_LBOARD_FIRST_FIXED_CHAR];
+               next_char_x = char_x + state->fixed_char_width;
+               char_x     += (float)(state->fixed_char_width - char_width) / 2.0f;
+            }
+            else if (c >= CHEEVO_LBOARD_FIRST_FIXED_CHAR && c <= CHEEVO_LBOARD_LAST_FIXED_CHAR)
+               next_char_x = char_x + state->char_width[c - CHEEVO_LBOARD_FIRST_FIXED_CHAR];
+            else
+               next_char_x = char_x + grid_overlay_text_width(true, buffer,
+                     video_height, TRACKER_TEXT_CAP);
+
+            grid_overlay_text(true, buffer, char_x, y + pill_h / 2.0f,
+                  video_width, video_height, TRACKER_COL_TEXT,
+                  TEXT_ALIGN_LEFT, TRACKER_TEXT_CAP);
 
             char_x = next_char_x;
          }
+
+         y -= spacing;
       }
 
+      /* Challenges in progress: their badges in a row */
       if (state->challenge_count)
       {
-         const unsigned widget_size = spacing * 4;
+         const float badge = TRACKER_REF(TRACKER_BADGE);
+         const float box   = badge + pad;
 
-         x = video_width;
-         y -= (widget_size + spacing);
+         x  = video_width - margin;
+         y -= box;
 
          for (i = 0; i < state->challenge_count; ++i)
          {
-            x -= (widget_size + spacing);
+            x -= box;
 
-            if (!state->challenge_info[i].image)
-            {
-               /* default icon */
-               if (p_dispwidget->gfx_widgets_icons_textures[
-                     MENU_WIDGETS_ICON_ACHIEVEMENT])
-               {
-                  gfx_display_ctx_driver_t* dispctx = p_disp->dispctx;
-                  if (dispctx && dispctx->blend_begin)
-                     dispctx->blend_begin(video_info->userdata);
+            grid_overlay_shape(p_disp, video_info->userdata,
+                  video_width, video_height, x, y, box, box,
+                  radius, TRACKER_COL_BACKDROP);
 
-                  gfx_widgets_draw_icon(
-                        video_info->userdata,
-                        p_disp,
-                        video_width,
-                        video_height,
-                        widget_size,
-                        widget_size,
-                        p_dispwidget->gfx_widgets_icons_textures[
-                              MENU_WIDGETS_ICON_ACHIEVEMENT],
-                        x,
-                        y,
-                        0.0f, /* rad */
-                        1.0f, /* cos(rad)   = cos(0)  = 1.0f */
-                        0.0f, /* sine(rad)  = sine(0) = 0.0f */
-                        pure_white);
+            gfx_widget_leaderboard_display_draw_image(video_info, p_disp,
+                  p_dispwidget, state->challenge_info[i].image,
+                  MENU_WIDGETS_ICON_ACHIEVEMENT,
+                  x + pad / 2.0f, y + pad / 2.0f, badge);
 
-                  if (dispctx && dispctx->blend_end)
-                     dispctx->blend_end(video_info->userdata);
-               }
-            }
-            else
-            {
-               /* achievement badge */
-               gfx_widgets_draw_icon(
-                     video_info->userdata,
-                     p_disp,
-                     video_width,
-                     video_height,
-                     widget_size,
-                     widget_size,
-                     state->challenge_info[i].image,
-                     x,
-                     y,
-                     0.0f, /* rad */
-                     1.0f, /* cos(rad)   = cos(0)  = 1.0f */
-                     0.0f, /* sine(rad)  = sine(0) = 0.0f */
-                     pure_white);
-            }
+            x -= spacing;
          }
+
+         y -= spacing;
       }
 
+      /* Progress towards an achievement, briefly: badge + "3/10" */
       if (state->progress_tracker.show_until)
       {
          retro_time_t now = cpu_features_get_time_usec();
@@ -267,94 +321,39 @@ static void gfx_widget_leaderboard_display_frame(void* data, void* userdata)
          }
          else
          {
-            const unsigned image_size = spacing * 4;
-            const unsigned tracker_height = image_size + spacing;
-            const unsigned tracker_width = state->progress_tracker.width + image_size + spacing * 2;
-            x = video_width - tracker_width - spacing;
-            y -= (tracker_height + spacing);
+            const float badge = pill_h - pad;
+            float text_w      = grid_overlay_text_width(true,
+                  state->progress_tracker.display, video_height,
+                  TRACKER_TEXT_CAP);
+            float w           = pad / 2.0f + badge + pad * 0.8f + text_w + pad * 1.4f;
 
-            /* Backdrop */
-            gfx_display_draw_quad(
-                  p_disp,
-                  video_info->userdata,
-                  video_width, video_height,
-                  (int)x, (int)y, tracker_width, tracker_height,
-                  video_width, video_height,
-                  p_dispwidget->backdrop_orig,
-                  NULL);
+            x  = video_width - margin - w;
+            y -= pill_h;
 
-            x += spacing / 2;
-            y += spacing / 2;
+            grid_overlay_shape(p_disp, video_info->userdata,
+                  video_width, video_height, x, y, w, pill_h,
+                  radius, TRACKER_COL_BACKDROP);
 
-            if (!state->progress_tracker.image)
-            {
-               /* default icon */
-               if (p_dispwidget->gfx_widgets_icons_textures[
-                     MENU_WIDGETS_ICON_ACHIEVEMENT])
-               {
-                  gfx_display_ctx_driver_t* dispctx = p_disp->dispctx;
-                  if (dispctx && dispctx->blend_begin)
-                     dispctx->blend_begin(video_info->userdata);
+            gfx_widget_leaderboard_display_draw_image(video_info, p_disp,
+                  p_dispwidget, state->progress_tracker.image,
+                  MENU_WIDGETS_ICON_ACHIEVEMENT,
+                  x + pad / 2.0f, y + pad / 2.0f, badge);
 
-                  gfx_widgets_draw_icon(
-                        video_info->userdata,
-                        p_disp,
-                        video_width,
-                        video_height,
-                        image_size,
-                        image_size,
-                        p_dispwidget->gfx_widgets_icons_textures[
-                              MENU_WIDGETS_ICON_ACHIEVEMENT],
-                        x,
-                        y,
-                        0.0f, /* rad */
-                        1.0f, /* cos(rad)   = cos(0)  = 1.0f */
-                        0.0f, /* sine(rad)  = sine(0) = 0.0f */
-                        pure_white);
+            grid_overlay_text(true, state->progress_tracker.display,
+                  x + pad / 2.0f + badge + pad * 0.8f, y + pill_h / 2.0f,
+                  video_width, video_height, TRACKER_COL_TEXT,
+                  TEXT_ALIGN_LEFT, TRACKER_TEXT_CAP);
 
-                  if (dispctx && dispctx->blend_end)
-                     dispctx->blend_end(video_info->userdata);
-               }
-            }
-            else
-            {
-               /* achievement badge */
-               gfx_widgets_draw_icon(
-                     video_info->userdata,
-                     p_disp,
-                     video_width,
-                     video_height,
-                     image_size,
-                     image_size,
-                     state->progress_tracker.image,
-                     x,
-                     y,
-                     0.0f, /* rad */
-                     1.0f, /* cos(rad)   = cos(0)  = 1.0f */
-                     0.0f, /* sine(rad)  = sine(0) = 0.0f */
-                     pure_white);
-            }
-
-            x += image_size + spacing;
-            y = (float)y + image_size / 2 + p_dispwidget->gfx_widget_fonts.regular.line_height / 2 - p_dispwidget->gfx_widget_fonts.regular.line_descender;
-            gfx_widgets_draw_text(&p_dispwidget->gfx_widget_fonts.regular,
-                  state->progress_tracker.display, x, y,
-                  video_width, video_height,
-                  TEXT_COLOR_INFO, TEXT_ALIGN_LEFT, true);
+            y -= spacing;
          }
       }
 
+      /* RetroAchievements: loading dots, or disconnected */
       if (state->disconnected || state->loading)
       {
          char loading_buffer[8] = "RA ...";
-         const char *disconnected_text = state->disconnected ? "! RA !" : loading_buffer;
-         const unsigned disconnect_widget_width = font_driver_get_message_width(
-            state->dispwidget_ptr->gfx_widget_fonts.msg_queue.font,
-            disconnected_text, 0, 1) + CHEEVO_LBOARD_DISPLAY_PADDING * 2;
-         const unsigned disconnect_widget_height =
-            p_dispwidget->gfx_widget_fonts.msg_queue.line_height + (CHEEVO_LBOARD_DISPLAY_PADDING - 1) * 2;
-         x  = video_width - disconnect_widget_width - spacing;
-         y -= disconnect_widget_height + spacing;
+         const char *status_text = state->disconnected ? "RA offline" : loading_buffer;
+         float w;
 
          if (state->loading)
          {
@@ -364,26 +363,27 @@ static void gfx_widget_leaderboard_display_frame(void* data, void* userdata)
             ++state->loading;
          }
 
-         /* Backdrop */
-         gfx_display_draw_quad(
-            p_disp,
-            video_info->userdata,
-            video_width, video_height,
-            (int)x, (int)y, disconnect_widget_width, disconnect_widget_height,
-            video_width, video_height,
-            p_dispwidget->backdrop_orig,
-            NULL);
+         /* sized for the longest text, so the dots don't resize it */
+         w  = grid_overlay_text_width(false,
+               state->disconnected ? status_text : "RA ...",
+               video_height, TRACKER_SMALL_CAP) + pad * 2.4f;
+         x  = video_width - margin - w;
+         y -= pill_h * 0.8f;
 
-         /* Text */
-         char_x = (float)(x + CHEEVO_LBOARD_DISPLAY_PADDING);
-         char_y = (float)(y + disconnect_widget_height - (CHEEVO_LBOARD_DISPLAY_PADDING - 1)
-            - p_dispwidget->gfx_widget_fonts.msg_queue.line_descender);
+         grid_overlay_shape(p_disp, video_info->userdata,
+               video_width, video_height, x, y, w, pill_h * 0.8f,
+               radius, TRACKER_COL_BACKDROP);
 
-         gfx_widgets_draw_text(&p_dispwidget->gfx_widget_fonts.msg_queue,
-            disconnected_text, char_x, char_y,
-            video_width, video_height,
-            TEXT_COLOR_INFO, TEXT_ALIGN_LEFT, true);
+         grid_overlay_text(false, status_text, x + pad * 1.2f,
+               y + pill_h * 0.4f, video_width, video_height,
+               state->disconnected ? TRACKER_COL_WARN : TRACKER_COL_DIM,
+               TEXT_ALIGN_LEFT, TRACKER_SMALL_CAP);
       }
+
+      grid_overlay_flush(video_width, video_height);
+
+      if (dispctx && dispctx->blend_end)
+         dispctx->blend_end(video_info->userdata);
    }
 
 #ifdef HAVE_THREADS
@@ -438,45 +438,12 @@ void gfx_widgets_set_leaderboard_display(unsigned id, const char* value)
       }
       else
       {
-         /* calculate fixed width spacing */
-         if (state->fixed_char_width == 0)
-         {
-            char buffer[2] = "0";
-            int j = 0;
-            for (j = 0; j < (int)ARRAY_SIZE(state->char_width); ++j)
-            {
-               buffer[0] = (char)(j + CHEEVO_LBOARD_FIRST_FIXED_CHAR);
-               state->char_width[j] = (uint16_t)font_driver_get_message_width(
-                     state->dispwidget_ptr->gfx_widget_fonts.regular.font,
-                     buffer, 0, 1);
-               if (state->char_width[j] > state->fixed_char_width)
-                  state->fixed_char_width = state->char_width[j];
-            }
-         }
-
          /* show or update display */
          if (i == state->tracker_count)
             state->tracker_info[state->tracker_count++].id = id;
 
          strlcpy(state->tracker_info[i].display, value,
                sizeof(state->tracker_info[i].display));
-
-         {
-            unsigned width = CHEEVO_LBOARD_DISPLAY_PADDING * 2;
-            const char* ptr = state->tracker_info[i].display;
-            while (*ptr)
-            {
-               const char c = *ptr++;
-               if (c >= '0' && c <= '9')
-                  width += state->fixed_char_width;
-               else if (c >= CHEEVO_LBOARD_FIRST_FIXED_CHAR && c <= CHEEVO_LBOARD_LAST_FIXED_CHAR)
-                  width += state->char_width[c - CHEEVO_LBOARD_FIRST_FIXED_CHAR];
-               else
-                  width += state->fixed_char_width;
-            }
-
-            state->tracker_info[i].width = width;
-         }
       }
    }
 

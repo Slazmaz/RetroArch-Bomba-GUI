@@ -1812,32 +1812,54 @@ LRESULT CALLBACK wnd_proc_gdi_common(HWND hwnd, UINT message,
 }
 #endif
 
-/* RetroArchWrapper: keep the window across video driver reinits (content
- * load/close) so it doesn't close and reopen. Only for the D3D drivers;
- * GL/Vulkan set per-window state that can't be redone on a reused window. */
+/* Bomba: keep the window across video driver reinits (content
+ * load/close) so it doesn't close and reopen. Only for the D3D and WGL
+ * drivers, and only when the next driver is of the same kind: a window
+ * that had a GL pixel format set can't be handed to D3D and vice versa.
+ * Vulkan sets per-window state that can't be redone on a reused window. */
+enum win32_window_kind
+{
+   WIN32_WINDOW_OTHER = 0,
+   WIN32_WINDOW_D3D,
+   WIN32_WINDOW_WGL
+};
+
 static HWND    kept_hwnd       = NULL;
+static enum win32_window_kind kept_kind = WIN32_WINDOW_OTHER;
 static WNDPROC last_wndproc    = NULL;
 static bool    window_reused   = false;
 
-static bool win32_is_d3d_wndproc(WNDPROC proc)
+static enum win32_window_kind win32_wndproc_kind(WNDPROC proc)
 {
 #if defined(HAVE_D3D) || defined(HAVE_D3D8) || defined(HAVE_D3D9) || defined (HAVE_D3D10) || defined (HAVE_D3D11) || defined (HAVE_D3D12)
    if (proc == wnd_proc_d3d_common)
-      return true;
+      return WIN32_WINDOW_D3D;
 #ifdef HAVE_WINRAWINPUT
    if (proc == wnd_proc_d3d_winraw)
-      return true;
+      return WIN32_WINDOW_D3D;
 #endif
 #ifdef HAVE_DINPUT
    if (proc == wnd_proc_d3d_dinput)
-      return true;
+      return WIN32_WINDOW_D3D;
 #endif
 #endif
-   return false;
+#if (defined(HAVE_OPENGL) || defined(HAVE_OPENGL1) || defined(HAVE_OPENGL_CORE)) && !defined(HAVE_OPENGLES)
+   if (proc == wnd_proc_wgl_common)
+      return WIN32_WINDOW_WGL;
+#ifdef HAVE_WINRAWINPUT
+   if (proc == wnd_proc_wgl_winraw)
+      return WIN32_WINDOW_WGL;
+#endif
+#ifdef HAVE_DINPUT
+   if (proc == wnd_proc_wgl_dinput)
+      return WIN32_WINDOW_WGL;
+#endif
+#endif
+   return WIN32_WINDOW_OTHER;
 }
 
 /* Use instead of win32_monitor_from_window() + win32_destroy_window()
- * when freeing a D3D driver: the window stays open for the next init. */
+ * when freeing a D3D/WGL driver: the window stays open for the next init. */
 void win32_keep_window(void)
 {
 #ifndef _XBOX
@@ -1848,6 +1870,7 @@ void win32_keep_window(void)
 #endif
 #endif
    kept_hwnd        = main_window.hwnd;
+   kept_kind        = win32_wndproc_kind(last_wndproc);
    main_window.hwnd = NULL;
 }
 
@@ -1857,6 +1880,7 @@ static bool win32_reuse_kept_window(unsigned style)
 {
    const LONG_PTR mask = WS_POPUP | WS_CAPTION | WS_THICKFRAME | WS_SYSMENU;
    HWND hwnd           = kept_hwnd;
+   enum win32_window_kind kind = win32_wndproc_kind(last_wndproc);
 
    kept_hwnd     = NULL;
    window_reused = false;
@@ -1864,7 +1888,8 @@ static bool win32_reuse_kept_window(unsigned style)
    if (!hwnd || !IsWindow(hwnd))
       return false;
 
-   if (     !win32_is_d3d_wndproc(last_wndproc)
+   if (     kind == WIN32_WINDOW_OTHER
+         || kind != kept_kind
          || (GetWindowLongPtr(hwnd, GWL_STYLE) & mask) != ((LONG_PTR)style & mask))
    {
       DestroyWindow(hwnd);
@@ -1874,7 +1899,14 @@ static bool win32_reuse_kept_window(unsigned style)
    SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)last_wndproc);
    main_window.hwnd  = hwnd;
    window_reused     = true;
-   /* WM_CREATE won't come again; it is what normally sets this. */
+   /* WM_CREATE won't come again; do what it normally does. */
+#if (defined(HAVE_OPENGL) || defined(HAVE_OPENGL1) || defined(HAVE_OPENGL_CORE)) && !defined(HAVE_OPENGLES)
+   if (kind == WIN32_WINDOW_WGL)
+   {
+      wnd_proc_wgl_wm_create(hwnd);
+      return true;
+   }
+#endif
    g_win32_flags    |= WIN32_CMN_FLAG_INITED;
    return true;
 }
@@ -2868,6 +2900,9 @@ void win32_setup_pixel_format(HDC hdc, bool supports_gl)
    pfd.dwFlags      = PFD_DRAW_TO_WINDOW | PFD_DOUBLEBUFFER;
    pfd.iPixelType   = PFD_TYPE_RGBA;
    pfd.cColorBits   = 32;
+   /* An alpha channel lets the GL driver leave the window see-through
+    * (Bomba's transparent frame, see gl2.c). */
+   pfd.cAlphaBits   = supports_gl ? 8 : 0;
    pfd.cDepthBits   = 0;
    pfd.cStencilBits = 0;
    pfd.iLayerType   = PFD_MAIN_PLANE;

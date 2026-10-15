@@ -2557,8 +2557,7 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_LABEL_NETPLAY_PASSWORD,
    "netplay_password"
-   )
-MSG_HASH(
+   )MSG_HASH(
    MENU_ENUM_LABEL_NETPLAY_SETTINGS,
    "menu_netplay_settings"
    )

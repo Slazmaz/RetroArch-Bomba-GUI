@@ -563,11 +563,10 @@ static void gfx_ctx_wgl_destroy(void *data)
    }
 
 #ifndef __WINRT__
+   /* Bomba: keep the window for the next init (content
+    * load/close) instead of closing and reopening it. */
    if (window)
-   {
-      win32_monitor_from_window();
-      win32_destroy_window();
-   }
+      win32_keep_window();
 
 #endif
    if (g_win32_flags & WIN32_CMN_FLAG_RESTORE_DESKTOP)

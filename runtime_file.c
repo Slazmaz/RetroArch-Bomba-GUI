@@ -45,6 +45,10 @@
 
 #include "runtime_file.h"
 
+#ifdef HAVE_XMB
+#include "bomba/grid_home.h"
+#endif
+
 #define LOG_FILE_RUNTIME_FORMAT_STR "%u:%02u:%02u"
 #define LOG_FILE_LAST_PLAYED_FORMAT_STR "%04u-%02u-%02u %02u:%02u:%02u"
 
@@ -337,11 +341,23 @@ runtime_log_t *runtime_log_init(
       return NULL;
 
    if (log_per_core)
+   {
+      /* Bomba: per console ("SNES"), like saves, so play time
+       * survives a change of emulator; per core when the file type
+       * doesn't tell the console. */
+      const char *log_folder = core_name;
+#ifdef HAVE_XMB
+      char console[64];
+      if (     !string_is_empty(content_path)
+            && grid_home_console_for_file(content_path, console, sizeof(console)))
+         log_folder = console;
+#endif
       fill_pathname_join_special(
             log_file_dir,
             tmp_buf,
-            core_name,
+            log_folder,
             sizeof(log_file_dir));
+   }
    else
       strlcpy(log_file_dir, tmp_buf, sizeof(log_file_dir));
 
