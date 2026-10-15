@@ -101,6 +101,7 @@
 /* Cap height (reference px) of all text on the main screen: bars, hints,
  * search, L/R labels, game title. */
 #define GRID_TEXT_CAP  9
+#define BOMBA_VERSION  "0.0.0"
 #define GRID_COVER_RADIUS 0.04f /* corner radius / tile width (reference) */
 #define GRID_TILE_ASPECT  (2.0f / 3.0f) /* tile width / height (600x900) */
 
@@ -8823,6 +8824,19 @@ bool grid_home_frame(video_frame_info_t *video_info)
    grid_flush_text(width, height);
 
    grid_draw_bottom_bar(p_disp, userdata, width, height);
+
+   /* Version, faint in the bottom left corner, on every screen: light text
+    * over a dark copy one pixel down-right, so it reads on any background. */
+   {
+      static const char ver[] = "Bomba GUI v" BOMBA_VERSION;
+      float vs = CAP(5);
+      float vx = REF(6);
+      float vy = grid_text_y(REF(415), height, vs);
+      grid_draw_text(ver, vx + 1.0f, vy + 1.0f, width, height,
+            0x0000001c, TEXT_ALIGN_LEFT, vs);
+      grid_draw_text(ver, vx, vy, width, height,
+            (COL_TEXT & 0xffffff00) | 0x1c, TEXT_ALIGN_LEFT, vs);
+   }
    grid_flush_text(width, height);
 
    /* RetroArch's message box: shown for the frame it was set for. */
