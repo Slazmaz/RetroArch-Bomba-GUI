@@ -42,7 +42,7 @@ gcc -O2 -Wall -static-libgcc -o "$ROOT/build/cores/eden_padinfo.exe" bomba/cores
 cp bomba/cores/eden/eden_libretro.info "$ROOT/build/info/"
 
 # Upstream revision this build is based on; the launch script compares it to Steam's.
-git rev-parse upstream > "$ROOT/build/build-rev.txt"
+git rev-parse refs/tags/upstream > "$ROOT/build/build-rev.txt"
 
 # Copy MinGW runtime DLLs the exe depends on (skip Windows system DLLs).
 # Repeat until ldd resolves nothing from /mingw64, to catch nested deps.
