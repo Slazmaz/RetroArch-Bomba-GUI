@@ -215,6 +215,11 @@ typedef struct settings
       unsigned input_auto_game_focus;
       unsigned input_max_users;
 
+      /* Bomba multiplayer: the last room's details (see
+       * bomba/bomba_multiplayer.h). */
+      unsigned bomba_mp_port;
+      unsigned bomba_mp_max_players;
+
       unsigned netplay_port;
       unsigned netplay_max_connections;
       unsigned netplay_max_ping;
@@ -543,6 +548,10 @@ typedef struct settings
 
       char netplay_password[128];
       char netplay_spectate_password[128];
+
+      /* Full size: the config loader copies path settings up to
+       * PATH_MAX_LENGTH. */
+      char bomba_mp_address[PATH_MAX_LENGTH];
 
       char streaming_title[512]; /* TODO/FIXME - check size */
 

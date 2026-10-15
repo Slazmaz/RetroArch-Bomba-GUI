@@ -100,6 +100,66 @@
 
 #define MAX_FENCES 4
 
+/* Blending for menus and text. Same colour result as plain
+ * SRC_ALPHA / ONE_MINUS_SRC_ALPHA, but keeps the backbuffer's alpha
+ * correct, which the transparent frame below needs. */
+#define GL2_BLEND_OVER() glBlendFuncSeparate(GL_SRC_ALPHA, \
+      GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA)
+
+#if defined(_WIN32) && !defined(__WINRT__) && !defined(HAVE_OPENGLES)
+#include <windows.h>
+#include "../../audio/audio_driver.h"
+HWND win32_get_window(void);
+
+/* Bomba: transparent frame. A core that shows another
+ * program's window under RetroArch's (the Ryujinx launcher) sets the
+ * "BombaTransparent" property on the window; the core's frame is then
+ * not drawn and the backbuffer is cleared to transparent, so only menus,
+ * notifications and widgets show over that program. "BombaOverlay"
+ * tells the core this driver supports it; the BOMBA_OVERLAY
+ * environment variable says so too while the driver restarts (as it does
+ * when content loads). */
+static bool gl2_bomba_transparent(void)
+{
+   static bool env_set = false;
+   HWND hwnd           = win32_get_window();
+
+   if (!env_set)
+   {
+      SetEnvironmentVariableA("BOMBA_OVERLAY", "1");
+      env_set = true;
+   }
+   if (!hwnd)
+      return false;
+   if (!GetPropA(hwnd, "BombaOverlay"))
+      SetPropA(hwnd, "BombaOverlay", (HANDLE)1);
+
+   /* RetroArch's volume as the program under the window should play at:
+    * gain x 1000, plus one so that silence isn't "no property". */
+   {
+      audio_driver_state_t *audio_st = audio_state_get_ptr();
+      float gain = (audio_st->mute_enable || (audio_st->flags & AUDIO_FLAG_MUTED))
+         ? 0.0f : audio_st->volume_gain;
+      SetPropA(hwnd, "BombaVolume",
+            (HANDLE)(intptr_t)(1 + (int)(gain * 1000.0f + 0.5f)));
+   }
+   return GetPropA(hwnd, "BombaTransparent") != NULL;
+}
+
+static void gl2_bomba_release(void)
+{
+   HWND hwnd = win32_get_window();
+   if (hwnd)
+   {
+      RemovePropA(hwnd, "BombaOverlay");
+      RemovePropA(hwnd, "BombaVolume");
+   }
+}
+#else
+#define gl2_bomba_transparent() false
+#define gl2_bomba_release()
+#endif
+
 #if !defined(HAVE_PSGL)
 
 #ifndef HAVE_GL_SYNC
@@ -406,7 +466,7 @@ static void gfx_display_gl2_blend_begin(void *data)
    gl2_t             *gl          = (gl2_t*)data;
 
    glEnable(GL_BLEND);
-   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+   GL2_BLEND_OVER();
 
    gl->shader->use(gl, gl->shader_data, VIDEO_SHADER_STOCK_BLEND,
          true);
@@ -554,7 +614,7 @@ static void gfx_display_gl2_draw_pipeline(
          glBlendFunc(GL_DST_COLOR, GL_ONE);
          break;
       default:
-         glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+         GL2_BLEND_OVER();
          break;
    }
 
@@ -950,7 +1010,7 @@ static void gl2_raster_font_setup_viewport(
    gl2_set_viewport(gl, width, height, full_screen, true, video_scale_integer);
 
    glEnable(GL_BLEND);
-   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+   GL2_BLEND_OVER();
    glBlendEquation(GL_FUNC_ADD);
 
    glBindTexture(GL_TEXTURE_2D, font->tex);
@@ -1068,7 +1128,7 @@ static const struct font_glyph *gl2_raster_font_get_glyph(
 {
    gl2_raster_t *font = (gl2_raster_t*)data;
    if (font && font->font_driver)
-      return font->font_driver->get_glyph((void*)font->font_driver, code);
+      return font->font_driver->get_glyph(font->font_data, code);
    return NULL;
 }
 
@@ -3229,7 +3289,7 @@ static void gl2_render_osd_background(gl2_t *gl, bool video_scale_integer, const
    gl->shader->set_coords(gl->shader_data, &coords);
 
    glEnable(GL_BLEND);
-   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+   GL2_BLEND_OVER();
    glBlendEquation(GL_FUNC_ADD);
 
    gl->shader->set_mvp(gl->shader_data, &gl->mvp_no_rot);
@@ -3560,37 +3620,51 @@ static bool gl2_frame(void *data, const void *frame,
       SET_TEXTURE_COORDS(feedback_info.coord, xamt, yamt);
    }
 
-   glClear(GL_COLOR_BUFFER_BIT);
+   if (gl2_bomba_transparent())
+   {
+      /* Leave the game area see-through (see gl2_bomba_transparent). */
+      if (gl->flags & GL2_FLAG_FBO_INITED)
+      {
+         gl2_renderchain_bind_backbuffer();
+         gl2_set_viewport(gl, width, height, false, true, video_scale_integer);
+      }
+      glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+      glClear(GL_COLOR_BUFFER_BIT);
+   }
+   else
+   {
+      glClear(GL_COLOR_BUFFER_BIT);
 
-   params.vp_width         = gl->out_vp_width;
-   params.vp_height        = gl->out_vp_height;
-   params.width            = frame_width;
-   params.height           = frame_height;
-   params.tex_width        = gl->tex_w;
-   params.tex_height       = gl->tex_h;
-   params.out_width        = gl->vp.width;
-   params.out_height       = gl->vp.height;
-   params.frame_counter    = (unsigned int)frame_count;
-   params.info             = &gl->tex_info;
-   params.prev_info        = gl->prev_info;
-   params.feedback_info    = &feedback_info;
-   params.fbo_info         = NULL;
-   params.fbo_info_cnt     = 0;
+      params.vp_width         = gl->out_vp_width;
+      params.vp_height        = gl->out_vp_height;
+      params.width            = frame_width;
+      params.height           = frame_height;
+      params.tex_width        = gl->tex_w;
+      params.tex_height       = gl->tex_h;
+      params.out_width        = gl->vp.width;
+      params.out_height       = gl->vp.height;
+      params.frame_counter    = (unsigned int)frame_count;
+      params.info             = &gl->tex_info;
+      params.prev_info        = gl->prev_info;
+      params.feedback_info    = &feedback_info;
+      params.fbo_info         = NULL;
+      params.fbo_info_cnt     = 0;
 
-   gl->shader->set_params(&params, gl->shader_data);
+      gl->shader->set_params(&params, gl->shader_data);
 
-   gl->coords.vertices  = 4;
+      gl->coords.vertices  = 4;
 
-   gl->shader->set_coords(gl->shader_data, &gl->coords);
-   gl->shader->set_mvp(gl->shader_data, &gl->mvp);
+      gl->shader->set_coords(gl->shader_data, &gl->coords);
+      gl->shader->set_mvp(gl->shader_data, &gl->mvp);
 
-   glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+      glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
 
-   if (gl->flags & GL2_FLAG_FBO_INITED)
-      gl2_renderchain_render(gl,
-            chain,
-            frame_count, &gl->tex_info, &feedback_info,
-            video_scale_integer);
+      if (gl->flags & GL2_FLAG_FBO_INITED)
+         gl2_renderchain_render(gl,
+               chain,
+               frame_count, &gl->tex_info, &feedback_info,
+               video_scale_integer);
+   }
 
    /* Set prev textures. */
    gl2_renderchain_bind_prev_texture(gl,
@@ -3765,6 +3839,8 @@ static void gl2_free(void *data)
    gl2_t *gl = (gl2_t*)data;
    if (!gl)
       return;
+
+   gl2_bomba_release();
 
    if (gl->flags & GL2_FLAG_SHARED_CONTEXT_USE)
       gl->ctx_driver->bind_hw_render(gl->ctx_data, false);
@@ -4402,7 +4478,7 @@ static void *gl2_init(const video_info_t *video,
    }
 #endif
 
-   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+   GL2_BLEND_OVER();
    glBlendEquation(GL_FUNC_ADD);
 
    gl->flags              &= ~GL2_FLAG_HW_RENDER_USE;

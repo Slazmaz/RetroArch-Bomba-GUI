@@ -108,7 +108,7 @@
 #include "steam/steam.h"
 #endif
 
-#include "wrapper/wrapper_notify.h"
+#include "bomba/bomba_notify.h"
 
 #include "config.def.h"
 
@@ -6061,7 +6061,7 @@ int rarch_main(int argc, char *argv[], void *data)
    steam_poll();
 #endif
 
-      wrapper_notify_poll();
+      bomba_notify_poll();
 
 #ifdef HAVE_QT
       app_exit = ui_companion_qt.application->exiting;

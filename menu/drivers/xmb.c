@@ -43,7 +43,7 @@
 #include "../../frontend/frontend_driver.h"
 
 #include "../menu_driver.h"
-#include "../../wrapper/grid_home.h"
+#include "../../bomba/grid_home.h"
 #include "../menu_entries.h"
 #include "../menu_screensaver.h"
 
@@ -1067,6 +1067,8 @@ static void xmb_draw_text(
 static void xmb_messagebox(void *data, const char *message)
 {
    xmb_handle_t *xmb = (xmb_handle_t*)data;
+   if (grid_home_messagebox(message))
+      return;
    if (xmb && !string_is_empty(message))
       xmb->box_message = strdup(message);
 }
@@ -6808,6 +6810,8 @@ static void xmb_render(void *data,
 
    if (!xmb)
       return;
+
+   grid_home_iterate();
 
    xmb->use_ps3_layout            = xmb_use_ps3_layout(settings->uints.menu_xmb_layout, width, height);
    scale_factor                   = xmb_get_scale_factor(settings->floats.menu_scale_factor,

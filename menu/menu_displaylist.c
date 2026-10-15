@@ -84,6 +84,7 @@
 #include "../record/record_driver.h"
 #include "menu_cbs.h"
 #include "menu_driver.h"
+#include "../bomba/grid_home.h"
 #include "menu_entries.h"
 #if defined(HAVE_CG) || defined(HAVE_GLSL) || defined(HAVE_SLANG) || defined(HAVE_HLSL)
 #include "menu_shader.h"
@@ -7492,6 +7493,16 @@ unsigned menu_displaylist_build_list(
          }
          break;
       case DISPLAYLIST_INPUT_HOTKEY_BINDS_LIST:
+         /* Bomba: the grid's Settings screen shows a short list
+          * of shortcuts outside advanced mode. */
+         {
+            int bomba_count = grid_home_hotkeys_build(list);
+            if (bomba_count >= 0)
+            {
+               count += bomba_count;
+               break;
+            }
+         }
          {
             /* "Hotkey Enable" */
             if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(list,
@@ -11121,6 +11132,16 @@ unsigned menu_displaylist_build_list(
          break;
 #endif
       case DISPLAYLIST_SETTINGS_ALL:
+         /* Bomba: the grid's Settings screen shows its own
+          * short lists of settings outside advanced mode. */
+         {
+            int bomba_count = grid_home_settings_build(list, false);
+            if (bomba_count >= 0)
+            {
+               count += bomba_count;
+               break;
+            }
+         }
          {
 #ifdef HAVE_TRANSLATE
             bool settings_show_ai_service = settings->bools.settings_show_ai_service;
@@ -11244,6 +11265,11 @@ unsigned menu_displaylist_build_list(
                   default:
                      break;
                }
+
+               /* Bomba: pages the grid's Settings screen shows
+                * as categories of their own. */
+               if (grid_home_settings_hide(build_list[i].enum_idx))
+                  build_list[i].checked = false;
             }
 
             for (i = 0; i < ARRAY_SIZE(build_list); i++)
@@ -15094,6 +15120,13 @@ bool menu_displaylist_ctl(enum menu_displaylist_ctl_state type,
             break;
          case DISPLAYLIST_MAIN_MENU:
             menu_entries_clear(info->list);
+            /* Bomba: the grid's Settings screen shows its own
+             * short list here outside advanced mode. */
+            if (grid_home_settings_build(info->list, true) >= 0)
+            {
+               info->flags |= MD_FLAG_NEED_PUSH;
+               break;
+            }
             {
                rarch_system_info_t *sys_info = &runloop_state_get_ptr()->system;
                const char *menu_ident        = menu_driver_ident();
@@ -15115,11 +15148,15 @@ bool menu_displaylist_ctl(enum menu_displaylist_ctl_state type,
 
                if (flags & RUNLOOP_FLAG_CORE_RUNNING)
                {
+                  /* Bomba: the Quick Menu is "Quick settings"
+                   * in the running game's Options menu on the grid. */
+#if 0
                   if (!retroarch_ctl(RARCH_CTL_IS_DUMMY_CORE, NULL))
                      if (MENU_DISPLAYLIST_PARSE_SETTINGS_ENUM(info->list,
                               MENU_ENUM_LABEL_CONTENT_SETTINGS,
                               PARSE_ACTION, false) == 0)
                         count++;
+#endif
                }
                else
                {
@@ -15437,6 +15474,11 @@ bool menu_displaylist_ctl(enum menu_displaylist_ctl_state type,
                unsigned val              = atoi(info->path);
                const char *temp_val      = msg_hash_to_str(
                      (enum msg_hash_enums)(MENU_ENUM_LABEL_INPUT_USER_1_BINDS + (val-1)));
+               /* Bomba: the grid's Settings screen splits this
+                * page into its options and a page of the bindings. */
+               if (grid_home_user_binds_build(info->list, temp_val, val) >= 0)
+                  ret = 0;
+               else
                ret                = MENU_DISPLAYLIST_PARSE_SETTINGS(info->list,
                      temp_val, PARSE_NONE, true, MENU_SETTINGS_INPUT_BEGIN);
                info->flags       |=  MD_FLAG_NEED_REFRESH

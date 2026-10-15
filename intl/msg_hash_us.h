@@ -7668,8 +7668,7 @@ MSG_HASH(
 MSG_HASH(
    MENU_ENUM_SUBLABEL_NETPLAY_PASSWORD,
    "The password used by clients connecting to the host."
-   )
-MSG_HASH(
+   )MSG_HASH(
    MENU_ENUM_LABEL_VALUE_NETPLAY_SPECTATE_PASSWORD,
    "Server Spectate-Only Password"
    )

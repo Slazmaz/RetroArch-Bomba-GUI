@@ -1294,7 +1294,7 @@ static void d3d11_font_render_msg(
 static const struct font_glyph* d3d11_font_get_glyph(void *data, uint32_t code)
 {
    d3d11_font_t* font = (d3d11_font_t*)data;
-   /* RetroArchWrapper: upstream passed font_driver instead of font_data,
+   /* Bomba: upstream passed font_driver instead of font_data,
     * crashing in the font renderer whenever this was called. */
    if (font && font->font_driver && font->font_data)
       return font->font_driver->get_glyph(font->font_data, code);
@@ -2102,7 +2102,7 @@ static void d3d11_gfx_free(void* data)
 #endif
 
 #if defined(HAVE_MONITOR) && defined(HAVE_WINDOW)
-   /* RetroArchWrapper: keep the window for the next init (content
+   /* Bomba: keep the window for the next init (content
     * load/close) instead of closing and reopening it. */
    win32_keep_window();
 #else

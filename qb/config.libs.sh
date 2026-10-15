@@ -632,7 +632,7 @@ fi
 
 if [ "$HAVE_STEAM" = 'yes' ]; then
    add_opt CORE_INFO_CACHE no
-   # RetroArchWrapper: keep the online/core updater so cores Steam doesn't
+   # Bomba: keep the online/core updater so cores Steam doesn't
    # ship as DLC (e.g. Dolphin) can be downloaded from the libretro
    # buildbot. They install next to the Steam DLC cores.
    die : 'Notice: Steam build enabled, disabling:'

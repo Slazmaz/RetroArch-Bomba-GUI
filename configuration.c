@@ -1710,6 +1710,7 @@ static struct config_path_setting *populate_settings_path(
    SETTING_PATH("netplay_password",              settings->paths.netplay_password, false, NULL, true);
    SETTING_PATH("netplay_spectate_password",     settings->paths.netplay_spectate_password, false, NULL, true);
 #endif
+   SETTING_PATH("bomba_mp_address",          settings->paths.bomba_mp_address, false, NULL, true);
 
 #ifdef _3DS
    SETTING_PATH("bottom_assets_directory",       settings->paths.directory_bottom_assets, true, NULL, true);
@@ -2593,6 +2594,9 @@ static struct config_uint_setting *populate_settings_uint(
    SETTING_UINT("notification_show_screenshot_duration", &settings->uints.notification_show_screenshot_duration, true, DEFAULT_NOTIFICATION_SHOW_SCREENSHOT_DURATION, false);
    SETTING_UINT("notification_show_screenshot_flash",    &settings->uints.notification_show_screenshot_flash, true, DEFAULT_NOTIFICATION_SHOW_SCREENSHOT_FLASH, false);
 #endif
+
+   SETTING_UINT("bomba_mp_port",                  &settings->uints.bomba_mp_port, true, 0, false);
+   SETTING_UINT("bomba_mp_max_players",           &settings->uints.bomba_mp_max_players, true, 8, false);
 
 #ifdef HAVE_NETWORKING
    SETTING_UINT("netplay_ip_port",                    &settings->uints.netplay_port, true, RARCH_DEFAULT_PORT, false);

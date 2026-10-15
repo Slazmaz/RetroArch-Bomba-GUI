@@ -386,6 +386,27 @@ static void rcheevos_lboard_submitted(const rc_client_leaderboard_t* lboard,
    {
       size_t _len;
       char buffer[256];
+#if defined(HAVE_GFX_WIDGETS)
+      /* Bomba: popup card with the score on top, leaderboard below */
+      if (gfx_widgets_ready())
+      {
+         _len = snprintf(buffer, sizeof(buffer), "Submitted %s",
+               scoreboard ? scoreboard->submitted_score : lboard->tracker_value);
+         if (scoreboard)
+         {
+            _len += strlcpy(buffer + _len, " - ", sizeof(buffer) - _len);
+            if (strcmp(scoreboard->best_score, scoreboard->submitted_score) == 0)
+               snprintf(buffer + _len, sizeof(buffer) - _len,
+                     msg_hash_to_str(MSG_LEADERBOARD_RANK), scoreboard->new_rank);
+            else
+               snprintf(buffer + _len, sizeof(buffer) - _len,
+                     msg_hash_to_str(MSG_LEADERBOARD_BEST), scoreboard->best_score);
+         }
+         gfx_widgets_push_achievement_icon(buffer, lboard->title, NULL,
+               MENU_WIDGETS_ICON_LAST);
+         return;
+      }
+#endif
       if (scoreboard)
       {
          _len = snprintf(buffer, sizeof(buffer), msg_hash_to_str(MSG_LEADERBOARD_SUBMISSION),
@@ -414,6 +435,15 @@ static void rcheevos_lboard_canceled(const rc_client_leaderboard_t* lboard)
    if (cheevos_visibility_lboard_cancel)
    {
       char buffer[256];
+#if defined(HAVE_GFX_WIDGETS)
+      if (gfx_widgets_ready())
+      {
+         gfx_widgets_push_achievement_icon(
+               msg_hash_to_str(MSG_LEADERBOARD_FAILED), lboard->title, NULL,
+               MENU_WIDGETS_ICON_LAST);
+         return;
+      }
+#endif
       size_t _len = strlcpy(buffer, msg_hash_to_str(MSG_LEADERBOARD_FAILED), sizeof(buffer));
       _len += strlcpy(buffer + _len, ": ", sizeof(buffer) - _len);
       _len += strlcpy(buffer + _len, lboard->title, sizeof(buffer) - _len);
@@ -429,6 +459,15 @@ static void rcheevos_lboard_started(const rc_client_leaderboard_t* lboard)
    if (cheevos_visibility_lboard_start)
    {
       char buffer[256];
+#if defined(HAVE_GFX_WIDGETS)
+      if (gfx_widgets_ready())
+      {
+         gfx_widgets_push_achievement_icon(
+               msg_hash_to_str(MSG_LEADERBOARD_STARTED), lboard->title, NULL,
+               MENU_WIDGETS_ICON_LAST);
+         return;
+      }
+#endif
       size_t _len = strlcpy(buffer, msg_hash_to_str(MSG_LEADERBOARD_STARTED),
             sizeof(buffer));
       _len += strlcpy(buffer + _len, ": ", sizeof(buffer) - _len);
@@ -459,9 +498,9 @@ static void rcheevos_lboard_hide_tracker(const rc_client_leaderboard_tracker_t* 
 
 static void rcheevos_challenge_started(const rc_client_achievement_t* cheevo)
 {
-   settings_t* settings = config_get_ptr();
-   if (cheevo && gfx_widgets_ready() && settings->bools.cheevos_challenge_indicators)
-      gfx_widgets_set_challenge_display(cheevo->id, cheevo->badge_name);
+   /* Bomba: no badges parked in the corner while a challenge
+    * is primed; only the unlock popup is shown. */
+   (void)cheevo;
 }
 
 static void rcheevos_challenge_ended(const rc_client_achievement_t* cheevo)

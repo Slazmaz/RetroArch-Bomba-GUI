@@ -1974,7 +1974,7 @@ static const struct font_glyph *vulkan_font_get_glyph(
    if (!font || !font->font_driver)
       return NULL;
 
-   glyph = font->font_driver->get_glyph((void*)font->font_driver, code);
+   glyph = font->font_driver->get_glyph(font->font_data, code);
 
    if (glyph && font->atlas->dirty)
    {
