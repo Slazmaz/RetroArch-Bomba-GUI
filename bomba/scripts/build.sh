@@ -1,7 +1,6 @@
 #!/bin/bash
 # Builds the custom RetroArch fork and stages it into ./dist, laid out as
-# an install: bomba.exe (the launcher), an empty bomba-settings.ini, and
-# app\ with the program (exe, its DLLs, mist, Bomba's assets, launcher
+# an install: bomba.exe (the launcher) and app\ with the program (exe, its DLLs, mist, Bomba's assets, launcher
 # cores) and a template retroarch.cfg. No user data. dist is what gets
 # distributed, and what install.sh copies into an install.
 # Run from an MSYS2 MINGW64 shell, or:
@@ -50,9 +49,7 @@ windres -I bomba/launcher bomba/launcher/bomba_launcher.rc \
 gcc -O2 -Wall -municode -mwindows -static-libgcc -o "$DIST/bomba.exe" \
    bomba/launcher/bomba_launcher.c "$ROOT/obj-unix/bomba_launcher.res"
 cp bomba/scripts/launch.ps1 "$APP/"
-# The user's files, empty: settings (see bomba_settings.h), and RetroArch's
-# config pointing at the install's top folders.
-cp bomba/bomba-settings.ini "$DIST/"
+# RetroArch's config, empty, pointing at the install's top folders.
 cp bomba/retroarch.cfg "$APP/"
 
 # Upstream revision this build is based on; the launch script compares it to Steam's.

@@ -23,6 +23,9 @@ enum grid_meta_state grid_cover_get(const char *title,
 /* Runs queued lookups. Returns true when any entry changed. */
 bool grid_cover_poll(void);
 
+/* The API key was just entered: use it. */
+void grid_cover_reload_key(void);
+
 /* Hero banner (1920x620 or 1600x650) from SteamGridDB for a game title,
  * for the background. Queues a lookup if it isn't cached and moves it to
  * the front of the queue; on GRID_META_FOUND, path is the cached image. */

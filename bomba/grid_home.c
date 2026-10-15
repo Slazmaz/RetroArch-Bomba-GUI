@@ -54,7 +54,7 @@
 #include "grid_cores.h"
 #include "grid_profile.h"
 #include "bomba_steamnet.h"
-#include "bomba_settings.h"
+#include "bomba_setup.h"
 #include "grid_updates.h"
 #include "grid_switch.h"
 #include "grid_cheevos.h"
@@ -229,7 +229,8 @@ enum grid_panel
    PANEL_GAME_MENU,/* dropdown for the selected game (+) */
    PANEL_CHEEVOS,  /* the game's achievements */
    PANEL_ART,      /* choosing the game's cover art or wallpaper */
-   PANEL_UPDATES   /* Installs: updates and things to install */
+   PANEL_UPDATES,  /* Installs: updates and things to install */
+   PANEL_SETUP     /* first start: SteamGridDB key, RetroAchievements login */
 };
 
 /* Game menu entries, in order. Settings are its console's (its emulator's
@@ -476,7 +477,8 @@ enum grid_kb
    KB_SEARCH = 0,
    KB_PROFILE_NAME,
    KB_MENU,         /* RetroArch's own text entry, in the Settings screen */
-   KB_DOWNLOADS     /* the Installs screen's search */
+   KB_DOWNLOADS,    /* the Installs screen's search */
+   KB_SETUP         /* a field on the Setup screen */
 };
 
 static struct
@@ -514,6 +516,13 @@ static struct
    unsigned panel_sel;      /* selected item in it */
    enum grid_kb kb;         /* what the keyboard is for */
    unsigned rename_target;  /* profile being renamed */
+   /* Setup screen: what it asks for (fixed while it's open), what's been
+    * typed, and the field the keyboard is typing into. */
+   bool setup_key, setup_ra;
+   char setup_griddb[64];
+   char setup_user[128];
+   char setup_pass[256];
+   unsigned setup_typing;
 
    /* Game menu: the game it is for (index into games), where its tile is
     * on screen (the dropdown opens beside it), and the screens it opens. */
@@ -1547,6 +1556,191 @@ static void grid_dl_start_search(void)
 
    grid_st.kb = KB_DOWNLOADS;
    menu_input_dialog_start(&line);
+}
+
+/* Setup screen: a SteamGridDB column (key, where to get one) and a
+ * RetroAchievements column (username, password, making an account), each
+ * only if needed, then Continue below. */
+enum grid_setup_item
+{
+   SETUP_KEY = 0,
+   SETUP_KEY_PAGE,
+   SETUP_USER,
+   SETUP_PASS,
+   SETUP_RA_PAGE,
+   SETUP_CONTINUE
+};
+
+#define GRID_SETUP_MAX 6
+
+/* The items shown, in order (panel_sel indexes it), and where each sits:
+ * column (0 or 1; Continue spans both, 0.5) and row. */
+static unsigned grid_setup_items(unsigned *items, float *col, float *row)
+{
+   unsigned n = 0, c = 0, r;
+
+   /* The page buttons sit at the bottom of their columns, level. */
+   if (grid_st.setup_key)
+   {
+      items[n] = SETUP_KEY;      col[n] = 0.0f; row[n++] = 0.0f;
+      items[n] = SETUP_KEY_PAGE; col[n] = 0.0f;
+      row[n++] = grid_st.setup_ra ? 2.0f : 1.0f;
+      c++;
+   }
+   if (grid_st.setup_ra)
+   {
+      items[n] = SETUP_USER;     col[n] = c; row[n++] = 0.0f;
+      items[n] = SETUP_PASS;     col[n] = c; row[n++] = 1.0f;
+      items[n] = SETUP_RA_PAGE;  col[n] = c; row[n++] = 2.0f;
+      c++;
+   }
+   r = grid_st.setup_ra ? 3 : 2;
+   items[n] = SETUP_CONTINUE; col[n] = c > 1 ? 0.5f : 0.0f;
+   row[n++] = (float)r;
+   return n;
+}
+
+static bool grid_setup_ready(void)
+{
+   return !bomba_setup_busy()
+       && (!grid_st.setup_key || !string_is_empty(grid_st.setup_griddb))
+       && (!grid_st.setup_ra  || (!string_is_empty(grid_st.setup_user)
+                               && !string_is_empty(grid_st.setup_pass)));
+}
+
+/* Opens the Setup screen while anything is missing, and closes it (and
+ * looks everything up again, with the new key and login) once nothing is. */
+static void grid_setup_poll(void)
+{
+   bool need_key = bomba_setup_need_key();
+   bool need_ra  = bomba_setup_need_login();
+
+   if (grid_st.panel == PANEL_SETUP)
+   {
+      if (     (need_key && grid_st.setup_key) || (need_ra && grid_st.setup_ra)
+            || menu_input_dialog_get_display_kb())
+         return;
+      grid_st.panel = PANEL_NONE;
+      grid_cover_reload_key();
+      grid_st.scanned = false;
+      return;
+   }
+
+   if ((!need_key && !need_ra) || grid_st.settings
+         || menu_input_dialog_get_display_kb())
+      return;
+
+   grid_st.setup_key       = need_key;
+   grid_st.setup_ra        = need_ra;
+   grid_st.setup_griddb[0] = '\0';
+   grid_st.setup_pass[0]   = '\0';
+   strlcpy(grid_st.setup_user, config_get_ptr()->arrays.cheevos_username,
+         sizeof(grid_st.setup_user));
+   grid_st.panel     = PANEL_SETUP;
+   grid_st.panel_sel = 0;
+}
+
+static void grid_setup_typed(void *userdata, const char *line)
+{
+   /* Nothing typed (B on an empty line) keeps what was there. */
+   if (!string_is_empty(line))
+      switch (grid_st.setup_typing)
+      {
+         case SETUP_KEY:
+            strlcpy(grid_st.setup_griddb, line, sizeof(grid_st.setup_griddb));
+            break;
+         case SETUP_USER:
+            strlcpy(grid_st.setup_user, line, sizeof(grid_st.setup_user));
+            break;
+         case SETUP_PASS:
+            strlcpy(grid_st.setup_pass, line, sizeof(grid_st.setup_pass));
+            break;
+      }
+   menu_input_dialog_end();
+   grid_st.kb = KB_SEARCH;
+}
+
+static void grid_setup_type(unsigned item)
+{
+   menu_input_ctx_line_t line;
+
+   line.label         = "";
+   line.label_setting = "";
+   line.type          = 0;
+   line.idx           = 0;
+   line.cb            = grid_setup_typed;
+
+   grid_st.setup_typing = item;
+   grid_st.kb           = KB_SETUP;
+   menu_input_dialog_start(&line);
+}
+
+static void grid_setup_action(enum menu_action action)
+{
+   unsigned items[GRID_SETUP_MAX];
+   float col[GRID_SETUP_MAX], row[GRID_SETUP_MAX];
+   unsigned i, n = grid_setup_items(items, col, row);
+   unsigned sel  = grid_st.panel_sel < n ? grid_st.panel_sel : 0;
+   float best    = 1e9f;
+   unsigned to   = sel;
+
+   switch (action)
+   {
+      case MENU_ACTION_OK:
+         switch (items[sel])
+         {
+            case SETUP_KEY:
+            case SETUP_USER:
+            case SETUP_PASS:
+               if (!bomba_setup_busy())
+                  grid_setup_type(items[sel]);
+               break;
+            case SETUP_KEY_PAGE:
+               bomba_setup_open_page(BOMBA_SETUP_PAGE_GRIDDB_KEY);
+               break;
+            case SETUP_RA_PAGE:
+               bomba_setup_open_page(BOMBA_SETUP_PAGE_RA_SIGNUP);
+               break;
+            case SETUP_CONTINUE:
+               if (grid_setup_ready())
+               {
+                  bomba_setup_submit(
+                        grid_st.setup_key ? grid_st.setup_griddb : NULL,
+                        grid_st.setup_ra  ? grid_st.setup_user   : NULL,
+                        grid_st.setup_ra  ? grid_st.setup_pass   : NULL);
+                  /* Typed again if the login fails. */
+                  grid_st.setup_pass[0] = '\0';
+               }
+               break;
+         }
+         return;
+      case MENU_ACTION_UP:
+      case MENU_ACTION_DOWN:
+      case MENU_ACTION_LEFT:
+      case MENU_ACTION_RIGHT:
+         break;
+      default:
+         return;
+   }
+
+   /* The nearest item that way (straight on counts more than sideways). */
+   for (i = 0; i < n; i++)
+   {
+      float dc = col[i] - col[sel], dr = row[i] - row[sel], d;
+      switch (action)
+      {
+         case MENU_ACTION_UP:    d = dr < 0.0f ? -dr + 2.0f * fabsf(dc) : -1; break;
+         case MENU_ACTION_DOWN:  d = dr > 0.0f ?  dr + 2.0f * fabsf(dc) : -1; break;
+         case MENU_ACTION_LEFT:  d = dc < 0.0f ? -dc + 2.0f * fabsf(dr) : -1; break;
+         default:                d = dc > 0.0f ?  dc + 2.0f * fabsf(dr) : -1; break;
+      }
+      if (d >= 0.0f && d < best)
+      {
+         best = d;
+         to   = i;
+      }
+   }
+   grid_st.panel_sel = to;
 }
 
 /* A guest starts the host's game once it is known and nothing runs; the
@@ -3035,6 +3229,12 @@ void grid_home_iterate(void)
 static void grid_panel_action(enum menu_action action)
 {
    unsigned sel;
+
+   if (grid_st.panel == PANEL_SETUP)
+   {
+      grid_setup_action(action);
+      return;
+   }
 
    grid_build_list_view(); /* current order and count for list screens */
    sel = grid_st.panel_sel;
@@ -5747,7 +5947,8 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
                      || grid_st.panel == PANEL_CHEEVOS
                      || grid_st.panel == PANEL_ART
                      || grid_st.panel == PANEL_ICONS
-                     || grid_st.panel == PANEL_UPDATES;
+                     || grid_st.panel == PANEL_UPDATES
+                     || grid_st.panel == PANEL_SETUP;
 
    /* Icon bar: 27px circles, 9px apart. */
    if (!full_screen)
@@ -6183,6 +6384,7 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
             break;
          case PANEL_ART:
          case PANEL_ICONS:
+         case PANEL_SETUP:
             srt = con = NULL;
             break;
          default:
@@ -6334,6 +6536,26 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
    else if (grid_st.panel == PANEL_CHEEVOS)
    {
       glyphs[n] = "B"; labels[n++] = "Back";
+   }
+   else if (grid_st.panel == PANEL_SETUP)
+   {
+      unsigned items[GRID_SETUP_MAX];
+      float col[GRID_SETUP_MAX], row[GRID_SETUP_MAX];
+      unsigned sn = grid_setup_items(items, col, row);
+      unsigned it = grid_st.panel_sel < sn ? items[grid_st.panel_sel]
+                                           : SETUP_CONTINUE;
+      if (it == SETUP_KEY || it == SETUP_USER || it == SETUP_PASS)
+      {
+         glyphs[n] = "A"; labels[n++] = "Type";
+      }
+      else if (it != SETUP_CONTINUE)
+      {
+         glyphs[n] = "A"; labels[n++] = "Open in browser";
+      }
+      else if (grid_setup_ready())
+      {
+         glyphs[n] = "A"; labels[n++] = "Continue";
+      }
    }
    else if (grid_st.panel == PANEL_ART)
    {
@@ -7342,6 +7564,189 @@ static void grid_draw_downloads_screen(gfx_display_t *p_disp,
                bh, bh / 2.0f, COL_CURSOR);
       }
    }
+}
+
+/* First start: what Bomba needs and why, then a panel per service (its
+ * name, what it gives, its fields, and its web page at the bottom, so
+ * both panels line up) and Continue under them (see grid_setup_items).
+ * Fields are typed into in place: while the keyboard covers the bottom
+ * half, everything moves up to keep the field above it. */
+static void grid_draw_setup_screen(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height)
+{
+   unsigned items[GRID_SETUP_MAX];
+   float col[GRID_SETUP_MAX], row[GRID_SETUP_MAX];
+   unsigned i, n     = grid_setup_items(items, col, row);
+   unsigned cols     = (grid_st.setup_key ? 1 : 0) + (grid_st.setup_ra ? 1 : 0);
+   unsigned prows    = grid_st.setup_ra ? 3 : 2; /* rows in a panel */
+   float ppad        = REF(12);
+   float cgap        = 2.0f * ppad + REF(12); /* between panels' cards */
+   float col_w       = REF(250);
+   float x0          = (width - cols * col_w - (cols - 1) * cgap) / 2.0f;
+   float card_h      = REF(36);
+   float rgap        = REF(6);
+   float cpad        = REF(12);
+   float ts          = CAP(GRID_TEXT_CAP);
+   float ss          = CAP(GRID_TEXT_CAP - 2);
+   float shift       = 0.0f;
+   float intro_y, panel_y, top, panel_h;
+   bool typing       = menu_input_dialog_get_display_kb()
+                    && grid_st.kb == KB_SETUP;
+   bool caret        = fmodf(cpu_features_get_time_usec() / 1000000.0f,
+                          1.0f) < 0.5f;
+   const char *error = bomba_setup_error();
+   const char *parts[1];
+   char line[256];
+
+   parts[0] = "Setup";
+   grid_draw_screen_heading(p_disp, userdata, width, height, parts, 1);
+
+   /* While typing: the field just above the keyboard (it starts halfway
+    * down), if it would be under it. */
+   if (typing)
+      for (i = 0; i < n; i++)
+         if (items[i] == grid_st.setup_typing)
+         {
+            float bottom = REF(166) + row[i] * (card_h + rgap) + card_h;
+            if (bottom > REF(204))
+               shift = bottom - REF(204);
+         }
+
+   intro_y = REF(96) - shift;
+   panel_y = REF(124) - shift;
+   top     = REF(166) - shift;               /* first row of cards */
+   panel_h = top - panel_y + prows * (card_h + rgap) - rgap + ppad;
+
+   /* What's needed, and why. */
+   snprintf(line, sizeof(line), "To use Bomba GUI, %s%s%s.",
+         grid_st.setup_key ? "enter a SteamGridDB API key" : "",
+         cols > 1 ? " and " : "",
+         grid_st.setup_ra ? "log in to RetroAchievements" : "");
+   grid_draw_text(line, width / 2.0f, grid_text_y(intro_y, height, ts),
+         width, height, COL_TEXT, TEXT_ALIGN_CENTER, ts);
+   grid_draw_text("This is how you get the names, covers, banners, icons, "
+         "and achievements for your roms.",
+         width / 2.0f, grid_text_y(intro_y + REF(15), height, ss),
+         width, height, COL_TEXT_SOFT, TEXT_ALIGN_CENTER, ss);
+
+   /* The panels: name and what it's for. */
+   for (i = 0; i < cols; i++)
+   {
+      bool key  = grid_st.setup_key && i == 0;
+      float px  = floorf(x0 + i * (col_w + cgap) + 0.5f);
+      grid_draw_shape(p_disp, userdata, width, height,
+            px - ppad, panel_y, col_w + 2.0f * ppad, panel_h, REF(14),
+            0x00000060);
+      grid_draw_text_bold(key ? "SteamGridDB" : "RetroAchievements", px,
+            grid_text_y(panel_y + REF(14), height, ts), width, height,
+            COL_TEXT, TEXT_ALIGN_LEFT, ts);
+      grid_draw_text(key ? "Covers, banners and icons"
+            : "Game names, icons and achievements", px,
+            grid_text_y(panel_y + REF(29), height, ss), width, height,
+            COL_TEXT_SOFT, TEXT_ALIGN_LEFT, ss);
+   }
+
+   for (i = 0; i < n; i++)
+   {
+      bool sel     = i == grid_st.panel_sel;
+      float cw     = col_w;
+      float cx     = floorf(x0 + col[i] * (col_w + cgap) + 0.5f);
+      float cy     = floorf(top + row[i] * (card_h + rgap) + 0.5f);
+      float mid;
+      const char *label = NULL, *value = NULL;
+      char shown[300], fitted[300];
+
+      switch (items[i])
+      {
+         case SETUP_KEY:
+            label = "API key";
+            value = grid_st.setup_griddb;
+            break;
+         case SETUP_USER:
+            label = "Username";
+            value = grid_st.setup_user;
+            break;
+         case SETUP_PASS:
+            label = "Password";
+            value = grid_st.setup_pass;
+            break;
+         case SETUP_KEY_PAGE:
+            label = "Get an API key";
+            break;
+         case SETUP_RA_PAGE:
+            label = "Create an account";
+            break;
+         case SETUP_CONTINUE:
+            label = bomba_setup_busy() ? "Logging in..." : "Continue";
+            cw    = REF(160);
+            cx    = floorf((width - cw) / 2.0f + 0.5f);
+            cy    = floorf(panel_y + panel_h + REF(12) + 0.5f);
+            break;
+      }
+
+      mid = cy + card_h / 2.0f;
+      if (sel)
+         grid_draw_cursor(p_disp, userdata, width, height,
+               cx, cy, cw, card_h, REF(10));
+
+      /* Buttons: a label in the middle; Continue blue once it can go. */
+      if (!value)
+      {
+         bool go = items[i] == SETUP_CONTINUE && grid_setup_ready();
+         grid_draw_shape(p_disp, userdata, width, height,
+               cx, cy, cw, card_h, REF(10), go ? COL_SELECT : COL_DIVIDER);
+         grid_draw_text_bold(label, cx + cw / 2.0f,
+               grid_text_y(mid, height, ts), width, height,
+               items[i] == SETUP_CONTINUE && !go ? COL_TEXT_DIM : COL_TEXT,
+               TEXT_ALIGN_CENTER, ts);
+         continue;
+      }
+
+      /* Fields: the label above what's typed (stars for the password),
+       * live while typing. */
+      grid_draw_shape(p_disp, userdata, width, height,
+            cx, cy, cw, card_h, REF(10), COL_DIVIDER);
+      if (typing && grid_st.setup_typing == items[i])
+      {
+         const char *buf = menu_input_dialog_get_buffer();
+         value = buf ? buf : "";
+      }
+      if (items[i] == SETUP_PASS)
+      {
+         size_t len = strlen(value);
+         if (len >= sizeof(shown))
+            len = sizeof(shown) - 1;
+         memset(shown, '*', len);
+         shown[len] = '\0';
+      }
+      else
+         strlcpy(shown, value, sizeof(shown));
+      if (typing && grid_st.setup_typing == items[i] && caret)
+         strlcat(shown, "|", sizeof(shown));
+
+      /* Empty and not being typed in: just the label, in the middle. */
+      if (string_is_empty(shown)
+            && !(typing && grid_st.setup_typing == items[i]))
+      {
+         grid_draw_text(label, cx + cpad, grid_text_y(mid, height, ts),
+               width, height, COL_TEXT_DIM, TEXT_ALIGN_LEFT, ts);
+         continue;
+      }
+
+      grid_draw_text(label, cx + cpad, grid_text_y(mid - REF(8), height, ss),
+            width, height, COL_TEXT_DIM, TEXT_ALIGN_LEFT, ss);
+      grid_fit_text(false, shown, cw - 2.0f * cpad, height, ts,
+            fitted, sizeof(fitted));
+      grid_draw_text(fitted, cx + cpad, grid_text_y(mid + REF(7), height, ts),
+            width, height, COL_TEXT, TEXT_ALIGN_LEFT, ts);
+   }
+
+   /* Why the login failed, under Continue. */
+   if (!string_is_empty(error) && !bomba_setup_busy())
+      grid_draw_text(error, width / 2.0f,
+            grid_text_y(panel_y + panel_h + REF(12) + card_h + REF(14),
+               height, ss),
+            width, height, COL_DANGER, TEXT_ALIGN_CENTER, ss);
 }
 
 /* Choosing cover art or a wallpaper: SteamGridDB's options as a grid of
@@ -8499,12 +8904,13 @@ bool grid_home_frame(video_frame_info_t *video_info)
                                  && grid_st.panel != PANEL_CHEEVOS
                                  && grid_st.panel != PANEL_ART
                                  && grid_st.panel != PANEL_ICONS
-                                 && grid_st.panel != PANEL_UPDATES;
+                                 && grid_st.panel != PANEL_UPDATES
+                                 && grid_st.panel != PANEL_SETUP;
 
    /* Point saves at the current profile (once). */
    grid_profile_init();
-   /* bomba-settings.ini: keys and the RetroAchievements login (once). */
-   bomba_settings_init();
+   /* SteamGridDB key and RetroAchievements login, until both are set. */
+   grid_setup_poll();
 
    /* A console control's bind wait just ended: show what was pressed. */
    grid_cc_bind_poll();
@@ -8668,6 +9074,8 @@ bool grid_home_frame(video_frame_info_t *video_info)
          grid_draw_art_screen(p_disp, userdata, width, height);
       else if (grid_st.panel == PANEL_ICONS)
          grid_draw_picker_screen(p_disp, userdata, width, height);
+      else if (grid_st.panel == PANEL_SETUP)
+         grid_draw_setup_screen(p_disp, userdata, width, height);
       else
          grid_draw_downloads_screen(p_disp, userdata, width, height);
    }

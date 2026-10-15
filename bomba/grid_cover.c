@@ -1,8 +1,8 @@
 /* Bomba: portrait covers from SteamGridDB for the game grid.
  *
- * Needs the user's SteamGridDB API key (steamgriddb_api_key in
- * bomba-settings.ini, see bomba_settings.h). Without it, covers are
- * disabled and the grid keeps its square icons.
+ * Needs the user's SteamGridDB API key (asked for on start, see
+ * bomba_setup.h). Without it, covers are disabled and the grid keeps its
+ * square icons.
  *
  * For each game title: search SteamGridDB, take the top-voted 600x900
  * static PNG/JPEG grid, download it. Results are cached in
@@ -24,7 +24,7 @@
 #include <formats/rpng.h>
 
 #include "grid_cover.h"
-#include "bomba_settings.h"
+#include "bomba_setup.h"
 #include "../configuration.h"
 
 void grid_title_fix_article(char *s)
@@ -96,7 +96,7 @@ static struct
 
 static void cover_load_key(void)
 {
-   const char *key = bomba_settings_steamgriddb_key();
+   const char *key = bomba_setup_steamgriddb_key();
 
    if (string_is_empty(key))
       return;
@@ -104,6 +104,12 @@ static void cover_load_key(void)
    snprintf(cover_st.header, sizeof(cover_st.header),
          "Authorization: Bearer %s\r\n", key);
    cover_st.have_key = true;
+}
+
+void grid_cover_reload_key(void)
+{
+   if (cover_st.loaded)
+      cover_load_key();
 }
 
 static void cover_save(void)

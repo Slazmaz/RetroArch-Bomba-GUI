@@ -504,6 +504,7 @@ typedef struct settings
 #endif
       char input_keyboard_layout[64];
       char cheevos_custom_host[64];
+      char bomba_steamgriddb_key[64]; /* Bomba: covers and banners */
 
 #ifdef HAVE_LAKKA
       char timezone[TIMEZONE_LENGTH];

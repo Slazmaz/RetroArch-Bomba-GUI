@@ -151,8 +151,15 @@ static const struct font_glyph *font_renderer_ft_get_glyph(
       atlas_slot = atlas_slot->next;
    }
 
-   if (FT_Load_Char(handle->face, charcode, FT_LOAD_RENDER))
+   /* Bomba: light (vertical-only) hinting, as full hinting squares off
+    * rounded fonts such as Baloo 2 at menu sizes. And outlines rendered
+    * as overlapping: Baloo 2's glyphs are built from overlapping shapes
+    * (an 'm' is stems plus arches), whose shared edges otherwise come
+    * out too bright, as bumps on the strokes. */
+   if (FT_Load_Char(handle->face, charcode, FT_LOAD_TARGET_LIGHT))
       return NULL;
+   if (handle->face->glyph->format == FT_GLYPH_FORMAT_OUTLINE)
+      handle->face->glyph->outline.flags |= FT_OUTLINE_OVERLAP;
 
    FT_Render_Glyph(handle->face->glyph, FT_RENDER_MODE_NORMAL);
    slot = handle->face->glyph;

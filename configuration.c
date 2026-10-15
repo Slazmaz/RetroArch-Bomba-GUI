@@ -1590,6 +1590,7 @@ static struct config_array_setting *populate_settings_array(
    SETTING_ARRAY("led_driver",                   settings->arrays.led_driver, false, NULL, true);
    SETTING_ARRAY("location_driver",              settings->arrays.location_driver, false, NULL, true);
    SETTING_ARRAY("cloud_sync_driver",            settings->arrays.cloud_sync_driver, false, NULL, true);
+   SETTING_ARRAY("bomba_steamgriddb_key",        settings->arrays.bomba_steamgriddb_key, false, NULL, true);
 
 #ifdef HAVE_CHEEVOS
    SETTING_ARRAY("cheevos_custom_host",          settings->arrays.cheevos_custom_host, false, NULL, true);
@@ -5876,6 +5877,7 @@ int8_t config_save_overrides(enum override_type type,
              * as it's directly tied to the token and password.
              */
             if (   string_is_equal(array_settings[i].ident, "cheevos_token")
+                || string_is_equal(array_settings[i].ident, "bomba_steamgriddb_key")
                 || string_is_equal(array_settings[i].ident, "cheevos_password")
                 || string_is_equal(array_settings[i].ident, "cheevos_username"))
                continue;
