@@ -1,3 +1,6 @@
+# Bomba: build output (Switch keys, profiles, API keys live here)
+/build/
+
 *.o
 *.obj
 *.pdb
