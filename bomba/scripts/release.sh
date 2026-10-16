@@ -5,7 +5,7 @@
 # mist\, steam_appid.txt) stay out: they aren't ours to hand out, and the
 # installs being updated already have them.
 # With --publish, also makes the GitHub release "vX.Y.Z" on origin, at the
-# current commit, with the zip attached (the GitHub login comes from git's
+# current commit, with the zip attached (the GitHub login comes from Git for Windows'
 # credential helper, the one git push uses).
 # Bump BOMBA_VERSION and run build.sh first.
 #   F:\msys64\usr\bin\bash.exe -l bomba/scripts/release.sh [--publish]
@@ -85,8 +85,14 @@ if git ls-remote --exit-code --tags origin "refs/tags/$tag" > /dev/null; then
    exit 1
 fi
 
-token=$(printf 'protocol=https\nhost=github.com\n\n' | git credential fill \
-   | sed -n 's/^password=//p')
+# The login git push keeps is Git for Windows' (MSYS2's git has none).
+wingit=$(/c/Windows/System32/reg.exe query 'HKLM\SOFTWARE\GitForWindows' \
+   //v InstallPath 2>/dev/null | sed -n 's/.*REG_SZ *//p' | tr -d '\r')
+wingit="$(cygpath -u "${wingit:-C:\\Program Files\\Git}")/cmd/git.exe"
+[ -x "$wingit" ] || wingit=git
+token=$(printf 'protocol=https\nhost=github.com\n\n' \
+   | GIT_TERMINAL_PROMPT=0 "$wingit" credential fill 2>/dev/null \
+   | sed -n 's/^password=//p' | tr -d '\r')
 if [ -z "$token" ]; then
    echo "No GitHub login from git's credential helper." >&2
    exit 1
