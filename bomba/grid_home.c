@@ -79,6 +79,7 @@
 #include "../paths.h"
 #include "../input/input_driver.h"
 #include "../input/input_keymaps.h"
+#include "../audio/audio_driver.h"
 #include "../menu/menu_driver.h"
 #include "../menu/menu_cbs.h"
 #include "../menu/menu_displaylist.h"
@@ -809,6 +810,35 @@ static bool grid_content_running(void)
 {
    return (runloop_state_get_ptr()->current_core.flags
          & RETRO_CORE_FLAG_GAME_LOADED) ? true : false;
+}
+
+/* One of RetroArch's menu sounds (assets/sounds), if the player has that
+ * sound on. */
+static void grid_sound(enum audio_mixer_system_slot slot)
+{
+#ifdef HAVE_AUDIOMIXER
+   settings_t *settings = config_get_ptr();
+   bool on              = settings->bools.audio_enable_menu;
+
+   switch (slot)
+   {
+      case AUDIO_MIXER_SYSTEM_SLOT_OK:
+         on = on && settings->bools.audio_enable_menu_ok;
+         break;
+      case AUDIO_MIXER_SYSTEM_SLOT_CANCEL:
+         on = on && settings->bools.audio_enable_menu_cancel;
+         break;
+      case AUDIO_MIXER_SYSTEM_SLOT_UP:
+      case AUDIO_MIXER_SYSTEM_SLOT_DOWN:
+         on = on && settings->bools.audio_enable_menu_scroll;
+         break;
+      default:
+         on = on && settings->bools.audio_enable_menu_notice;
+         break;
+   }
+   if (on)
+      audio_driver_mixer_play_menu_sound(slot);
+#endif
 }
 
 /* "Mega Man X (USA) (Rev 1)" -> "Mega Man X" */
@@ -1577,6 +1607,9 @@ void grid_home_toggle(bool menu_on)
       ? cpu_features_get_time_usec() : 0;
    grid_st.close_start = (!menu_on && grid_content_running())
       ? cpu_features_get_time_usec() : 0;
+   if (grid_content_running())
+      grid_sound(menu_on ? AUDIO_MIXER_SYSTEM_SLOT_NOTICE
+                         : AUDIO_MIXER_SYSTEM_SLOT_NOTICE_BACK);
    /* A started game's loading screen fades out as the menu closes. */
    if (menu_on || !grid_st.close_start)
       grid_st.loading = LOADING_NONE;
@@ -3738,7 +3771,48 @@ static void grid_grid_action(enum menu_action action)
    grid_st.selection = sel;
 }
 
+static bool grid_entry_action(enum menu_action action, unsigned xmb_depth);
+
+/* The sound for a button the grid acted on. (What it leaves to RetroArch
+ * makes RetroArch's own.) */
+static void grid_action_sound(enum menu_action action)
+{
+   switch (action)
+   {
+      case MENU_ACTION_UP:
+      case MENU_ACTION_LEFT:
+      case MENU_ACTION_SCROLL_UP:
+         grid_sound(AUDIO_MIXER_SYSTEM_SLOT_UP);
+         break;
+      case MENU_ACTION_DOWN:
+      case MENU_ACTION_RIGHT:
+      case MENU_ACTION_SCROLL_DOWN:
+         grid_sound(AUDIO_MIXER_SYSTEM_SLOT_DOWN);
+         break;
+      case MENU_ACTION_OK:
+      case MENU_ACTION_SEARCH:
+      case MENU_ACTION_SCAN:
+         grid_sound(AUDIO_MIXER_SYSTEM_SLOT_OK);
+         break;
+      case MENU_ACTION_CANCEL:
+         grid_sound(AUDIO_MIXER_SYSTEM_SLOT_CANCEL);
+         break;
+      default:
+         break;
+   }
+}
+
 bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth)
+{
+   bool quiet = grid_st.forwarding || grid_st.loading != LOADING_NONE;
+   bool done  = grid_entry_action(action, xmb_depth);
+
+   if (done && !quiet)
+      grid_action_sound(action);
+   return done;
+}
+
+static bool grid_entry_action(enum menu_action action, unsigned xmb_depth)
 {
    /* An action the grid passes on to RetroArch itself (see
     * grid_settings_forward). */
@@ -4039,6 +4113,7 @@ static void grid_hit_activate(const grid_hit_t *t)
 {
    if (t->kind == HIT_CAT)
    {
+      grid_sound(AUDIO_MIXER_SYSTEM_SLOT_OK);
       /* A game's Settings switch tab at their top only (as L / R). */
       if (grid_st.game_settings)
       {
@@ -4628,6 +4703,12 @@ static void grid_osk_press(int id)
  * erases (closes when empty), X cancels, Y types a space, Start is done,
  * L / R move the caret, the left stick's click shifts, the right's
  * switches to symbols. */
+static void grid_osk_step_sound(unsigned d)
+{
+   grid_sound((d == RETRO_DEVICE_ID_JOYPAD_UP || d == RETRO_DEVICE_ID_JOYPAD_LEFT)
+         ? AUDIO_MIXER_SYSTEM_SLOT_UP : AUDIO_MIXER_SYSTEM_SLOT_DOWN);
+}
+
 bool grid_home_osk_input(const input_bits_t *held,
       const input_bits_t *pressed)
 {
@@ -4654,6 +4735,7 @@ bool grid_home_osk_input(const input_bits_t *held,
       if (BIT256_GET_PTR(pressed, d))
       {
          grid_osk_step(d);
+         grid_osk_step_sound(d);
          grid_st.osk_rep_dir = (int)d;
          grid_st.osk_rep_at  = now + 400000;
       }
@@ -4661,6 +4743,7 @@ bool grid_home_osk_input(const input_bits_t *held,
             && now >= grid_st.osk_rep_at)
       {
          grid_osk_step(d);
+         grid_osk_step_sound(d);
          grid_st.osk_rep_at = now + 70000;
       }
       if (BIT256_GET_PTR(held, d))
@@ -4672,11 +4755,13 @@ bool grid_home_osk_input(const input_bits_t *held,
    /* (Done or cancelled: the line is gone, nothing more to do.) */
    if (BIT256_GET_PTR(pressed, ok_btn))
    {
+      grid_sound(AUDIO_MIXER_SYSTEM_SLOT_OK);
       grid_osk_press(grid_osk_key_at(grid_st.osk_row, grid_st.osk_col));
       return true;
    }
    if (BIT256_GET_PTR(pressed, del_btn))
    {
+      grid_sound(AUDIO_MIXER_SYSTEM_SLOT_CANCEL);
       if (grid_edit_line()->size)
          grid_edit_delete(false);
       else
@@ -4687,24 +4772,41 @@ bool grid_home_osk_input(const input_bits_t *held,
     * search, "Y". See grid_glyph_button.) */
    if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_Y))
    {
+      grid_sound(AUDIO_MIXER_SYSTEM_SLOT_CANCEL);
       grid_edit_cancel();
       return true;
    }
    if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_START))
    {
+      grid_sound(AUDIO_MIXER_SYSTEM_SLOT_OK);
       input_keyboard_event(true, '\n', '\n', 0, RETRO_DEVICE_KEYBOARD);
       return true;
    }
    if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_X))
+   {
+      grid_sound(AUDIO_MIXER_SYSTEM_SLOT_OK);
       grid_osk_type(" ");
+   }
    if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_L))
+   {
+      grid_sound(AUDIO_MIXER_SYSTEM_SLOT_UP);
       grid_edit_move(RETROK_LEFT, false, false);
+   }
    if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_R))
+   {
+      grid_sound(AUDIO_MIXER_SYSTEM_SLOT_DOWN);
       grid_edit_move(RETROK_RIGHT, false, false);
+   }
    if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_L3))
+   {
+      grid_sound(AUDIO_MIXER_SYSTEM_SLOT_OK);
       grid_osk_press(OSK_SHIFT);
+   }
    if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_R3))
+   {
+      grid_sound(AUDIO_MIXER_SYSTEM_SLOT_OK);
       grid_osk_press(OSK_SYMBOLS);
+   }
    return true;
 }
 
