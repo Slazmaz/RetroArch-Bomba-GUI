@@ -72,7 +72,7 @@ public static class WindowHelper
                 );
             }
 
-            ShowWindowAsync(hWnd, 3);
+            ShowWindowAsync(hWnd, 5); // SW_SHOW: its own size, not maximized
             BringWindowToTop(hWnd);
             SetForegroundWindow(hWnd);
         }
@@ -204,6 +204,19 @@ if ($steamExe) {
         $env:BOMBA_MSG = "RetroArch update available"
     }
 }
+
+# Each start logs to logs\retroarch-<time>.log in the install (RetroArch
+# writes crash-<time>.txt/.dmp there on a crash), for players to send in.
+# The newest 10 of each are kept.
+$logs = Join-Path $root "logs"
+New-Item -ItemType Directory -Force $logs | Out-Null
+foreach ($pattern in "retroarch-*.log", "crash-*.txt", "crash-*.dmp") {
+    Get-ChildItem -LiteralPath $logs -Filter $pattern -ErrorAction SilentlyContinue |
+        Sort-Object Name -Descending | Select-Object -Skip 9 |
+        Remove-Item -Force -ErrorAction SilentlyContinue
+}
+$logFile = Join-Path $logs ("retroarch-" + (Get-Date -Format "yyyyMMdd-HHmmss") + ".log")
+$argsToPass = @("-v", "--log-file", $logFile) + $argsToPass
 
 if (-not ($argsToPass -contains "--config" -or $argsToPass -contains "-c")) {
     $argsToPass = @("--config", (Join-Path $app "retroarch.cfg")) + $argsToPass
