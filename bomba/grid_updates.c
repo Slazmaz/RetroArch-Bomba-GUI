@@ -2,7 +2,20 @@
  * download button): updates for what is installed, and what can be
  * installed, each only when the player picks it.
  *
- * Two kinds of item:
+ * Three kinds of item:
+ *  - Bomba GUI itself: the latest release on its GitHub, looked for once
+ *    per boot. GitHub allows 60 requests an hour per IP (a "not changed"
+ *    answer counts too), so the answer is kept in
+ *    <app>/bomba/update-check.txt: boots within SELF_RECHECK of a check
+ *    reuse it, later ones ask "changed since?" with its ETag (no download
+ *    if not), and when GitHub can't be reached it stands in. A release
+ *    tagged with a higher version than BOMBA_VERSION ("v1.2.3") is an
+ *    update. Installing extracts the release zip (an
+ *    install's layout: bomba.exe, app\...) and moves its files in; files
+ *    in use (the running exe, its DLLs) are renamed to .old first, which
+ *    Windows allows, and deleted on the next boot. The player's
+ *    retroarch.cfg and bomba-settings.ini are never replaced. Takes
+ *    effect on restart.
  *  - Eden (the Switch emulator, <system>/Eden): its latest release on
  *    git.eden-emu.dev. The installed version is kept in
  *    <system>/Eden/bomba-version.txt (Eden's exe doesn't say);
@@ -24,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <ctype.h>
+#include <time.h>
 
 #include <compat/strl.h>
 #include <features/features_cpu.h>
@@ -33,11 +47,13 @@
 
 #include "grid_updates.h"
 #include "grid_switch.h"
+#include "bomba_version.h"
 
 #if defined(HAVE_NETWORKING) && defined(HAVE_UPDATE_CORES) && defined(HAVE_THREADS)
 
 #include <encodings/crc32.h>
 #include <file/config_file.h>
+#include <lists/string_list.h>
 #include <rthreads/rthreads.h>
 
 #include "../command.h"
@@ -61,6 +77,10 @@ static const char *eden_assets[] = {
 };
 #define EDEN_VERSION_FILE "bomba-version.txt"
 #define EDEN_ZIP          "Eden-update.zip"
+
+#define SELF_API      "https://api.github.com/repos/Slazmaz/RetroArch-Bomba-GUI/releases/latest"
+/* Seconds a check is reused for: quick restarts don't ask again. */
+#define SELF_RECHECK  (2 * 60)
 
 #define CORE_INFO_URL "https://raw.githubusercontent.com/libretro/libretro-core-info/master/"
 
@@ -142,8 +162,36 @@ enum upd_eden_step
    EDEN_REMOVE               /* its folder being deleted */
 };
 
+/* ---- Bomba GUI -------------------------------------------------------- */
+
+enum upd_self_step
+{
+   SELF_NONE = 0,           /* not an install (no app\ folder), or no check */
+   SELF_CHECK,              /* release info in flight */
+   SELF_READY,              /* checked: see self_state */
+   SELF_DOWNLOAD,
+   SELF_EXTRACT,
+   SELF_APPLY               /* its files being moved in, on a thread */
+};
+
 static struct
 {
+   /* Bomba GUI */
+   enum upd_self_step self_step;
+   enum grid_update_state self_state;
+   enum grid_update_section self_section;
+   char self_app[PATH_MAX_LENGTH];   /* <install>/app */
+   char self_root[PATH_MAX_LENGTH];  /* <install> */
+   char self_installed[32];          /* "v" BOMBA_VERSION */
+   char self_latest[32];
+   char self_url[1024];
+   char self_etag[128];              /* of the kept answer, "" if none */
+   char self_error[96];
+   unsigned self_date;
+   long long self_checked_at;        /* the kept answer's time() */
+   void *self_task;
+   int self_progress;
+
    /* Eden */
    enum upd_eden_step eden_step;
    enum grid_update_state eden_state;
@@ -335,6 +383,32 @@ static void upd_eden_detail(char *s, size_t len)
    }
 }
 
+static void upd_self_detail(char *s, size_t len)
+{
+   switch (upd_st.self_state)
+   {
+      case GRID_UPDATE_CURRENT:
+         strlcpy(s, "Up to date", len);
+         break;
+      case GRID_UPDATE_AVAILABLE:
+         snprintf(s, len, "%s available", upd_st.self_latest);
+         break;
+      case GRID_UPDATE_WORKING:
+         upd_working_detail(s, len,
+               upd_st.self_step == SELF_DOWNLOAD ? "Downloading"
+               : "Installing", upd_st.self_step == SELF_DOWNLOAD
+               ? upd_st.self_progress : -1);
+         break;
+      case GRID_UPDATE_DONE:
+         strlcpy(s, "Restart to finish updating", len);
+         break;
+      case GRID_UPDATE_FAILED:
+      default:
+         strlcpy(s, upd_st.self_error, len);
+         break;
+   }
+}
+
 static void upd_core_detail(const upd_core_t *c, char *s, size_t len)
 {
    bool update = c->section == GRID_SECTION_UPDATES;
@@ -367,6 +441,18 @@ static void upd_rebuild(void)
    size_t i;
 
    upd_st.item_count = 0;
+
+   /* Bomba GUI itself (item_core -4). */
+   if (upd_st.self_step != SELF_NONE && upd_st.self_step != SELF_CHECK)
+   {
+      upd_self_detail(detail, sizeof(detail));
+      upd_add_item("Bomba GUI", detail,
+            !string_is_empty(upd_st.self_installed)
+            ? upd_st.self_installed : upd_st.self_latest,
+            "", "", false, "App", upd_st.self_section, upd_st.self_state,
+            upd_st.self_step == SELF_DOWNLOAD ? upd_st.self_progress : -1,
+            upd_st.self_date, -4);
+   }
 
    /* The player's Switch keys and firmware, once Eden is there: A picks a
     * file for them (item_core -2 keys, -3 firmware). */
@@ -803,6 +889,665 @@ static void upd_eden_remove_poll(void)
    upd_rebuild();
 }
 
+/* ---- Bomba GUI -------------------------------------------------------- */
+
+#ifdef _WIN32
+
+#define SELF_CHECK_FILE   "bomba/update-check.txt"
+#define SELF_OLD_FILE     "bomba/update-old.txt" /* .old files left to delete */
+#define SELF_ZIP          "bomba/update.zip"
+#define SELF_STAGE        "bomba/update"         /* the zip, extracted */
+
+static void upd_self_path(char *s, size_t len, const char *name)
+{
+   fill_pathname_join_special(s, upd_st.self_app, name, len);
+}
+
+/* Compares versions "1.2.3" / "v1.2.3" (missing parts are 0): <0, 0, >0. */
+static int upd_self_vercmp(const char *a, const char *b)
+{
+   int i;
+
+   while (*a && !isdigit((unsigned char)*a))
+      a++;
+   while (*b && !isdigit((unsigned char)*b))
+      b++;
+   for (i = 0; i < 3; i++)
+   {
+      char *ea, *eb;
+      unsigned long x = strtoul(a, &ea, 10);
+      unsigned long y = strtoul(b, &eb, 10);
+      if (x != y)
+         return x < y ? -1 : 1;
+      a = *ea == '.' ? ea + 1 : ea;
+      b = *eb == '.' ? eb + 1 : eb;
+   }
+   return 0;
+}
+
+/* Where things are. False if this isn't an install (the exe not in an
+ * app folder: a build run from the repo, say). */
+static bool upd_self_paths(void)
+{
+   size_t len;
+
+   strlcpy(upd_st.self_installed, "v" BOMBA_VERSION,
+         sizeof(upd_st.self_installed));
+   fill_pathname_application_dir(upd_st.self_app, sizeof(upd_st.self_app));
+   len = strlen(upd_st.self_app);
+   while (len && (upd_st.self_app[len - 1] == '\\'
+            || upd_st.self_app[len - 1] == '/'))
+      upd_st.self_app[--len] = '\0';
+   if (!string_is_equal_noncase(path_basename(upd_st.self_app), "app"))
+      return false;
+   fill_pathname_parent_dir(upd_st.self_root, upd_st.self_app,
+         sizeof(upd_st.self_root));
+   return true;
+}
+
+/* What the last update left: files that were in use (deleted now they
+ * aren't), its zip and extracted copy. */
+static void upd_self_cleanup(void)
+{
+   char path[PATH_MAX_LENGTH];
+   void *buf   = NULL;
+   int64_t len = 0;
+
+   upd_self_path(path, sizeof(path), SELF_OLD_FILE);
+   if (filestream_read_file(path, &buf, &len) && buf)
+   {
+      char *line = (char*)buf, *nl;
+      for (; line && *line; line = nl ? nl + 1 : NULL)
+      {
+         if ((nl = strchr(line, '\n')))
+            *nl = '\0';
+         filestream_delete(line);
+      }
+      filestream_delete(path);
+   }
+   free(buf);
+
+   upd_self_path(path, sizeof(path), SELF_ZIP);
+   filestream_delete(path);
+   upd_self_path(path, sizeof(path), SELF_STAGE);
+   if (path_is_directory(path))
+      grid_switch_rmtree(path);
+}
+
+static void upd_self_fail(const char *why)
+{
+   upd_st.self_step  = SELF_READY;
+   upd_st.self_state = GRID_UPDATE_FAILED;
+   strlcpy(upd_st.self_error, why, sizeof(upd_st.self_error));
+   upd_rebuild();
+}
+
+/* The latest release is known (self_latest, self_url): where it shows. */
+static void upd_self_result(void)
+{
+   upd_st.self_step = SELF_READY;
+   if (string_is_empty(upd_st.self_latest))
+   {
+      upd_self_fail("Couldn't check for updates");
+      return;
+   }
+   if (upd_self_vercmp(upd_st.self_installed, upd_st.self_latest) >= 0)
+   {
+      upd_st.self_section = GRID_SECTION_INSTALLED;
+      upd_st.self_state   = GRID_UPDATE_CURRENT;
+   }
+   else if (string_is_empty(upd_st.self_url))
+   {
+      upd_self_fail("No download in the latest release");
+      return;
+   }
+   else
+   {
+      upd_st.self_section = GRID_SECTION_UPDATES;
+      upd_st.self_state   = GRID_UPDATE_AVAILABLE;
+   }
+   upd_rebuild();
+}
+
+/* The kept answer: check time, ETag, tag, zip URL, date, a line each.
+ * self_checked_at is 0 if there's none. An empty tag: no release yet. */
+static void upd_self_read_kept(void)
+{
+   char path[PATH_MAX_LENGTH];
+   char *lines[5]  = { NULL };
+   void *buf       = NULL;
+   int64_t len     = 0;
+
+   upd_st.self_checked_at = 0;
+   upd_st.self_etag[0]    = '\0';
+   upd_st.self_latest[0]  = '\0';
+   upd_st.self_url[0]     = '\0';
+   upd_st.self_date       = 0;
+
+   upd_self_path(path, sizeof(path), SELF_CHECK_FILE);
+   if (filestream_read_file(path, &buf, &len) && buf)
+   {
+      char *p = (char*)buf;
+      int n;
+      for (n = 0; n < 5 && p; n++)
+      {
+         char *nl  = strchr(p, '\n');
+         lines[n]  = p;
+         if (nl)
+            *nl    = '\0';
+         p         = nl ? nl + 1 : NULL;
+      }
+      if (n == 5)
+      {
+         upd_st.self_checked_at = strtoll(lines[0], NULL, 10);
+         strlcpy(upd_st.self_etag, lines[1], sizeof(upd_st.self_etag));
+         strlcpy(upd_st.self_latest, lines[2], sizeof(upd_st.self_latest));
+         strlcpy(upd_st.self_url, lines[3], sizeof(upd_st.self_url));
+         upd_st.self_date = (unsigned)strtoul(lines[4], NULL, 10);
+      }
+   }
+   free(buf);
+}
+
+static void upd_self_write_kept(void)
+{
+   char path[PATH_MAX_LENGTH], kept[2048];
+
+   upd_st.self_checked_at = (long long)time(NULL);
+   snprintf(kept, sizeof(kept), "%lld\n%s\n%s\n%s\n%u\n",
+         upd_st.self_checked_at, upd_st.self_etag, upd_st.self_latest,
+         upd_st.self_url, upd_st.self_date);
+   upd_self_path(path, sizeof(path), SELF_CHECK_FILE);
+   filestream_write_file(path, kept, strlen(kept));
+}
+
+/* The kept answer (or none) is what's known: where it shows. */
+static void upd_self_kept_result(void)
+{
+   if (!upd_st.self_checked_at)
+      upd_self_fail("Couldn't check for updates");
+   else if (string_is_empty(upd_st.self_latest))
+   {
+      /* No release yet: nothing newer. */
+      upd_st.self_step    = SELF_READY;
+      upd_st.self_section = GRID_SECTION_INSTALLED;
+      upd_st.self_state   = GRID_UPDATE_CURRENT;
+      upd_rebuild();
+   }
+   else
+      upd_self_result();
+}
+
+static void upd_self_check_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *error)
+{
+   http_transfer_data_t *data = (http_transfer_data_t*)task_data;
+   char date[32];
+   char *json;
+   const char *p;
+   size_t i;
+
+   upd_st.self_task = NULL;
+
+   /* Not changed since the kept answer. */
+   if (data && data->status == 304 && upd_st.self_checked_at)
+   {
+      upd_self_write_kept();
+      upd_self_kept_result();
+      return;
+   }
+
+   /* No release yet. */
+   if (data && data->status == 404)
+   {
+      upd_st.self_etag[0]   = '\0';
+      upd_st.self_latest[0] = '\0';
+      upd_st.self_url[0]    = '\0';
+      upd_st.self_date      = 0;
+      upd_self_write_kept();
+      upd_self_kept_result();
+      return;
+   }
+
+   /* Offline, or GitHub's limit reached: the kept answer stands in. */
+   if (     !data || data->status != 200 || !data->data || !data->len
+         || !(json = (char*)malloc(data->len + 1)))
+   {
+      upd_self_kept_result();
+      return;
+   }
+   memcpy(json, data->data, data->len);
+   json[data->len] = '\0';
+
+   upd_st.self_etag[0]   = '\0';
+   upd_st.self_latest[0] = '\0';
+   upd_st.self_url[0]    = '\0';
+   upd_st.self_date      = 0;
+
+   upd_json_str(json, "tag_name", upd_st.self_latest,
+         sizeof(upd_st.self_latest));
+   /* "2026-10-16T19:57:41Z" -> 20261016 */
+   if (upd_json_str(json, "published_at", date, sizeof(date)))
+   {
+      unsigned y, m, d;
+      if (sscanf(date, "%u-%u-%u", &y, &m, &d) == 3)
+         upd_st.self_date = y * 10000 + m * 100 + d;
+   }
+   /* The release's zip (GitHub's own source zips aren't assets). */
+   for (p = json; (p = upd_json_str(p, "browser_download_url",
+               upd_st.self_url, sizeof(upd_st.self_url))); )
+      if (upd_ends_with(upd_st.self_url, ".zip"))
+         break;
+   if (!p)
+      upd_st.self_url[0] = '\0';
+   free(json);
+
+   for (i = 0; data->headers && i < data->headers->size; i++)
+   {
+      const char *h = data->headers->elems[i].data;
+      if (string_starts_with_case_insensitive(h, "ETag:"))
+      {
+         for (h += strlen("ETag:"); *h == ' '; h++);
+         strlcpy(upd_st.self_etag, h, sizeof(upd_st.self_etag));
+         break;
+      }
+   }
+
+   if (string_is_empty(upd_st.self_latest))
+   {
+      upd_self_fail("Couldn't check for updates");
+      return;
+   }
+   upd_self_write_kept();
+   upd_self_result();
+}
+
+/* Asks GitHub ("changed since?" when there's a kept answer), unless the
+ * kept answer is recent enough (force: ask anyway). */
+static void upd_self_fetch(bool force)
+{
+   char headers[192];
+   long long now = (long long)time(NULL);
+
+   upd_self_read_kept();
+   if (     !force && upd_st.self_checked_at
+         && now >= upd_st.self_checked_at
+         && now - upd_st.self_checked_at < SELF_RECHECK)
+   {
+      upd_self_kept_result();
+      return;
+   }
+
+   headers[0] = '\0';
+   if (upd_st.self_checked_at && !string_is_empty(upd_st.self_etag))
+      snprintf(headers, sizeof(headers), "If-None-Match: %s\r\n",
+            upd_st.self_etag);
+
+   upd_st.self_step = SELF_CHECK;
+   command_event(CMD_EVENT_NETWORK_INIT, NULL);
+   if (!(upd_st.self_task = task_push_http_transfer_with_headers(SELF_API,
+               true, "GET", string_is_empty(headers) ? NULL : headers,
+               upd_self_check_cb, NULL)))
+      upd_self_kept_result();
+}
+
+/* Once per boot. */
+static void upd_self_check(void)
+{
+   if (!upd_self_paths())
+   {
+      upd_st.self_step = SELF_NONE;
+      return;
+   }
+   upd_self_cleanup();
+   upd_st.self_section = GRID_SECTION_UPDATES;
+   upd_self_fetch(false);
+}
+
+/* Moving the update's files in, on a worker thread. Each file replaced is
+ * renamed to <name>.old first (works for the running exe and its DLLs);
+ * if any step fails, everything done is put back. */
+typedef struct
+{
+   wchar_t rel[512];
+   bool had_old;
+} upd_moved_t;
+
+typedef struct
+{
+   wchar_t stage[PATH_MAX_LENGTH];
+   wchar_t root[PATH_MAX_LENGTH];
+   char old_list[PATH_MAX_LENGTH];
+   char stage_utf8[PATH_MAX_LENGTH];
+   upd_moved_t *moved;
+   size_t count, cap;
+   volatile bool done;
+   bool ok;
+   sthread_t *thread;
+} upd_self_job_t;
+
+static upd_self_job_t *upd_self_job;
+
+static void upd_wjoin(wchar_t *out, size_t len, const wchar_t *a,
+      const wchar_t *b)
+{
+   _snwprintf(out, len, L"%ls\\%ls", a, b);
+   out[len - 1] = 0;
+}
+
+/* The player's own: put in only when missing. */
+static bool upd_self_keep(const wchar_t *rel)
+{
+   return !_wcsicmp(rel, L"app\\retroarch.cfg")
+       || !_wcsicmp(rel, L"bomba-settings.ini");
+}
+
+static bool upd_self_walk(upd_self_job_t *job, const wchar_t *rel)
+{
+   wchar_t pat[PATH_MAX_LENGTH], sub[512], src[PATH_MAX_LENGTH],
+           dst[PATH_MAX_LENGTH], old[PATH_MAX_LENGTH];
+   WIN32_FIND_DATAW fd;
+   HANDLE h;
+   bool ok = true;
+
+   if (*rel)
+      upd_wjoin(src, PATH_MAX_LENGTH, job->stage, rel);
+   else
+      wcsncpy(src, job->stage, PATH_MAX_LENGTH);
+   upd_wjoin(pat, PATH_MAX_LENGTH, src, L"*");
+   if ((h = FindFirstFileW(pat, &fd)) == INVALID_HANDLE_VALUE)
+      return true;
+
+   do
+   {
+      bool exists;
+
+      if (!wcscmp(fd.cFileName, L".") || !wcscmp(fd.cFileName, L".."))
+         continue;
+      if (*rel)
+         upd_wjoin(sub, 512, rel, fd.cFileName);
+      else
+      {
+         wcsncpy(sub, fd.cFileName, 512);
+         sub[511] = 0;
+      }
+      upd_wjoin(src, PATH_MAX_LENGTH, job->stage, sub);
+      upd_wjoin(dst, PATH_MAX_LENGTH, job->root, sub);
+
+      if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+      {
+         CreateDirectoryW(dst, NULL);
+         if (!(ok = upd_self_walk(job, sub)))
+            break;
+         continue;
+      }
+
+      exists = GetFileAttributesW(dst) != INVALID_FILE_ATTRIBUTES;
+      if (exists && upd_self_keep(sub))
+         continue;
+
+      if (job->count >= job->cap)
+      {
+         size_t cap        = job->cap ? job->cap * 2 : 256;
+         upd_moved_t *more = (upd_moved_t*)realloc(job->moved,
+               cap * sizeof(*more));
+         if (!more)
+         {
+            ok = false;
+            break;
+         }
+         job->moved = more;
+         job->cap   = cap;
+      }
+      wcsncpy(job->moved[job->count].rel, sub, 512);
+      job->moved[job->count].had_old = exists;
+
+      if (exists)
+      {
+         _snwprintf(old, PATH_MAX_LENGTH, L"%ls.old", dst);
+         old[PATH_MAX_LENGTH - 1] = 0;
+         DeleteFileW(old);
+         if (!MoveFileExW(dst, old, 0))
+         {
+            ok = false;
+            break;
+         }
+      }
+      job->count++;
+      if (!MoveFileExW(src, dst,
+               MOVEFILE_REPLACE_EXISTING | MOVEFILE_COPY_ALLOWED))
+      {
+         ok = false;
+         break;
+      }
+   } while (FindNextFileW(h, &fd));
+
+   FindClose(h);
+   return ok;
+}
+
+static void upd_self_thread(void *data)
+{
+   upd_self_job_t *job = (upd_self_job_t*)data;
+   wchar_t dst[PATH_MAX_LENGTH], old[PATH_MAX_LENGTH];
+   char *list      = NULL;
+   size_t list_len = 0, i;
+
+   job->ok = upd_self_walk(job, L"");
+
+   for (i = job->count; i-- > 0; )
+   {
+      upd_moved_t *m = &job->moved[i];
+      if (!m->had_old)
+      {
+         if (!job->ok)
+         {
+            upd_wjoin(dst, PATH_MAX_LENGTH, job->root, m->rel);
+            DeleteFileW(dst);
+         }
+         continue;
+      }
+      upd_wjoin(dst, PATH_MAX_LENGTH, job->root, m->rel);
+      _snwprintf(old, PATH_MAX_LENGTH, L"%ls.old", dst);
+      old[PATH_MAX_LENGTH - 1] = 0;
+      if (!job->ok)
+      {
+         /* Put the old one back. */
+         DeleteFileW(dst);
+         MoveFileExW(old, dst, MOVEFILE_REPLACE_EXISTING);
+      }
+      else if (!DeleteFileW(old))
+      {
+         /* In use (the running exe, its DLLs): next boot. */
+         char *u = utf16_to_utf8_string_alloc(old);
+         char *more;
+         if (u && (more = (char*)realloc(list, list_len + strlen(u) + 2)))
+         {
+            list      = more;
+            list_len += snprintf(list + list_len, strlen(u) + 2, "%s\n", u);
+         }
+         free(u);
+      }
+   }
+   if (list)
+   {
+      filestream_write_file(job->old_list, list, list_len);
+      free(list);
+   }
+
+   grid_switch_rmtree(job->stage_utf8);
+   job->done = true;
+}
+
+static void upd_self_extract_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *error)
+{
+   decompress_task_data_t *dec = (decompress_task_data_t*)task_data;
+   char zip[PATH_MAX_LENGTH], stage[PATH_MAX_LENGTH], exe[PATH_MAX_LENGTH];
+   wchar_t *w;
+
+   if (dec)
+   {
+      free(dec->source_file);
+      free(dec);
+   }
+   upd_self_path(zip, sizeof(zip), SELF_ZIP);
+   filestream_delete(zip);
+   upd_self_path(stage, sizeof(stage), SELF_STAGE);
+
+   /* An install's layout, or it isn't Bomba GUI. */
+   fill_pathname_join_special(exe, stage, "app/retroarch.exe", sizeof(exe));
+   if (!string_is_empty(error) || !path_is_valid(exe))
+   {
+      grid_switch_rmtree(stage);
+      upd_self_fail("Couldn't update");
+      return;
+   }
+
+   if (!(upd_self_job = (upd_self_job_t*)calloc(1, sizeof(*upd_self_job))))
+   {
+      upd_self_fail("Couldn't update");
+      return;
+   }
+   strlcpy(upd_self_job->stage_utf8, stage, sizeof(upd_self_job->stage_utf8));
+   upd_self_path(upd_self_job->old_list, sizeof(upd_self_job->old_list),
+         SELF_OLD_FILE);
+   if ((w = utf8_to_utf16_string_alloc(stage)))
+   {
+      wcsncpy(upd_self_job->stage, w, PATH_MAX_LENGTH - 1);
+      free(w);
+   }
+   if ((w = utf8_to_utf16_string_alloc(upd_st.self_root)))
+   {
+      size_t n;
+      wcsncpy(upd_self_job->root, w, PATH_MAX_LENGTH - 1);
+      free(w);
+      /* No trailing slash, the walk adds its own. */
+      n = wcslen(upd_self_job->root);
+      while (n && (upd_self_job->root[n - 1] == L'\\'
+               || upd_self_job->root[n - 1] == L'/'))
+         upd_self_job->root[--n] = 0;
+   }
+   for (w = upd_self_job->stage; *w; w++)
+      if (*w == L'/')
+         *w = L'\\';
+
+   if (     !upd_self_job->stage[0] || !upd_self_job->root[0]
+         || !(upd_self_job->thread = sthread_create(upd_self_thread,
+               upd_self_job)))
+   {
+      free(upd_self_job);
+      upd_self_job = NULL;
+      upd_self_fail("Couldn't update");
+      return;
+   }
+   upd_st.self_step = SELF_APPLY;
+   upd_rebuild();
+}
+
+static void upd_self_download_cb(retro_task_t *task, void *task_data,
+      void *user_data, const char *error)
+{
+   http_transfer_data_t *data = (http_transfer_data_t*)task_data;
+   char zip[PATH_MAX_LENGTH], stage[PATH_MAX_LENGTH];
+
+   upd_st.self_task = NULL;
+
+   if (!data || data->status != 200 || !data->data || !data->len)
+   {
+      upd_self_fail("Download failed");
+      return;
+   }
+   upd_self_path(zip, sizeof(zip), SELF_ZIP);
+   if (!filestream_write_file(zip, data->data, data->len))
+   {
+      upd_self_fail("Couldn't save the download");
+      return;
+   }
+
+   upd_self_path(stage, sizeof(stage), SELF_STAGE);
+   if (path_is_directory(stage))
+      grid_switch_rmtree(stage);
+   path_mkdir(stage);
+   upd_st.self_step = SELF_EXTRACT;
+   upd_rebuild();
+#if defined(HAVE_COMPRESSION) && defined(HAVE_ZLIB)
+   if (!task_push_decompress(zip, stage, NULL, NULL, NULL,
+            upd_self_extract_cb, NULL, NULL, true))
+#endif
+      upd_self_fail("Couldn't update");
+}
+
+static void upd_self_install(void)
+{
+   if (     upd_st.self_step != SELF_READY
+         || (upd_st.self_state != GRID_UPDATE_AVAILABLE
+          && upd_st.self_state != GRID_UPDATE_FAILED))
+      return;
+
+   /* A failed check: check again rather than update. */
+   if (string_is_empty(upd_st.self_url) || string_is_empty(upd_st.self_latest))
+   {
+      upd_self_fetch(true);
+      upd_rebuild();
+      return;
+   }
+
+   upd_st.self_step     = SELF_DOWNLOAD;
+   upd_st.self_state    = GRID_UPDATE_WORKING;
+   upd_st.self_progress = -1;
+   command_event(CMD_EVENT_NETWORK_INIT, NULL);
+   if (!(upd_st.self_task = task_push_http_transfer(upd_st.self_url, true,
+               "GET", upd_self_download_cb, NULL)))
+   {
+      upd_self_fail("Download failed");
+      return;
+   }
+   upd_rebuild();
+}
+
+/* Per frame: download progress; the files moved in? */
+static void upd_self_poll(void)
+{
+   if (upd_st.self_step == SELF_DOWNLOAD && upd_st.self_task)
+   {
+      int p;
+      if (     upd_task_running(upd_st.self_task, &p)
+            && p != upd_st.self_progress)
+      {
+         upd_st.self_progress = p;
+         upd_rebuild();
+      }
+   }
+
+   if (!upd_self_job || !upd_self_job->done)
+      return;
+   sthread_join(upd_self_job->thread);
+   if (upd_self_job->ok)
+   {
+      upd_st.self_step    = SELF_READY;
+      upd_st.self_state   = GRID_UPDATE_DONE;
+      upd_st.self_section = GRID_SECTION_INSTALLED;
+      strlcpy(upd_st.self_installed, upd_st.self_latest,
+            sizeof(upd_st.self_installed));
+      upd_toast("Bomba GUI updated: restart it to use the new version");
+      upd_rebuild();
+   }
+   else
+      upd_self_fail("Couldn't update; close anything using its files");
+   free(upd_self_job->moved);
+   free(upd_self_job);
+   upd_self_job = NULL;
+}
+
+#else
+
+static void upd_self_check(void) { }
+static void upd_self_install(void) { }
+static void upd_self_poll(void) { }
+
+#endif
+
 /* ---- Cores ------------------------------------------------------------ */
 
 static uint32_t upd_file_crc(const char *path)
@@ -874,7 +1619,7 @@ static bool upd_alloc_items(size_t cores)
 {
    free(upd_st.items);
    free(upd_st.item_core);
-   upd_st.item_cap   = cores + 3; /* + Eden, Switch keys, firmware */
+   upd_st.item_cap   = cores + 4; /* + Bomba GUI, Eden, Switch keys, firmware */
    upd_st.item_count = 0;
    upd_st.items      = (grid_update_t*)calloc(upd_st.item_cap,
          sizeof(*upd_st.items));
@@ -1180,7 +1925,17 @@ static void upd_info_apply(void)
 
 void grid_updates_check(bool force, const char *running_core)
 {
-   retro_time_t now = cpu_features_get_time_usec();
+   static bool self_checked = false;
+   retro_time_t now         = cpu_features_get_time_usec();
+
+   /* Bomba GUI: once per boot (picking it after a failed check asks
+    * again). */
+   if (!self_checked)
+   {
+      self_checked = true;
+      upd_self_check();
+      upd_rebuild();
+   }
 
    if (     !force && upd_st.checked
          && now - upd_st.last_check < UPDATES_RECHECK)
@@ -1206,7 +1961,7 @@ void grid_updates_check(bool force, const char *running_core)
 
 bool grid_updates_checking(void)
 {
-   return upd_st.eden_step == EDEN_CHECK
+   return upd_st.eden_step == EDEN_CHECK || upd_st.self_step == SELF_CHECK
       || upd_st.cores_step == CORES_LIST || upd_st.cores_step == CORES_CRC;
 }
 
@@ -1221,6 +1976,7 @@ bool grid_updates_poll(void)
    bool installed;
 
    upd_info_apply();
+   upd_self_poll();
    upd_eden_remove_poll();
    if (grid_switch_poll())
       upd_rebuild();
@@ -1355,7 +2111,9 @@ void grid_updates_install(size_t idx, const char *running_core)
       return;
    core = upd_st.item_core[idx];
 
-   if (core == -1)
+   if (core == -4)
+      upd_self_install();
+   else if (core == -1)
       upd_eden_install(running_core);
    else if ((size_t)core < upd_st.core_count)
       upd_core_install(&upd_st.cores[core], running_core);
@@ -1367,6 +2125,9 @@ void grid_updates_install_all(const char *running_core)
 {
    size_t i;
 
+   if (     upd_st.self_section == GRID_SECTION_UPDATES
+         && upd_st.self_state == GRID_UPDATE_AVAILABLE)
+      upd_self_install();
    if (     upd_st.eden_section == GRID_SECTION_UPDATES
          && upd_st.eden_state == GRID_UPDATE_AVAILABLE)
       upd_eden_install(running_core);

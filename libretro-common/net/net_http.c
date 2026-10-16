@@ -1214,6 +1214,14 @@ static ssize_t net_http_receive_header(struct http_t *state, ssize_t len)
             }
             else
             {
+               /* Bomba: 204 and 304 never have a body (without this, one
+                * sent without a Content-Length waited for the server to
+                * close the connection). */
+               if (response->status == 204 || response->status == 304)
+               {
+                  response->bodytype = T_LEN;
+                  response->len      = 0;
+               }
                response->part = P_BODY;
                if (response->bodytype == T_CHUNK)
                   response->part = P_BODY_CHUNKLEN;
@@ -1546,11 +1554,13 @@ int net_http_status(struct http_t *state)
  *
  * @return the response headers. The returned buffer is owned by the
  * caller of net_http_new; it is not freed by net_http_delete().
- * If the status is not 20x and accept_err is false, it returns NULL.
+ * Bomba: returned whatever the status (was only on errors, so a
+ * successful response's headers, an ETag say, couldn't be read, and
+ * leaked).
  **/
 struct string_list *net_http_headers(struct http_t *state)
 {
-   if (!state || !state->err)
+   if (!state)
       return NULL;
    return state->response.headers;
 }
