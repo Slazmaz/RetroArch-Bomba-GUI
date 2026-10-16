@@ -240,6 +240,7 @@ static peer_t *sn_peer(peer_t *peers, size_t *count, steam_id_t id)
    peers[*count].id   = id;
    peers[*count].s    = s;
    peers[*count].last = sn_now();
+   RARCH_LOG("[Bomba] Guest %llu reached the room.\n", (unsigned long long)id);
    return &peers[(*count)++];
 }
 
@@ -253,6 +254,8 @@ static void sn_tunnel(void *data)
    net_identity_t host_id;
    struct sockaddr_in app;
    int app_len   = 0;
+   bool heard_host = false;
+   int last_res    = RESULT_OK;
 
    sn_identity(&host_id, to);
 
@@ -295,9 +298,21 @@ static void sn_tunnel(void *data)
                p->last = sn_now();
             }
          }
-         else if (!host && from == to && app_len)
-            sendto(sn.local, (const char*)m->data, m->size, 0,
-                  (struct sockaddr*)&app, app_len);
+         else if (!host && from == to)
+         {
+            if (!heard_host)
+            {
+               heard_host = true;
+               RARCH_LOG("[Bomba] First data from the host%s.\n",
+                     app_len ? "" : " (the emulator hasn't sent yet)");
+            }
+            if (app_len)
+               sendto(sn.local, (const char*)m->data, m->size, 0,
+                     (struct sockaddr*)&app, app_len);
+         }
+         else
+            RARCH_WARN("[Bomba] Data from %llu, not in this session; ignored.\n",
+                  (unsigned long long)from);
          api.ReleaseMessage(m);
       }
 
@@ -319,6 +334,8 @@ static void sn_tunnel(void *data)
          {
             if (now - peers[i].last > PEER_IDLE_USEC)
             {
+               RARCH_LOG("[Bomba] Guest %llu went quiet; dropped.\n",
+                     (unsigned long long)peers[i].id);
                closesocket(peers[i].s);
                peers[i] = peers[--npeers];
             }
@@ -333,11 +350,17 @@ static void sn_tunnel(void *data)
          while ((r = recvfrom(sn.local, buf, sizeof(buf), 0,
                (struct sockaddr*)&from, &from_len)) > 0)
          {
+            int res;
             /* Replies go to whoever last sent (the emulator). */
+            if (!app_len)
+               RARCH_LOG("[Bomba] The emulator reached the tunnel; sending to the host.\n");
             app     = from;
             app_len = from_len;
-            api.SendMessageToUser(sn.msgs, &host_id, buf, (uint32_t)r,
+            res = api.SendMessageToUser(sn.msgs, &host_id, buf, (uint32_t)r,
                   SEND_FLAGS, 0);
+            if (res != RESULT_OK && res != last_res)
+               RARCH_WARN("[Bomba] Sending to the host failed (%d).\n", res);
+            last_res = res;
             from_len = sizeof(from);
          }
       }
@@ -441,8 +464,10 @@ static void sn_on_lobby_created(const lobby_created_t *c)
 {
    if (sn.state != BOMBA_STEAMNET_CREATING)
    {
-      /* Ended while it was being made. */
-      if (c->result == RESULT_OK)
+      /* Ended while it was being made. (Not the second copy, as callback
+       * and call result, of the one hosted now: leaving that ends it for
+       * Steam while this side still thinks it's hosting.) */
+      if (c->result == RESULT_OK && c->lobby != sn.lobby)
          api.LeaveLobby(sn.mm, c->lobby);
       return;
    }
@@ -588,7 +613,15 @@ static void sn_dispatch(int id, const void *param)
          if (     sn.state == BOMBA_STEAMNET_HOSTING
                && who->type == IDENTITY_STEAMID
                && sn_is_member(who->u.steam_id))
-            api.AcceptSession(sn.msgs, who);
+         {
+            RARCH_LOG("[Bomba] Connection from %llu accepted (%d).\n",
+                  (unsigned long long)who->u.steam_id,
+                  api.AcceptSession(sn.msgs, who));
+         }
+         else
+            RARCH_WARN("[Bomba] Connection from %llu refused (state %d, "
+                  "type %d).\n", (unsigned long long)who->u.steam_id,
+                  sn.state, who->type);
          break;
       }
       default:
