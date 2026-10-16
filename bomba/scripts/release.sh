@@ -6,7 +6,9 @@
 # installs being updated already have them.
 # With --publish, also makes the GitHub release "vX.Y.Z" on origin, at the
 # current commit, with the zip attached (the GitHub login comes from Git for Windows'
-# credential helper, the one git push uses).
+# credential helper, the one git push uses). The release's description is
+# release/notes.md (Markdown), which --publish needs; without one GitHub
+# shows the commit's message.
 # Bump BOMBA_VERSION and run build.sh first.
 #   F:\msys64\usr\bin\bash.exe -l bomba/scripts/release.sh [--publish]
 export MSYSTEM=MINGW64
@@ -67,6 +69,12 @@ echo "Packaged: $zip"
 
 [ "$1" = "--publish" ] || exit 0
 
+notes="$OUT/notes.md"
+if [ ! -s "$notes" ]; then
+   echo "Write the release's description in $notes first." >&2
+   exit 1
+fi
+
 # Published releases are installed by everyone: only committed, pushed code.
 if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
    echo "Uncommitted changes; commit and push them first." >&2
@@ -99,9 +107,16 @@ if [ -z "$token" ]; then
 fi
 auth=(-H "Authorization: Bearer $token" -H "Accept: application/vnd.github+json")
 
-release=$(curl -sS --fail-with-body "${auth[@]}" \
-   -d "{\"tag_name\":\"$tag\",\"target_commitish\":\"$commit\",\"name\":\"Bomba GUI $tag\"}" \
-   "https://api.github.com/repos/$REPO/releases")
+body=$(python3 - "$tag" "$commit" "$notes" <<'EOF'
+import json, sys
+tag, commit, notes = sys.argv[1:4]
+with open(notes, encoding="utf-8") as f:
+    print(json.dumps({"tag_name": tag, "target_commitish": commit,
+                      "name": "Bomba GUI " + tag, "body": f.read()}))
+EOF
+)
+release=$(printf '%s' "$body" | curl -sS --fail-with-body "${auth[@]}" \
+   --data-binary @- "https://api.github.com/repos/$REPO/releases")
 id=$(printf '%s' "$release" | python3 -c 'import json,sys; print(json.load(sys.stdin)["id"])')
 
 curl -sS --fail-with-body "${auth[@]}" -H "Content-Type: application/zip" \
