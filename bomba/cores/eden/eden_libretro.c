@@ -2309,9 +2309,44 @@ static struct
    const char *volatile message; /* for retro_run to show, NULL none */
 } launch;
 
+/* eden-cli can't open a game whose path isn't plain ASCII (it exits right
+ * after opening its window, e.g. on "Super Mario™ 3D World"): it's given
+ * a link to the game under a plain name in Eden's user folder instead, a
+ * hard link (same drive) or else a symbolic one. Falls back to the game's
+ * own path. */
+static const wchar_t *cli_game_path(const wchar_t *rom, wchar_t *alias, size_t alias_len)
+{
+   const wchar_t *p, *ext;
+
+   for (p = rom; *p && *p < 0x80; p++);
+   if (!*p)
+      return rom;
+
+   ext = wcsrchr(rom, L'.');
+   if (!ext || wcschr(ext, L'\\'))
+      ext = L"";
+   _snwprintf(alias, alias_len, L"%ls\\user\\cli-game%ls", launch.workdir, ext);
+   alias[alias_len - 1] = L'\0';
+   for (p = alias; *p && *p < 0x80; p++);
+   if (*p)
+      return rom;
+
+   DeleteFileW(alias);
+   if (CreateHardLinkW(alias, rom, NULL)
+         || CreateSymbolicLinkW(alias, rom, 0x2 /* ALLOW_UNPRIVILEGED_CREATE */))
+   {
+      log_msg("multiplayer: game linked as %ls (eden-cli needs a plain path)", alias);
+      return alias;
+   }
+   log_msg("multiplayer: couldn't link the game under a plain path (%lu)",
+         (unsigned long)GetLastError());
+   return rom;
+}
+
 static DWORD WINAPI launch_main(LPVOID unused)
 {
    wchar_t cmdline[MAX_PATH * 6];
+   wchar_t alias[MAX_PATH * 2];
    const wchar_t *exe = launch.exe;
    STARTUPINFOW si;
    PROCESS_INFORMATION pi;
@@ -2335,6 +2370,7 @@ static DWORD WINAPI launch_main(LPVOID unused)
 
    if (mp.active)
    {
+      const wchar_t *game = cli_game_path(launch.rom, alias, MAX_PATH * 2);
       log_msg("multiplayer: joining %s:%u as \"%s\"%s", mp.address, mp.port, mp.nick,
             mp.password[0] ? " with password" : "");
       /* Long option only (-m isn't one of eden-cli's), and no ':' without
@@ -2342,10 +2378,10 @@ static DWORD WINAPI launch_main(LPVOID unused)
       _snwprintf(cmdline, MAX_PATH * 6,
             L"\"%ls\" %ls--multiplayer \"%hs%hs%hs@%hs:%u\" -g \"%ls\"",
             launch.cli, launch.fullscreen ? L"-f " : L"", mp.nick,
-            mp.password[0] ? ":" : "", mp.password, mp.address, mp.port, launch.rom);
+            mp.password[0] ? ":" : "", mp.password, mp.address, mp.port, game);
       exe = launch.cli;
       /* Not the room's password, which is on the command line. */
-      log_msg("starting: %ls -g \"%ls\"", exe, launch.rom);
+      log_msg("starting: %ls -g \"%ls\"", exe, game);
    }
    else
    {
