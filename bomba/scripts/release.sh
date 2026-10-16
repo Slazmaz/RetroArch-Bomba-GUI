@@ -41,11 +41,19 @@ fi
 
 mkdir -p "$OUT"
 rm -f "$zip"
-python3 - "$DIST" "$zip" <<'EOF'
-import os, sys, zipfile
-dist, out = sys.argv[1], sys.argv[2]
+# The README (GitHub's, .github/README.md) goes in too, its links into
+# the repo made full GitHub links at this commit.
+python3 - "$DIST" "$zip" "$ROOT/.github/README.md" \
+   "https://github.com/$REPO" "$(git rev-parse HEAD)" <<'EOF'
+import os, re, sys, zipfile
+dist, out, readme, repo, commit = sys.argv[1:6]
 skip = {"app/mist.dll", "app/steam_appid.txt"}
+with open(readme, encoding="utf-8") as f:
+    text = f.read()
+text = re.sub(r"(!\[[^\]]*\]\()\.\./", r"\g<1>%s/raw/%s/" % (repo, commit), text)
+text = re.sub(r"(\]\()\.\./", r"\g<1>%s/blob/%s/" % (repo, commit), text)
 with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("README.md", text)
     for top, dirs, files in os.walk(dist):
         rel_top = os.path.relpath(top, dist).replace(os.sep, "/")
         if rel_top == "app/mist" or rel_top.startswith("app/mist/"):
