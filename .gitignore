@@ -2,6 +2,7 @@
 /build/
 # Bomba: build.sh's staged program (see bomba/scripts/build.sh)
 /dist/
+/release/
 
 *.o
 *.obj
