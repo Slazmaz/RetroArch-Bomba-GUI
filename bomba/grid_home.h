@@ -1,12 +1,15 @@
 #ifndef __BOMBA_GRID_HOME_H
 #define __BOMBA_GRID_HOME_H
 
+#include <stdint.h>
+
 #include <boolean.h>
 #include <retro_common_api.h>
 
 #include "../gfx/video_driver.h"
 #include "../gfx/gfx_display.h"
 #include "../menu/menu_defines.h"
+#include "../input/input_types.h"
 
 RETRO_BEGIN_DECLS
 
@@ -20,6 +23,25 @@ void grid_home_iterate(void);
 
 /* Handles a menu action. Returns true if consumed. */
 bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth);
+
+/* Mouse and keyboard mode: the mouse or keyboard was used last, not a
+ * controller. The pointer shows and the on-screen keyboard doesn't. */
+bool grid_home_kbm(void);
+
+/* The menu's mouse this frame: position in screen pixels and its
+ * MENU_INP_PTR_FLG_* flags. Returns true if the grid took it, in which
+ * case RetroArch treats the mouse as idle. */
+bool grid_home_mouse(int x, int y, unsigned flags);
+
+/* The controller while typing (buttons held, and newly pressed). Returns
+ * true if the grid's on-screen keyboard took it. */
+bool grid_home_osk_input(const input_bits_t *held,
+      const input_bits_t *pressed);
+
+/* A keyboard event, as input_keyboard_event gets it. Returns true if the
+ * grid took it (an editing key in a text field). */
+bool grid_home_key_event(bool down, unsigned code, uint32_t character,
+      uint16_t mod);
 
 /* The console a game file belongs to, as the grid names it ("SNES",
  * "Wii", "Switch"...). False if the file type doesn't tell (zip, an iso

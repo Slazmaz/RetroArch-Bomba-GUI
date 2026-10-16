@@ -67,6 +67,10 @@
 
 #include "../ai/game_ai.h"
 
+#if defined(HAVE_MENU) && defined(HAVE_XMB)
+#include "../bomba/grid_home.h"
+#endif
+
 #define HOLD_BTN_DELAY_SEC 2
 
 /* Depends on ASCII character values */
@@ -6955,9 +6959,13 @@ void input_driver_collect_system_input(input_driver_state_t *input_st,
             {0,                RARCH_UI_COMPANION_TOGGLE     },
             {0,                RARCH_FPS_TOGGLE              },
             {0,                RARCH_NETPLAY_HOST_TOGGLE     },
+            /* Bomba: Escape is Back in the menu (it never quits). */
+            {RETROK_ESCAPE,    RETRO_DEVICE_ID_JOYPAD_B      }, /* 19 */
          };
 
          ids[14][0] = input_config_binds[0][RARCH_QUIT_KEY].key;
+         if (ids[14][0] == RETROK_ESCAPE)
+            ids[14][0] = 0;
          ids[15][0] = input_config_binds[0][RARCH_FULLSCREEN_TOGGLE_KEY].key;
          ids[16][0] = input_config_binds[0][RARCH_UI_COMPANION_TOGGLE].key;
          ids[17][0] = input_config_binds[0][RARCH_FPS_TOGGLE].key;
@@ -6965,8 +6973,9 @@ void input_driver_collect_system_input(input_driver_state_t *input_st,
 
          if (settings->bools.input_menu_swap_ok_cancel_buttons)
          {
-            ids[0][1] = RETRO_DEVICE_ID_JOYPAD_B;
-            ids[1][1] = RETRO_DEVICE_ID_JOYPAD_A;
+            ids[0][1]  = RETRO_DEVICE_ID_JOYPAD_B;
+            ids[1][1]  = RETRO_DEVICE_ID_JOYPAD_A;
+            ids[19][1] = RETRO_DEVICE_ID_JOYPAD_A;
          }
 
          for (i = 0; i < ARRAY_SIZE(ids); i++)
@@ -6983,7 +6992,12 @@ void input_driver_collect_system_input(input_driver_state_t *input_st,
                BIT256_SET_PTR(current_bits, ids[i][1]);
          }
       }
+      /* (Bomba: in mouse and keyboard mode the keys edit the text instead,
+       * with no on-screen keyboard to steer.) */
       else if (display_kb
+#ifdef HAVE_XMB
+            && !grid_home_kbm()
+#endif
             && current_input
             && current_input->input_state)
       {
@@ -7183,6 +7197,14 @@ void input_keyboard_event(bool down, unsigned code,
 
    if (down)
       menu_st->input_last_time_us = menu_st->current_time_us;
+
+#ifdef HAVE_XMB
+   /* Bomba: a key switches the grid to mouse and keyboard mode, and in its
+    * text fields the editing keys (arrows, selection, copy and paste) are
+    * the grid's. */
+   if (grid_home_key_event(down, code, character, mod))
+      return;
+#endif
 
 #ifdef HAVE_ACCESSIBILITY
    if (     menu_input_dialog_get_display_kb()

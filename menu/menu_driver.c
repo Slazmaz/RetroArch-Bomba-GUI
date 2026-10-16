@@ -86,6 +86,10 @@
 #include "../ui/drivers/cocoa/apple_platform.h"
 #endif
 
+#ifdef HAVE_XMB
+#include "../bomba/grid_home.h"
+#endif
+
 typedef struct menu_input_ctx_bind
 {
    char *s;
@@ -5382,6 +5386,15 @@ unsigned menu_event(
                overlay_active,
                &mouse_hw_state);
 
+#ifdef HAVE_XMB
+      /* Bomba: the grid handles the mouse itself (pointing, clicking,
+       * the wheel); RetroArch then sees it idle. */
+      if (     menu_mouse_enable
+            && grid_home_mouse(mouse_hw_state.x, mouse_hw_state.y,
+               mouse_hw_state.flags))
+         mouse_hw_state.flags = 0;
+#endif
+
       /* Read touchscreen
        * Note: Could forgo this if mouse is currently active,
        * but this is 'cleaner' code... (if performance is a
@@ -5545,6 +5558,11 @@ unsigned menu_event(
 
    if (display_kb)
    {
+#ifdef HAVE_XMB
+      /* Bomba: the grid's own on-screen keyboard. */
+      if (!grid_home_osk_input(p_input, p_trigger_input))
+#endif
+      {
 #ifdef HAVE_MIST
       /* Do not process input events if the Steam OSK is open */
       if (!steam_has_osk_open())
@@ -5648,6 +5666,7 @@ unsigned menu_event(
 #ifdef HAVE_MIST
       }
 #endif
+      }
 
       BIT256_CLEAR_ALL_PTR(p_trigger_input);
    }
