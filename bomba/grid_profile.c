@@ -98,9 +98,20 @@ static void profile_dir(unsigned idx, const char *base, const char *fallback,
    fill_pathname_join_special(s, root, profile_st.names[idx], len);
 }
 
-/* Same directory, ignoring case, slash style and a trailing slash. */
-static bool profile_same_dir(const char *a, const char *b)
+/* Same directory, ignoring case, slash style, a trailing slash and ".."
+ * (":\..\saves" from the cfg is "<app>\..\saves", the base "<top>\saves"). */
+static bool profile_same_dir(const char *a_in, const char *b_in)
 {
+   char a_buf[PATH_MAX_LENGTH];
+   char b_buf[PATH_MAX_LENGTH];
+   const char *a = a_buf;
+   const char *b = b_buf;
+
+   strlcpy(a_buf, a_in, sizeof(a_buf));
+   strlcpy(b_buf, b_in, sizeof(b_buf));
+   path_resolve_realpath(a_buf, sizeof(a_buf), false);
+   path_resolve_realpath(b_buf, sizeof(b_buf), false);
+
    for (;; a++, b++)
    {
       char ca = *a == '/' ? '\\' : *a;

@@ -88,6 +88,8 @@ static void setup_login_cb(retro_task_t *task, void *task_data,
          sizeof(settings->arrays.cheevos_token));
    settings->arrays.cheevos_password[0] = '\0';
    rc_api_destroy_login_response(&response);
+   /* Logging in turns achievements on, so they unlock in-game too. */
+   settings->bools.cheevos_enable = true;
 
    command_event(CMD_EVENT_MENU_SAVE_CURRENT_CONFIG, NULL);
 }
