@@ -425,6 +425,8 @@ static void sn_join(steam_id_t lobby)
    sn.state = BOMBA_STEAMNET_JOINING;
    sn.lobby = lobby;
    api.JoinLobby(sn.mm, lobby);
+   RARCH_LOG("[Bomba] Joining Steam lobby %llu.\n",
+         (unsigned long long)lobby);
 }
 
 /* Back to one's own session soon (not at once: Steam refusing to make
@@ -480,6 +482,8 @@ static void sn_on_lobby_enter(const lobby_enter_t *e)
       return;
    if (e->response != ENTER_SUCCESS)
    {
+      RARCH_ERR("[Bomba] Steam lobby %llu not joined (response %u).\n",
+            (unsigned long long)e->lobby, e->response);
       sn_message("Multiplayer: couldn't join the session.");
       sn.lobby = 0;
       sn_back_home(0);
@@ -664,6 +668,19 @@ void bomba_steamnet_init(void)
    SN_SYM(InitRelay,             "SteamAPI_ISteamNetworkingUtils_InitRelayNetworkAccess");
 #undef SN_SYM
 
+   /* Lobbies are per app: started some other way than as RetroArch (a
+    * non-Steam shortcut), sessions would be invisible to friends. */
+   {
+      char appid[32];
+      GetEnvironmentVariableA("SteamAppId", appid, sizeof(appid));
+      if (strtoul(appid, NULL, 10) != STEAM_APPID)
+      {
+         RARCH_WARN("[Bomba] Started by Steam as app %s; using RetroArch's "
+               "(%u) for multiplayer.\n", appid, STEAM_APPID);
+         snprintf(appid, sizeof(appid), "%u", STEAM_APPID);
+         SetEnvironmentVariableA("SteamAppId", appid);
+      }
+   }
    if (!api.Init())
    {
       RARCH_ERR("[Bomba] SteamAPI_Init failed; no Steam multiplayer.\n");
@@ -744,6 +761,8 @@ void bomba_steamnet_poll(void)
          else if (done->id == CB_LOBBY_ENTER
                && sn.state == BOMBA_STEAMNET_JOINING)
          {
+            RARCH_ERR("[Bomba] Steam lobby %llu not joined (call failed).\n",
+                  (unsigned long long)sn.lobby);
             sn_message("Multiplayer: couldn't join the session.");
             sn.lobby = 0;
             sn_back_home(0);
