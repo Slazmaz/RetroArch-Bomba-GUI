@@ -34,6 +34,12 @@ cp retroarch.exe "$APP/"
 mkdir -p "$APP/bomba/fonts" "$APP/bomba/icons"
 cp bomba/fonts/* "$APP/bomba/fonts/"
 cp bomba/icons/* "$APP/bomba/icons/"
+# RetroArch's menu sounds (retroarch-assets), where it looks for them.
+mkdir -p "$APP/assets/sounds"
+cp bomba/sounds/* "$APP/assets/sounds/"
+# The install's own folders, empty.
+mkdir -p "$DIST/roms" "$DIST/saves" "$DIST/states" "$DIST/config" \
+   "$DIST/screenshots"
 
 # Launcher cores, built separately from RetroArch's makefile.
 mkdir -p "$APP/cores" "$APP/info"

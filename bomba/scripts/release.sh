@@ -60,6 +60,9 @@ with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
         rel_top = os.path.relpath(top, dist).replace(os.sep, "/")
         if rel_top == "app/mist" or rel_top.startswith("app/mist/"):
             continue
+        # Empty folders (roms, saves...) go in as folder entries.
+        if rel_top != "." and not dirs and not files:
+            z.writestr(rel_top + "/", "")
         for f in sorted(files):
             rel = f if rel_top == "." else rel_top + "/" + f
             if rel not in skip:
