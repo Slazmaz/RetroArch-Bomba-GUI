@@ -1349,6 +1349,9 @@ static void grid_launch_now(void)
    /* For a launcher core's own loading screen (Eden's), so it shows the
     * same name. */
    SetEnvironmentVariableA("BOMBA_GAME_TITLE", game->title);
+   /* The player's name inside the game (Eden's Switch user). */
+   SetEnvironmentVariableA("BOMBA_PROFILE",
+         grid_profile_name(grid_profile_current()));
 #endif
 
    /* Its console's game buttons, as RetroArch's remap for this game. */
