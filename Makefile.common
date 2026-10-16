@@ -2714,8 +2714,7 @@ ifeq ($(HAVE_MIST), 1)
    HAVE_PRESENCE = 1
    DEFINES += -DHAVE_MIST
    INCLUDE_DIRS += -I$(MIST_PATH)/include
-   LDFLAGS   += -L$(MIST_PATH) -lmist
-   OBJ += steam/steam.o tasks/task_steam.o
+   OBJ += steam/steam.o steam/mist_load.o tasks/task_steam.o
 endif
 
 ### Bomba additions

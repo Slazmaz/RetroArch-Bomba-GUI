@@ -176,8 +176,9 @@ if ($steamExe) {
     }
 }
 
-# retroarch.exe needs Steam's mist (mist.dll, mist\, steam_appid.txt),
+# Steam features need Steam's mist (mist.dll, mist\, steam_appid.txt),
 # which releases don't carry: take it from Steam's RetroArch when missing.
+# Without it retroarch.exe still runs, just without Steam.
 if ($steamExe) {
     $steamRa = Split-Path -Parent $steamExe
     foreach ($name in "mist.dll", "mist", "steam_appid.txt") {
