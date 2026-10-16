@@ -508,6 +508,18 @@ bool steam_has_osk_open(void)
  * clears all of it, so it is put back after every update. */
 static char steam_connect[64];
 
+/* Bomba: the grid's name for the game it starts (RetroAchievements'
+ * title, else the file's), shown instead of the playlist label or file
+ * name while that content runs. */
+static char steam_game_path[PATH_MAX_LENGTH];
+static char steam_game_title[256];
+
+void steam_set_game_title(const char *path, const char *title)
+{
+   strlcpy(steam_game_path,  path  ? path  : "", sizeof(steam_game_path));
+   strlcpy(steam_game_title, title ? title : "", sizeof(steam_game_title));
+}
+
 void steam_set_connect(const char *connect)
 {
    strlcpy(steam_connect, connect ? connect : "", sizeof(steam_connect));
@@ -562,7 +574,10 @@ static void steam_update_presence_inner(enum presence presence, bool force)
 
             core_info_get_current_core(&core_info);
 
-            if (current_playlist)
+            if (     !string_is_empty(steam_game_title)
+                  && string_is_equal(steam_game_path, path_get(RARCH_PATH_CONTENT)))
+               label = steam_game_title;
+            else if (current_playlist)
             {
                playlist_get_index_by_path(
                      current_playlist,
