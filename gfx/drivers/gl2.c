@@ -149,7 +149,7 @@ static bool gl2_bomba_transparent(void)
 /* How opaque the black over the program still is (0..1): the core sets
  * "BombaFade" to the tick it went see-through (its loading screen had
  * faded to black), and the black fades off over GL2_BOMBA_FADE_MS. */
-#define GL2_BOMBA_FADE_MS 150
+#define GL2_BOMBA_FADE_MS 500
 static float gl2_bomba_fade(void)
 {
    HWND hwnd = win32_get_window();
