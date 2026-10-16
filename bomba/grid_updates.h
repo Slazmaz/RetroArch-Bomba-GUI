@@ -35,15 +35,16 @@ typedef struct
    char console[96];        /* the system it plays, "" if unknown */
    char search[384];        /* name, console, maker: what a search matches */
    bool removable;          /* an installed core that can be removed */
-   const char *kind;        /* "Emulator" or "Core" */
+   const char *kind;        /* "App" (Bomba GUI), "Emulator" or "Core" */
    enum grid_update_section section;
    enum grid_update_state state;
    int progress;            /* 0-100 while downloading, -1 if unknown */
    unsigned date;           /* release date as yyyymmdd, 0 if unknown */
 } grid_update_t;
 
-/* Looks for updates and things to install (Eden from its releases, cores
- * from the buildbot). Nothing is downloaded until asked for. Without
+/* Looks for updates and things to install (Bomba GUI from its GitHub
+ * releases, once per boot; Eden from its releases, cores from the
+ * buildbot). Nothing is downloaded until asked for. Without
  * force, does nothing if a check ran recently. Also installs Switch keys
  * and firmware dropped into the system folder (see grid_switch.h). */
 void grid_updates_check(bool force, const char *running_core);

@@ -58,6 +58,7 @@
 #include "bomba_clipboard.h"
 #include "bomba_keymap.h"
 #include "grid_updates.h"
+#include "bomba_version.h"
 #include "grid_switch.h"
 #include "grid_cheevos.h"
 #include "grid_controls.h"
@@ -109,7 +110,6 @@
 /* Cap height (reference px) of all text on the main screen: bars, hints,
  * search, L/R labels, game title. */
 #define GRID_TEXT_CAP  9
-#define BOMBA_VERSION  "0.0.0"
 #define GRID_COVER_RADIUS 0.04f /* corner radius / tile width (reference) */
 #define GRID_TILE_ASPECT  (2.0f / 3.0f) /* tile width / height (600x900) */
 
