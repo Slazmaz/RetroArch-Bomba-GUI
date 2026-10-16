@@ -50,6 +50,10 @@ void grid_controls_apply(const char *console, const char *core_path,
  * override is in use); otherwise from its next start. */
 void grid_controls_apply_running(const char *console);
 
+/* The menu opens (on) or closes over a game started with our override:
+ * the menu goes by the usual binds, the game by its console's. */
+void grid_controls_menu(bool on);
+
 RETRO_END_DECLS
 
 #endif
