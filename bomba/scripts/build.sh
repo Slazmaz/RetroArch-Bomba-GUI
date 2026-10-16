@@ -14,9 +14,9 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 DIST="$ROOT/dist"
 APP="$DIST/app"
 source "$ROOT/bomba/scripts/steam_ra.sh"
-# mist headers are vendored in bomba/mist; the dll to link against is Steam's.
+# mist headers are vendored in bomba/mist; mist.dll is loaded at runtime
+# (steam/mist_load.c), not linked.
 export MIST_PATH="$ROOT/bomba/mist"
-cp -u "$STEAM_RA/mist.dll" "$MIST_PATH/"
 
 cd "$ROOT"
 
