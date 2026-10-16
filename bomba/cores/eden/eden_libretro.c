@@ -2343,6 +2343,76 @@ static const wchar_t *cli_game_path(const wchar_t *rom, wchar_t *alias, size_t a
    return rom;
 }
 
+/* The grid profile's name (BOMBA_PROFILE), read at load. */
+static char profile_name[64];
+
+/* Names Eden's Switch user after the grid profile: the name games show,
+ * other players too. Only the name changes, not the user's id, which
+ * its saves are kept by. Its first user is the one Eden plays as; Eden
+ * makes the file the first time it runs. */
+static void name_switch_user(const wchar_t *workdir)
+{
+   /* yuzu's ProfileDataRaw: 0x10 bytes, then 8 users of 0xC8: id (0x10),
+    * second id (0x10), timestamp (8), name (0x20, UTF-8, NUL-padded)... */
+   unsigned char data[0x650], name[0x20];
+   unsigned char *user = NULL;
+   wchar_t path[MAX_PATH * 2];
+   const unsigned char *s;
+   size_t i, n, chars;
+   FILE *f;
+
+   if (!profile_name[0])
+      return;
+   _snwprintf(path, MAX_PATH * 2, L"%ls\\user\\nand\\system\\save\\8000000000000010"
+         L"\\su\\avators\\profiles.dat", workdir);
+   path[MAX_PATH * 2 - 1] = L'\0';
+   if (!(f = _wfopen(path, L"rb")))
+      return;
+   n = fread(data, 1, sizeof(data), f);
+   if (n != sizeof(data) || fgetc(f) != EOF)
+      n = 0;
+   fclose(f);
+   if (!n)
+   {
+      log_msg("profiles.dat not as expected; Switch user not renamed");
+      return;
+   }
+
+   for (i = 0; i < 8 && !user; i++)
+   {
+      unsigned char *u = data + 0x10 + i * 0xC8;
+      for (n = 0; n < 0x10 && !u[n]; n++);
+      if (n < 0x10)
+         user = u;
+   }
+   if (!user)
+      return;
+
+   /* At most 10 characters, as on a Switch, whole UTF-8 sequences only,
+    * and a NUL after. */
+   memset(name, 0, sizeof(name));
+   for (s = (const unsigned char*)profile_name, n = chars = 0; *s; )
+   {
+      size_t len = *s < 0x80 ? 1 : *s >= 0xF0 ? 4 : *s >= 0xE0 ? 3 : 2;
+      if (*s < 0x20 || chars == 10 || n + len >= sizeof(name))
+         break;
+      memcpy(name + n, s, len);
+      n += len;
+      s += len;
+      chars++;
+   }
+   if (!n || !memcmp(user + 0x28, name, sizeof(name)))
+      return;
+
+   memcpy(user + 0x28, name, sizeof(name));
+   if ((f = _wfopen(path, L"wb")))
+   {
+      if (fwrite(data, 1, sizeof(data), f) == sizeof(data))
+         log_msg("Switch user named \"%s\"", (const char*)name);
+      fclose(f);
+   }
+}
+
 static DWORD WINAPI launch_main(LPVOID unused)
 {
    wchar_t cmdline[MAX_PATH * 6];
@@ -2367,6 +2437,7 @@ static DWORD WINAPI launch_main(LPVOID unused)
 
    write_config(launch.exe, mp.active);
    link_saves(launch.exe);
+   name_switch_user(launch.workdir);
 
    if (mp.active)
    {
@@ -2619,6 +2690,12 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    wcscpy(launch.workdir, exe);
    if ((slash = wcsrchr(launch.workdir, L'\\')))
       *slash = L'\0';
+
+   {
+      DWORD n = GetEnvironmentVariableA("BOMBA_PROFILE", profile_name, sizeof(profile_name));
+      if (!n || n >= sizeof(profile_name))
+         profile_name[0] = '\0';
+   }
 
    read_multiplayer_settings();
    if (mp.active)
