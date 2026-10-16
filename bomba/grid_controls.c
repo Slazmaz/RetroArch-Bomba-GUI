@@ -76,6 +76,15 @@ static struct
    } consoles[GRID_CONTROLS_CONSOLES];
 } grid_controls_st;
 
+/* The running game's console, when its bindings came from our override,
+ * and the usual binds from before it: the menu keeps those (it reads the
+ * same binds as the game). */
+static struct
+{
+   char console[40];
+   grid_controls_bind_t binds[MAX_USERS][GRID_CONTROLS_BUTTONS];
+} grid_controls_game;
+
 const char *grid_controls_button_name(unsigned id)
 {
    return id < GRID_CONTROLS_BUTTONS ? grid_controls_names[id] : "";
@@ -360,6 +369,8 @@ void grid_controls_apply(const char *console, const char *core_path,
    unsigned p, j;
    int c;
 
+   grid_controls_game.console[0] = '\0';
+
    if (     string_is_empty(console) || string_is_empty(content_path)
          || !core_info_find(core_path, &info) || !info
          || string_is_empty(info->core_name))
@@ -441,6 +452,48 @@ void grid_controls_apply(const char *console, const char *core_path,
       path_mkdir(core_dir);
    config_file_write(conf, path, true);
    config_file_free(conf);
+
+   strlcpy(grid_controls_game.console, console,
+         sizeof(grid_controls_game.console));
+   for (p = 0; p < MAX_USERS; p++)
+      for (j = 0; j < GRID_CONTROLS_BUTTONS; j++)
+      {
+         grid_controls_game.binds[p][j].joykey  = input_config_binds[p][j].joykey;
+         grid_controls_game.binds[p][j].joyaxis = input_config_binds[p][j].joyaxis;
+         grid_controls_game.binds[p][j].key     = input_config_binds[p][j].key;
+      }
+}
+
+void grid_controls_menu(bool on)
+{
+   unsigned p, j;
+   int c;
+
+   if (     !grid_controls_game.console[0]
+         || path_is_empty(RARCH_PATH_CONFIG_OVERRIDE))
+      return;
+   if (!on)
+   {
+      grid_controls_apply_running(grid_controls_game.console);
+      return;
+   }
+   if ((c = grid_controls_load(grid_controls_game.console)) < 0)
+      return;
+
+   /* Back to the usual binds, where the console has its own. */
+   for (j = 0; j < GRID_CONTROLS_BUTTONS; j++)
+   {
+      const grid_controls_bind_t *b = &grid_controls_st.consoles[c].binds[j];
+
+      if (b->joykey != NO_BTN || b->joyaxis != AXIS_NONE)
+         for (p = 0; p < MAX_USERS; p++)
+         {
+            input_config_binds[p][j].joykey  = grid_controls_game.binds[p][j].joykey;
+            input_config_binds[p][j].joyaxis = grid_controls_game.binds[p][j].joyaxis;
+         }
+      if (b->key != RETROK_UNKNOWN)
+         input_config_binds[0][j].key = (enum retro_key)grid_controls_game.binds[0][j].key;
+   }
 }
 
 void grid_controls_apply_running(const char *console)

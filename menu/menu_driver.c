@@ -88,6 +88,7 @@
 
 #ifdef HAVE_XMB
 #include "../bomba/grid_home.h"
+#include "../bomba/grid_controls.h"
 #endif
 
 typedef struct menu_input_ctx_bind
@@ -6687,6 +6688,10 @@ void retroarch_menu_running(void)
             true);
    }
 
+#ifdef HAVE_XMB
+   grid_controls_menu(true);
+#endif
+
    /* Prevent stray input */
    menu_st->input_driver_flushing_input = 2;
 
@@ -6759,6 +6764,11 @@ void retroarch_menu_running_finished(bool quit)
             &runloop_st->frontend_key_event,
             false);
    }
+
+#ifdef HAVE_XMB
+   if (!quit)
+      grid_controls_menu(false);
+#endif
 
    /* Prevent stray input */
    menu_st->input_driver_flushing_input = 2;
