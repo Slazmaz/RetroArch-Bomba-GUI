@@ -454,9 +454,14 @@ static void grid_bind_args(wchar_t *out, size_t out_len)
          || !(slash = wcsrchr(path, L'\\')))
       return;
    *slash = L'\0';
-   wcsncat(path, L"\\config\\remaps\\Bomba.cfg", MAX_PATH * 2 - wcslen(path) - 1);
+   /* The remap folder sits beside the app folder (the template's
+    * ":\..\config\remaps"). */
+   wcsncat(path, L"\\..\\config\\remaps\\Bomba.cfg", MAX_PATH * 2 - wcslen(path) - 1);
    if (!(f = _wfopen(path, L"rb")))
+   {
+      log_msg("controller: no grid bindings (%ls)", path);
       return;
+   }
    fseek(f, 0, SEEK_END);
    size = ftell(f);
    fseek(f, 0, SEEK_SET);
@@ -785,13 +790,19 @@ static bool make_junction(const wchar_t *link, const wchar_t *target)
       WORD  sub_off, sub_len, print_off, print_len;
       WCHAR buf[4 * MAX_PATH + 8];
    } rp;
-   size_t tl = wcslen(target);
+   wchar_t full[2 * MAX_PATH + 1];
+   size_t tl;
    DWORD attr, bytes;
    HANDLE h;
    BOOL ok;
 
-   if (tl > 2 * MAX_PATH)
+   /* A junction keeps its target as written and nothing resolves ".." in
+    * it later (RetroArch's save folder is "<app>\..\saves\..."): Eden then
+    * can't open anything through it. */
+   tl = GetFullPathNameW(target, 2 * MAX_PATH + 1, full, NULL);
+   if (!tl || tl > 2 * MAX_PATH)
       return false;
+   target = full;
 
    /* RemoveDirectory takes away only a junction, not what it points to,
     * and fails on a folder that isn't empty. */
