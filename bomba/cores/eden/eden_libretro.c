@@ -40,6 +40,7 @@
 #include <mmdeviceapi.h>
 #include <audiopolicy.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1104,6 +1105,203 @@ static void stop_room(void)
    log_msg("multiplayer: room closed");
 }
 
+/* eden-cli.exe joins the room given with --multiplayer but never starts
+ * Eden's network (Network::Init(), which only eden.exe calls), so the
+ * join fails ("Could not access RoomMember") and it quits. The function
+ * is in eden-cli.exe all the same: found here as the one that logs
+ * "Error initializing ENet" (x64 unwind data gives its start), it's run
+ * in Eden's process right after Eden starts, before the game is loaded
+ * and the room joined. Eden's files stay as they are. */
+static uint8_t  *pe_file;
+static IMAGE_NT_HEADERS64 *pe_nt;
+static IMAGE_SECTION_HEADER *pe_sec;
+
+static uint8_t *pe_rva(uint32_t rva)
+{
+   int i;
+   for (i = 0; i < pe_nt->FileHeader.NumberOfSections; i++)
+      if (     rva >= pe_sec[i].VirtualAddress
+            && rva <  pe_sec[i].VirtualAddress + pe_sec[i].SizeOfRawData)
+         return pe_file + pe_sec[i].PointerToRawData
+            + (rva - pe_sec[i].VirtualAddress);
+   return NULL;
+}
+
+/* The function holding code at rva (its first part, for a split one). */
+static const RUNTIME_FUNCTION *pe_function(uint32_t rva)
+{
+   const IMAGE_DATA_DIRECTORY *dir =
+      &pe_nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXCEPTION];
+   const RUNTIME_FUNCTION *f = (const RUNTIME_FUNCTION*)pe_rva(dir->VirtualAddress);
+   size_t lo = 0, hi = f ? dir->Size / sizeof(*f) : 0;
+   const RUNTIME_FUNCTION *hit = NULL;
+
+   while (lo < hi)
+   {
+      size_t mid = (lo + hi) / 2;
+      if (rva < f[mid].BeginAddress)
+         hi = mid;
+      else if (rva >= f[mid].EndAddress)
+         lo = mid + 1;
+      else
+      {
+         hit = &f[mid];
+         break;
+      }
+   }
+   /* UNW_FLAG_CHAININFO: the part's unwind data ends with its parent. */
+   while (hit)
+   {
+      const uint8_t *ui = pe_rva(hit->UnwindData);
+      if (!ui || !((ui[0] >> 3) & 4))
+         break;
+      hit = (const RUNTIME_FUNCTION*)(ui + 4 + ((ui[2] + 1) & ~1) * 2);
+   }
+   return hit;
+}
+
+/* Network::Init's offset in the exe, 0 if not found (or not only one). */
+static uint32_t find_network_init(const wchar_t *exe)
+{
+   static const char msg[] = "Error initializing ENet";
+   HANDLE h;
+   DWORD size, got;
+   int64_t str = -1;
+   uint32_t found = 0;
+   int i, hits = 0;
+
+   h = CreateFileW(exe, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+   if (h == INVALID_HANDLE_VALUE)
+      return 0;
+   size = GetFileSize(h, NULL);
+   if (size == INVALID_FILE_SIZE || !(pe_file = (uint8_t*)malloc(size)))
+   {
+      CloseHandle(h);
+      return 0;
+   }
+   if (!ReadFile(h, pe_file, size, &got, NULL) || got != size || size < 0x400)
+      goto done;
+   pe_nt = (IMAGE_NT_HEADERS64*)(pe_file + ((IMAGE_DOS_HEADER*)pe_file)->e_lfanew);
+   if (     (uint8_t*)pe_nt + sizeof(*pe_nt) > pe_file + size
+         || pe_nt->Signature != IMAGE_NT_SIGNATURE
+         || pe_nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)
+      goto done;
+   pe_sec = IMAGE_FIRST_SECTION(pe_nt);
+
+   /* The message, in the data sections. */
+   for (i = 0; i < pe_nt->FileHeader.NumberOfSections && str < 0; i++)
+   {
+      uint8_t *p   = pe_file + pe_sec[i].PointerToRawData;
+      uint32_t len = pe_sec[i].SizeOfRawData, k;
+      if (     (pe_sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+            || pe_sec[i].PointerToRawData + len > size)
+         continue;
+      for (k = 0; k + sizeof(msg) <= len; k++)
+         if (!memcmp(p + k, msg, sizeof(msg)))
+         {
+            str = (int64_t)pe_sec[i].VirtualAddress + k;
+            break;
+         }
+   }
+   if (str < 0)
+      goto done;
+
+   /* Code loading its address: lea r64, [rip + disp32]. */
+   for (i = 0; i < pe_nt->FileHeader.NumberOfSections; i++)
+   {
+      uint8_t *p   = pe_file + pe_sec[i].PointerToRawData;
+      uint32_t len = pe_sec[i].SizeOfRawData, k;
+      if (     !(pe_sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)
+            || pe_sec[i].PointerToRawData + len > size)
+         continue;
+      for (k = 0; k + 7 <= len; k++)
+      {
+         int32_t disp;
+         uint32_t at;
+         const RUNTIME_FUNCTION *f;
+         if (     (p[k] != 0x48 && p[k] != 0x4C) || p[k + 1] != 0x8D
+               || (p[k + 2] & 0xC7) != 0x05)
+            continue;
+         memcpy(&disp, p + k + 3, 4);
+         at = pe_sec[i].VirtualAddress + k;
+         if ((int64_t)at + 7 + disp != str || !(f = pe_function(at)))
+            continue;
+         if (f->BeginAddress != found)
+            hits++;
+         found = f->BeginAddress;
+      }
+   }
+   if (hits != 1)
+      found = 0;
+
+done:
+   CloseHandle(h);
+   free(pe_file);
+   pe_file = NULL;
+   return found;
+}
+
+static uint32_t network_init_rva;
+
+/* Runs Network::Init in Eden once it runs (the overlay starts it
+ * suspended): after its C runtime is up, well before the game loads. */
+static DWORD WINAPI network_init_main(LPVOID param)
+{
+   typedef LONG (WINAPI *query_t)(HANDLE, int, PVOID, ULONG, PULONG);
+   struct { PVOID exit_status; uint8_t *peb; ULONG_PTR more[4]; } info;
+   HANDLE process = (HANDLE)param;
+   query_t query  = (query_t)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
+         "NtQueryInformationProcess");
+   uint64_t base  = 0;
+   HANDLE thread;
+   DWORD code     = 0;
+   int i;
+
+   for (i = 0; i < 1200; i++)
+   {
+      FILETIME c, e, k, u;
+      if (     GetProcessTimes(process, &c, &e, &k, &u)
+            && (u.dwLowDateTime || u.dwHighDateTime))
+         break;
+      if (WaitForSingleObject(process, 50) == WAIT_OBJECT_0)
+         goto out;
+   }
+   Sleep(200);
+
+   if (     !query || query(process, 0, &info, sizeof(info), NULL) != 0
+         || !ReadProcessMemory(process, info.peb + 0x10, &base, sizeof(base), NULL))
+   {
+      log_msg("multiplayer: Eden's image base not read (%lu)", (unsigned long)GetLastError());
+      goto out;
+   }
+   thread = CreateRemoteThread(process, NULL, 0,
+         (LPTHREAD_START_ROUTINE)(ULONG_PTR)(base + network_init_rva), NULL, 0, NULL);
+   if (!thread)
+   {
+      log_msg("multiplayer: Eden's network not started (%lu)", (unsigned long)GetLastError());
+      goto out;
+   }
+   WaitForSingleObject(thread, 10000);
+   GetExitCodeThread(thread, &code);
+   CloseHandle(thread);
+   log_msg("multiplayer: Eden's network started (%lu)", (unsigned long)(code & 0xff));
+out:
+   CloseHandle(process);
+   return 0;
+}
+
+static void start_network_init(HANDLE process)
+{
+   HANDLE dup, thread;
+   if (!DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(), &dup,
+         0, FALSE, DUPLICATE_SAME_ACCESS))
+      return;
+   if ((thread = CreateThread(NULL, 0, network_init_main, dup, 0, NULL)))
+      CloseHandle(thread);
+   else
+      CloseHandle(dup);
+}
+
 /* ---------------------------------------------------------------------- */
 /* Loading screen                                                         */
 /* ---------------------------------------------------------------------- */
@@ -2118,6 +2316,12 @@ static DWORD WINAPI launch_main(LPVOID unused)
    BOOL ok;
 
    (void)unused;
+   if (mp.active && !(network_init_rva = find_network_init(launch.cli)))
+   {
+      log_msg("multiplayer: Network::Init not found in eden-cli.exe; playing alone");
+      launch.message = "Multiplayer doesn't work with this Eden version. Playing alone.";
+      mp.active      = false;
+   }
    if (mp.active && mp.host && !start_room(launch.exe, launch.workdir, launch.rom))
    {
       launch.message = "Multiplayer: the room couldn't be opened. Playing alone.";
@@ -2131,9 +2335,12 @@ static DWORD WINAPI launch_main(LPVOID unused)
    {
       log_msg("multiplayer: joining %s:%u as \"%s\"%s", mp.address, mp.port, mp.nick,
             mp.password[0] ? " with password" : "");
-      _snwprintf(cmdline, MAX_PATH * 6, L"\"%ls\" %ls-m \"%hs:%hs@%hs:%u\" -g \"%ls\"",
-            launch.cli, launch.fullscreen ? L"-f " : L"", mp.nick, mp.password,
-            mp.address, mp.port, launch.rom);
+      /* Long option only (-m isn't one of eden-cli's), and no ':' without
+       * a password: "nick:@address" doesn't match its format. */
+      _snwprintf(cmdline, MAX_PATH * 6,
+            L"\"%ls\" %ls--multiplayer \"%hs%hs%hs@%hs:%u\" -g \"%ls\"",
+            launch.cli, launch.fullscreen ? L"-f " : L"", mp.nick,
+            mp.password[0] ? ":" : "", mp.password, mp.address, mp.port, launch.rom);
       exe = launch.cli;
       /* Not the room's password, which is on the command line. */
       log_msg("starting: %ls -g \"%ls\"", exe, launch.rom);
@@ -2167,6 +2374,8 @@ static DWORD WINAPI launch_main(LPVOID unused)
 
    emu_process = pi.hProcess;
    emu_pid     = pi.dwProcessId;
+   if (mp.active)
+      start_network_init(pi.hProcess);
    if (launch.overlay)
       InterlockedExchangePointer((PVOID volatile*)&ov.emu_thread, pi.hThread);
    else
