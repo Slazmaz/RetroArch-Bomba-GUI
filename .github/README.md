@@ -28,11 +28,7 @@ for Steam's overlay, multiplayer and cloud saves.
 
 4. Play RetroArch from Steam.
 
-Saves, save states and core settings are kept in Steam's RetroArch folder
-(`saves`, `states` and `config` in Bomba GUI's folder link there), so Steam
-Cloud backs them up.
-
-Updates to Bomba GUI show up on its Downloads screen.
+You can then easily update Bomba GUI after launching it and opening the Downloads menu.
 
 ## License
 
