@@ -2935,7 +2935,7 @@ static void grid_cc_action(enum menu_action action)
                || action == MENU_ACTION_LEFT || action == MENU_ACTION_RIGHT))
             grid_coreopts_set(opt, (cur + (action == MENU_ACTION_LEFT
                         ? cnt - 1 : 1)) % cnt);
-         else if (action == MENU_ACTION_SCAN)
+         else if (action == MENU_ACTION_SCAN)   /* X : default */
             grid_coreopts_set(opt, grid_coreopts_default(opt));
          break;
       }
@@ -3834,10 +3834,10 @@ bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth)
       /* Face buttons as labelled on the player's controller: the menu's
        * "search" is Y (top), its "scan" X (left). Select and Start do
        * nothing here. */
-      case MENU_ACTION_SCAN:        /* X : zoom */
+      case MENU_ACTION_SEARCH:      /* Y : zoom */
          grid_zoom();
          break;
-      case MENU_ACTION_SEARCH:      /* Y : the selected game's menu (quit
+      case MENU_ACTION_SCAN:        /* X : the selected game's menu (quit
                                      * the running game is in it) */
          if (     grid_st.selection < grid_st.view_count
                && !grid_st.games[grid_st.view[grid_st.selection]].pending)
@@ -4359,7 +4359,7 @@ bool grid_home_mouse(int x, int y, unsigned flags)
       if (hit && hit->kind == HIT_TILE)
       {
          grid_hit_select(hit);
-         grid_mouse_dispatch(MENU_ACTION_SEARCH);
+         grid_mouse_dispatch(MENU_ACTION_SCAN);
       }
       else
          grid_mouse_dispatch(MENU_ACTION_CANCEL);
@@ -4625,7 +4625,7 @@ static void grid_osk_press(int id)
 }
 
 /* Controller: the D-pad moves (repeating while held), A types the key, B
- * erases (closes when empty), Y types a space, X cancels, Start is done,
+ * erases (closes when empty), X cancels, Y types a space, Start is done,
  * L / R move the caret, the left stick's click shifts, the right's
  * switches to symbols. */
 bool grid_home_osk_input(const input_bits_t *held,
@@ -4683,9 +4683,9 @@ bool grid_home_osk_input(const input_bits_t *held,
          grid_edit_cancel();
       return true;
    }
-   /* (RetroPad X: the menu's search, whose glyph is "Y"; RetroPad Y its
-    * scan, "X". See grid_glyph_button.) */
-   if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_X))
+   /* (RetroPad Y: the menu's scan, whose glyph is "X"; RetroPad X its
+    * search, "Y". See grid_glyph_button.) */
+   if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_Y))
    {
       grid_edit_cancel();
       return true;
@@ -4695,7 +4695,7 @@ bool grid_home_osk_input(const input_bits_t *held,
       input_keyboard_event(true, '\n', '\n', 0, RETRO_DEVICE_KEYBOARD);
       return true;
    }
-   if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_Y))
+   if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_X))
       grid_osk_type(" ");
    if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_L))
       grid_edit_move(RETROK_LEFT, false, false);
@@ -7790,17 +7790,12 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
    float hints_w  = 0.0f, hx;
 
    /* Hints, right-aligned, only those that apply right now, in the order
-    * Y, X, A, B: Options and Zoom outside menus, Back only inside them.
-    * Face buttons are labelled as on the player's controller ("X" = the
-    * menu's scan action, "Y" = search). */
+    * Y, X, A, B: Zoom outside menus, Back only inside them. Face buttons
+    * are labelled as on the player's controller ("X" = the menu's scan
+    * action, "Y" = search). */
    if (grid_st.panel == PANEL_NONE && !grid_settings_shown())
    {
-      if (     !grid_st.bar_focus && has_sel
-            && !grid_st.games[grid_st.view[grid_st.selection]].pending)
-      {
-         glyphs[n] = "Y"; labels[n++] = "Options";
-      }
-      glyphs[n] = "X"; labels[n++] = "Zoom";
+      glyphs[n] = "Y"; labels[n++] = "Zoom";
    }
 
    if (grid_settings_shown() && grid_st.cc_level == 1)
@@ -7946,6 +7941,10 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
    }
    else
    {
+      if (has_sel && !grid_st.games[grid_st.view[grid_st.selection]].pending)
+      {
+         glyphs[n] = "X"; labels[n++] = "Game Options";
+      }
       if (has_sel && !grid_st.games[grid_st.view[grid_st.selection]].pending)
       {
          glyphs[n] = "A";
@@ -9471,10 +9470,10 @@ static void grid_draw_keyboard(gfx_display_t *p_disp, void *userdata,
       /* A key with a button of its own shows it in its top-right
        * corner. */
       {
-         /* (As actions: Space is on the scan button, Cancel on search.) */
+         /* (As actions: Space is on the search button, Cancel on scan.) */
          const char *btn = id == OSK_BACKSPACE ? "B"
-                         : id == OSK_SPACE ? "X" : id == OSK_OK ? "+"
-                         : id == OSK_CANCEL ? "Y" : NULL;
+                         : id == OSK_SPACE ? "Y" : id == OSK_OK ? "+"
+                         : id == OSK_CANCEL ? "X" : NULL;
          if (btn)
          {
             float bd = 2.0f * floorf(REF(11) / 2.0f) + 1.0f;
