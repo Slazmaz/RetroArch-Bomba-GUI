@@ -3,16 +3,22 @@
 **⚠️ WARNING - This project was vibe coded with a dash of extra slop.**
 **Courtesy of Claude Opus 5.5. ⚠️**
 
-A modern console-style GUI for RetroArch. Designed for ease of use, and fitted
+A modern console-style GUI for RetroArch. Designed for ease of use and fitted
 with extra tools, including [Eden](https://eden-emu.dev/) integration. Made
 for me, myself, and I.
 
 ![Bomba GUI's home screen](../bomba/docs/screenshot.jpg)
 
+## Launching without Steam
+
+1. Download the latest `bomba-gui-vX.Y.Z.zip` from
+   [Releases](https://github.com/Slazmaz/RetroArch-Bomba-GUI/releases/latest)
+   and unzip it into a folder of its own, e.g. `C:\Bomba GUI`.
+2. Run `bomba.exe`.
+
 ## Launching with Steam
 
-Windows only. Bomba GUI runs through Steam's RetroArch, which it needs
-for Steam's overlay, multiplayer and cloud saves.
+Launching with steam integrates steam multiplayer, overlay, and cloud saves.
 
 1. Install [RetroArch](https://store.steampowered.com/app/1118310/RetroArch/)
    from Steam.
@@ -28,11 +34,19 @@ for Steam's overlay, multiplayer and cloud saves.
 
 4. Play RetroArch from Steam.
 
-You can then easily update Bomba GUI after launching it and opening the Downloads menu.
+To play multiplayer, start Retroarch and right-click a friend in Steam's
+friends list → **Invite to Game**. Once they accept, the game sees them as
+a LAN player. Only works with Eden for now.
+
+## Updating
+
+You can easily stay up to date by launching Bomba GUI and opening the **Downloads**
+menu. There you can update Bomba GUI itself, and update or install cores.
 
 ## License
 
 GPLv3, like RetroArch. Baloo 2 is under the SIL Open Font License, and the
 mist headers are under MPL-2.0 (see their folders). The icons in
 `bomba/icons` are from [Flaticon](https://www.flaticon.com), under the
-Flaticon license; see [their credits](../bomba/icons/CREDITS.md).
+Flaticon license; see [their credits](../bomba/icons/CREDITS.md). The menu
+sounds in `bomba/sounds` are by ViRiX Dreamcore, under CC BY-NC 3.0.
