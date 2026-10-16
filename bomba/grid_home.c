@@ -3817,10 +3817,59 @@ bool grid_home_ok_on_press(void)
    return !grid_settings_shown();
 }
 
+/* Where the cursor is, to tell whether a move went anywhere. */
+typedef struct
+{
+   size_t selection;
+   unsigned bar_sel;
+   unsigned panel_sel;
+   unsigned cc_sel;
+   int panel;
+   int cc_level;
+   bool bar_focus;
+   bool settings;
+} grid_cursor_t;
+
+static void grid_cursor_get(grid_cursor_t *c)
+{
+   memset(c, 0, sizeof(*c));
+   c->selection = grid_st.selection;
+   c->bar_sel   = (unsigned)grid_st.bar_sel;
+   c->panel_sel = (unsigned)grid_st.panel_sel;
+   c->cc_sel    = (unsigned)grid_st.cc_sel;
+   c->panel     = (int)grid_st.panel;
+   c->cc_level  = (int)grid_st.cc_level;
+   c->bar_focus = grid_st.bar_focus;
+   c->settings  = grid_st.settings;
+}
+
 bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth)
 {
-   bool quiet = grid_st.forwarding || grid_st.loading != LOADING_NONE;
-   bool done  = grid_entry_action(action, xmb_depth);
+   bool quiet   = grid_st.forwarding || grid_st.loading != LOADING_NONE;
+   bool move    = action == MENU_ACTION_UP   || action == MENU_ACTION_DOWN
+               || action == MENU_ACTION_LEFT || action == MENU_ACTION_RIGHT;
+   /* Left / right on a Consoles row change its value, not the cursor. */
+   bool value   = (action == MENU_ACTION_LEFT || action == MENU_ACTION_RIGHT)
+               && grid_st.settings && grid_st.cc_level >= 2;
+   /* A hold (Exit, removing an install) already under way: the button's
+    * repeats are no new press. */
+   bool holding = (action == MENU_ACTION_OK   && grid_st.exit_hold_start)
+               || (action == MENU_ACTION_SCAN && grid_st.dl_hold_start);
+   bool updates_scan = action == MENU_ACTION_SCAN
+               && grid_st.panel == PANEL_UPDATES && !grid_st.settings;
+   grid_cursor_t before, after;
+   bool done;
+
+   grid_cursor_get(&before);
+   done = grid_entry_action(action, xmb_depth);
+   grid_cursor_get(&after);
+
+   /* A move that went nowhere (an edge), or X on an install that can't be
+    * removed: silent. */
+   if (move && !value && !memcmp(&before, &after, sizeof(before)))
+      quiet = true;
+   if (holding || (updates_scan && !grid_st.dl_hold_start))
+      quiet = true;
 
    if (done && !quiet)
       grid_action_sound(action);
