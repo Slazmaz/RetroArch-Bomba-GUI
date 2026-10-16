@@ -68,7 +68,7 @@ echo "Packaged: $zip"
 [ "$1" = "--publish" ] || exit 0
 
 # Published releases are installed by everyone: only committed, pushed code.
-if [ -n "$(git status --porcelain)" ]; then
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
    echo "Uncommitted changes; commit and push them first." >&2
    exit 1
 fi
