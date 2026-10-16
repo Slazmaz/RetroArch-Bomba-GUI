@@ -5688,7 +5688,11 @@ unsigned menu_event(
                | (1 << RETRO_DEVICE_ID_JOYPAD_START);
 
       /* Handle OK on release with specific items */
-      if (ok_current || ok_trigger_release)
+      if (     (ok_current || ok_trigger_release)
+#ifdef HAVE_XMB
+            && !grid_home_ok_on_press()
+#endif
+         )
       {
          menu_entry_t entry;
          MENU_ENTRY_INITIALIZE(entry);
