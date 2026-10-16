@@ -2726,7 +2726,7 @@ ifeq ($(HAVE_XMB), 1)
           bomba/grid_cheevos.o bomba/grid_controls.o \
           bomba/grid_coreopts.o bomba/grid_updates.o \
           bomba/grid_switch.o bomba/bomba_multiplayer.o \
-          bomba/bomba_setup.o
+          bomba/bomba_setup.o bomba/bomba_clipboard.o bomba/bomba_keymap.o
 endif
 ifeq ($(HAVE_MIST), 1)
    OBJ += bomba/bomba_steamnet.o

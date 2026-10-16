@@ -55,6 +55,8 @@
 #include "grid_profile.h"
 #include "bomba_steamnet.h"
 #include "bomba_setup.h"
+#include "bomba_clipboard.h"
+#include "bomba_keymap.h"
 #include "grid_updates.h"
 #include "grid_switch.h"
 #include "grid_cheevos.h"
@@ -624,13 +626,115 @@ static struct
    grid_icon_t icon_search;
    grid_icon_t icon_trophy;  /* achievement progress, in the bottom bar */
    grid_icon_t icon_download;/* Installs, in the icon bar */
+   grid_icon_t icon_backspace; /* on-screen keyboard keys */
+   grid_icon_t icon_shift;
    /* Background of the selected game. */
    grid_bg_t bg;
    char bg_key[PATH_MAX_LENGTH];   /* what bg shows: "", GRID_BG_GAME or a
                                       hero image path */
    char bg_prev[PATH_MAX_LENGTH];  /* previous one, fading out under it */
    retro_time_t bg_fade_start;
+
+   /* Mouse and keyboard mode (else gamepad mode): whichever was used last.
+    * In it the pointer shows, things under it are selected and clicked,
+    * the hints name keys, and text is typed without the on-screen
+    * keyboard. */
+   bool kbm;
+   bool cursor_known;       /* cursor_shown is what the window shows */
+   bool cursor_shown;
+   bool pad_active;         /* controllers polled since the menu opened */
+   bool mouse_seen;         /* mouse_x / mouse_y hold a position */
+   int mouse_x, mouse_y;    /* screen pixels */
+   int mouse_rest_x, mouse_rest_y; /* where it was in gamepad mode */
+   bool mouse_left;         /* left button down (holds as OK does) */
+   bool mouse_right;
+   /* Typing: the selection's other end in the line (GRID_NO_ANCHOR: no
+    * selection), whether the mouse is dragging it, and Escape down (it
+    * cancels when let go, so the key isn't still down after). */
+   size_t edit_anchor;
+   bool edit_drag;
+   bool edit_esc;
+
+   /* The on-screen keyboard (gamepad mode): its keys, from the system's
+    * layout osk_layout (set up when typing starts); the key selected (row,
+    * column, and the column up / down keeps to); shift (on until pressed
+    * again); the symbols page; and the direction held down repeating
+    * (osk_rep_at: its next step). */
+   bool osk_ready;
+   bomba_key_t osk_keys[BOMBA_KEYMAP_KEYS];
+   unsigned osk_layout;
+   int osk_row, osk_col, osk_want;
+   bool osk_shift;
+   bool osk_symbols;
+   int osk_rep_dir;
+   retro_time_t osk_rep_at;
 } grid_st;
+
+#define GRID_NO_ANCHOR ((size_t)-1)
+
+/* What the mouse can point at, recorded while drawing: a box, what it
+ * selects when pointed at (kind and index; HIT_NONE: nothing) and the
+ * action a click then does. Hits drawn later are on top. */
+enum grid_hit_kind
+{
+   HIT_NONE = 0,
+   HIT_TILE,     /* a game in the grid (index into view) */
+   HIT_BAR,      /* an icon bar button */
+   HIT_PANEL,    /* an item of the open panel or screen (panel_sel) */
+   HIT_MENU,     /* a row of RetroArch's list on the Settings screen */
+   HIT_CC,       /* a row of the Consoles page (cc_sel) */
+   HIT_CAT       /* a Settings tab: a category, or a game's tab (cc_sub) */
+};
+
+typedef struct
+{
+   float x, y, w, h;
+   enum grid_hit_kind kind;
+   unsigned idx;
+   enum menu_action action;
+} grid_hit_t;
+
+#define GRID_MAX_HITS 192
+#define GRID_EDIT_MAX 255 /* bytes of a typed line the mouse can place in */
+
+typedef struct
+{
+   grid_hit_t hit[GRID_MAX_HITS];
+   unsigned count;
+   /* The text field being typed in, when shown: its box, where the text
+    * starts (scrolled) and each byte's offset from there. */
+   bool edit;
+   float edit_x, edit_y, edit_w, edit_h, edit_x0;
+   size_t edit_len;
+   float edit_xs[GRID_EDIT_MAX + 1];
+} grid_hits_t;
+
+/* Being drawn, and the last frame's (what the mouse uses). */
+static grid_hits_t grid_hits_next, grid_hits;
+
+static void grid_hit_add(float x, float y, float w, float h,
+      enum grid_hit_kind kind, unsigned idx, enum menu_action action)
+{
+   grid_hit_t *t;
+   if (grid_hits_next.count >= GRID_MAX_HITS)
+      return;
+   t         = &grid_hits_next.hit[grid_hits_next.count++];
+   t->x      = x;
+   t->y      = y;
+   t->w      = w;
+   t->h      = h;
+   t->kind   = kind;
+   t->idx    = idx;
+   t->action = action;
+}
+
+/* Whether the pointer is over the box (mouse and keyboard mode only). */
+static bool grid_hover(float x, float y, float w, float h)
+{
+   return grid_st.kbm && grid_st.mouse_seen
+      && grid_st.mouse_x >= x && grid_st.mouse_x < x + w
+      && grid_st.mouse_y >= y && grid_st.mouse_y < y + h;
+}
 
 /* From menu_cbs_ok.c; also handles "quit on close" and the menu stack. */
 int action_ok_close_content(const char *path, const char *label,
@@ -1381,6 +1485,7 @@ static void grid_bg_free_all(void)
 }
 
 static void grid_settings_sync_controllers(void);
+static void grid_unbind_escape_quit(void);
 
 void grid_home_toggle(bool menu_on)
 {
@@ -1400,6 +1505,22 @@ void grid_home_toggle(bool menu_on)
    /* The game menu animates afresh, not finishing an old open or close. */
    grid_st.gm_open    = false;
    grid_st.gm_closing = false;
+
+   /* Controllers are looked at afresh (what is held as the menu opens
+    * isn't a new press); leaving it, the pointer is as RetroArch has it,
+    * hidden in fullscreen. */
+   grid_unbind_escape_quit();
+   grid_st.pad_active  = false;
+   grid_st.mouse_left  = false;
+   grid_st.mouse_right = false;
+   if (!menu_on)
+   {
+      video_driver_state_t *video_st = video_state_get_ptr();
+      if (video_st->poke && video_st->poke->show_mouse)
+         video_st->poke->show_mouse(video_st->data,
+               !config_get_ptr()->bools.video_fullscreen);
+      grid_st.cursor_known = false;
+   }
 
    /* The running game may have unlocked achievements since: look its
     * progress up again. */
@@ -3180,7 +3301,7 @@ static void grid_dl_hold_iterate(void)
    if (     grid_st.panel != PANEL_UPDATES
          || grid_st.panel_sel >= grid_st.list_count
          || grid_st.list_view[grid_st.panel_sel] != grid_st.dl_hold_item
-         || !menu_driver_scan_held())
+         || !(menu_driver_scan_held() || grid_st.mouse_left))
    {
       grid_st.dl_hold_start   = 0;
       grid_st.dl_hold_full_at = 0;
@@ -3198,17 +3319,21 @@ static void grid_dl_hold_iterate(void)
    }
 }
 
+static void grid_input_mode_poll(void);
+
 void grid_home_iterate(void)
 {
+   grid_input_mode_poll();
    grid_dl_hold_iterate();
    grid_mp_follow_host();
 
    if (!grid_st.exit_hold_start)
       return;
 
+   /* (A click holds as OK does: the mouse button held down.) */
    if (     grid_st.panel != PANEL_PROFILES
          || grid_st.panel_sel != GRID_STRIP_EXIT
-         || !menu_driver_ok_held())
+         || !(menu_driver_ok_held() || grid_st.mouse_left))
    {
       grid_st.exit_hold_start = 0;
       grid_st.exit_full_at    = 0;
@@ -3654,6 +3779,842 @@ bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth)
          return false;
    }
 
+   return true;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Mouse and keyboard                                                     */
+/* ---------------------------------------------------------------------- */
+
+static bool grid_binding(void);
+
+bool grid_home_kbm(void)
+{
+   return grid_st.kbm;
+}
+
+/* Escape never quits (it is Back in the menu): RetroArch's default quit
+ * key is unbound wherever it is still Escape. */
+static void grid_unbind_escape_quit(void)
+{
+   if (input_config_binds[0][RARCH_QUIT_KEY].key == RETROK_ESCAPE)
+      input_config_binds[0][RARCH_QUIT_KEY].key = RETROK_UNKNOWN;
+}
+
+static void grid_set_kbm(bool kbm)
+{
+   grid_st.kbm          = kbm;
+   grid_st.mouse_rest_x = grid_st.mouse_x;
+   grid_st.mouse_rest_y = grid_st.mouse_y;
+}
+
+/* Gamepad mode once a controller button is pressed or a stick pushed
+ * (something newly down, so one held or resting off centre doesn't keep
+ * switching back). Also shows the pointer in mouse and keyboard mode
+ * only. */
+static void grid_input_mode_poll(void)
+{
+   static input_bits_t prev[MAX_USERS];
+   static uint8_t prev_axes[MAX_USERS];
+   input_driver_state_t *input_st      = input_state_get_ptr();
+   const input_device_driver_t *joypad = input_st->primary_joypad;
+   video_driver_state_t *video_st      = video_state_get_ptr();
+   settings_t *settings                = config_get_ptr();
+   unsigned users                      = settings->uints.input_max_users;
+   bool pressed                        = false;
+   unsigned u, k;
+
+   if (users > MAX_USERS)
+      users = MAX_USERS;
+
+   grid_unbind_escape_quit();
+
+   for (u = 0; joypad && u < users; u++)
+   {
+      unsigned port = settings->uints.input_joypad_index[u];
+      input_bits_t bits;
+      uint8_t axes  = 0;
+
+      BIT256_CLEAR_ALL(bits);
+      /* (xinput's driver reads an unplugged pad out of bounds.) */
+      if (joypad->query_pad && !joypad->query_pad(port))
+         continue;
+      if (joypad->get_buttons)
+         joypad->get_buttons(port, &bits);
+      else if (joypad->button)
+      {
+         /* Drivers without get_buttons (xinput): buttons one by one, and
+          * the D-pad as hat 0. */
+         static const uint16_t hats[4] = {
+            HAT_UP_MASK, HAT_DOWN_MASK, HAT_LEFT_MASK, HAT_RIGHT_MASK
+         };
+         for (k = 0; k < 32; k++)
+            if (joypad->button(port, (uint16_t)k))
+               BIT256_SET(bits, k);
+         for (k = 0; k < 4; k++)
+            if (joypad->button(port, HAT_MAP(0, hats[k])))
+               BIT256_SET(bits, 32 + k);
+      }
+      for (k = 0; joypad->axis && k < 4; k++)
+      {
+         if (abs(joypad->axis(port, AXIS_POS(k))) > 0x4000)
+            axes |= 1 << (2 * k);
+         if (abs(joypad->axis(port, AXIS_NEG(k))) > 0x4000)
+            axes |= 1 << (2 * k + 1);
+      }
+
+      if (grid_st.pad_active)
+      {
+         for (k = 0; k < ARRAY_SIZE(bits.data); k++)
+            if (bits.data[k] & ~prev[u].data[k])
+               pressed = true;
+         if (axes & ~prev_axes[u])
+            pressed = true;
+      }
+      prev[u]      = bits;
+      prev_axes[u] = axes;
+   }
+   /* (The first poll since the menu opened only takes note.) */
+   if (!grid_st.pad_active)
+   {
+      grid_st.pad_active = true;
+      pressed            = false;
+   }
+   if (pressed)
+      grid_set_kbm(false);
+
+   if (!menu_input_dialog_get_display_kb())
+   {
+      grid_st.edit_anchor = GRID_NO_ANCHOR;
+      grid_st.edit_drag   = false;
+      grid_st.edit_esc    = false;
+      grid_st.osk_ready   = false;
+   }
+
+   if (     (!grid_st.cursor_known || grid_st.cursor_shown != grid_st.kbm)
+         && video_st->poke && video_st->poke->show_mouse)
+   {
+      video_st->poke->show_mouse(video_st->data, grid_st.kbm);
+      grid_st.cursor_shown = grid_st.kbm;
+      grid_st.cursor_known = true;
+   }
+}
+
+/* An action as if from the controller (through the menu driver, so
+ * Settings' pages get it as RetroArch's). */
+static void grid_mouse_dispatch(enum menu_action action)
+{
+   struct menu_state *menu_st = menu_state_get_ptr();
+   size_t sel                 = menu_st->selection_ptr;
+   menu_entry_t entry;
+
+   MENU_ENTRY_INITIALIZE(entry);
+   menu_entry_get(&entry, 0, sel, NULL, false);
+   menu_entry_action(&entry, sel, action);
+}
+
+/* Pointing at something selects it. */
+static void grid_hit_select(const grid_hit_t *t)
+{
+   switch (t->kind)
+   {
+      case HIT_TILE:
+         if (t->idx < grid_st.view_count)
+         {
+            grid_st.selection = t->idx;
+            grid_st.bar_focus = false;
+         }
+         break;
+      case HIT_BAR:
+         grid_st.bar_focus = true;
+         grid_st.bar_sel   = t->idx;
+         break;
+      case HIT_PANEL:
+         grid_st.panel_sel = t->idx;
+         break;
+      case HIT_MENU:
+      {
+         struct menu_state *menu_st = menu_state_get_ptr();
+         file_list_t *list = MENU_LIST_GET_SELECTION(menu_st->entries.list, 0);
+         if (list && t->idx < list->size)
+            menu_st->selection_ptr = t->idx;
+         break;
+      }
+      case HIT_CC:
+         grid_st.cc_sel = t->idx;
+         break;
+      default:
+         break;
+   }
+}
+
+/* Clicking it does its action. */
+static void grid_hit_activate(const grid_hit_t *t)
+{
+   if (t->kind == HIT_CAT)
+   {
+      /* A game's Settings switch tab at their top only (as L / R). */
+      if (grid_st.game_settings)
+      {
+         if (grid_st.cc_level == 2)
+         {
+            grid_st.cc_sub = (int)t->idx;
+            grid_st.cc_sel = 0;
+         }
+      }
+      else if (!grid_st.settings_quick)
+         grid_settings_open_cat(t->idx);
+      return;
+   }
+   if (t->action != MENU_ACTION_NOOP)
+      grid_mouse_dispatch(t->action);
+}
+
+/* The wheel moves the selection: sideways along the games grid, the icon
+ * bar and the profiles strip, up and down elsewhere. */
+static enum menu_action grid_wheel_action(bool down)
+{
+   if (     !grid_settings_shown()
+         && (grid_st.panel == PANEL_NONE || grid_st.panel == PANEL_PROFILES))
+      return down ? MENU_ACTION_RIGHT : MENU_ACTION_LEFT;
+   return down ? MENU_ACTION_DOWN : MENU_ACTION_UP;
+}
+
+static input_keyboard_line_t *grid_edit_line(void)
+{
+   return &input_state_get_ptr()->keyboard_line;
+}
+
+static size_t grid_utf8_prev(const char *s, size_t i)
+{
+   if (!i)
+      return 0;
+   for (i--; i > 0 && ((unsigned char)s[i] & 0xc0) == 0x80; i--);
+   return i;
+}
+
+static size_t grid_utf8_next(const char *s, size_t i, size_t len)
+{
+   if (i >= len)
+      return len;
+   for (i++; i < len && ((unsigned char)s[i] & 0xc0) == 0x80; i++);
+   return i;
+}
+
+/* The selected bytes of the line [a, b), if any. */
+static bool grid_edit_sel(size_t *a, size_t *b)
+{
+   input_keyboard_line_t *line = grid_edit_line();
+   size_t anchor               = grid_st.edit_anchor;
+
+   if (     anchor == GRID_NO_ANCHOR || anchor > line->size
+         || anchor == line->ptr || !line->buffer)
+      return false;
+   *a = anchor < line->ptr ? anchor : line->ptr;
+   *b = anchor < line->ptr ? line->ptr : anchor;
+   return true;
+}
+
+static void grid_edit_erase(size_t a, size_t b)
+{
+   input_keyboard_line_t *line = grid_edit_line();
+
+   if (!line->buffer || b <= a || b > line->size)
+      return;
+   memmove(line->buffer + a, line->buffer + b, line->size - b + 1);
+   line->size -= b - a;
+   line->ptr   = a;
+}
+
+/* Removes the selection (true if there was one); either way none is
+ * left. */
+static bool grid_edit_erase_sel(void)
+{
+   size_t a, b;
+   bool had = grid_edit_sel(&a, &b);
+
+   if (had)
+      grid_edit_erase(a, b);
+   grid_st.edit_anchor = GRID_NO_ANCHOR;
+   return had;
+}
+
+static void grid_edit_delete(bool forward)
+{
+   input_keyboard_line_t *line = grid_edit_line();
+
+   if (grid_edit_erase_sel() || !line->buffer)
+      return;
+   if (forward)
+      grid_edit_erase(line->ptr,
+            grid_utf8_next(line->buffer, line->ptr, line->size));
+   else if (line->ptr)
+      grid_edit_erase(grid_utf8_prev(line->buffer, line->ptr), line->ptr);
+}
+
+/* Left / right a character (ctrl: a word), Home / End; shift extends the
+ * selection. */
+static void grid_edit_move(unsigned code, bool shift, bool ctrl)
+{
+   input_keyboard_line_t *line = grid_edit_line();
+   const char *s = line->buffer ? line->buffer : "";
+   size_t len    = line->buffer ? line->size : 0;
+   size_t p      = line->ptr, a, b;
+
+   /* Without shift, left / right go to that end of the selection. */
+   if (     !shift && (code == RETROK_LEFT || code == RETROK_RIGHT)
+         && grid_edit_sel(&a, &b))
+   {
+      line->ptr           = code == RETROK_LEFT ? a : b;
+      grid_st.edit_anchor = GRID_NO_ANCHOR;
+      return;
+   }
+   if (shift && (grid_st.edit_anchor == GRID_NO_ANCHOR
+            || grid_st.edit_anchor > len))
+      grid_st.edit_anchor = p;
+
+   switch (code)
+   {
+      case RETROK_LEFT:
+         if (ctrl)
+         {
+            while (p && s[p - 1] == ' ')
+               p--;
+            while (p && s[p - 1] != ' ')
+               p--;
+         }
+         else
+            p = grid_utf8_prev(s, p);
+         break;
+      case RETROK_RIGHT:
+         if (ctrl)
+         {
+            while (p < len && s[p] != ' ')
+               p++;
+            while (p < len && s[p] == ' ')
+               p++;
+         }
+         else
+            p = grid_utf8_next(s, p, len);
+         break;
+      case RETROK_HOME:
+         p = 0;
+         break;
+      default:
+         p = len;
+         break;
+   }
+
+   line->ptr = p;
+   if (!shift)
+      grid_st.edit_anchor = GRID_NO_ANCHOR;
+}
+
+/* Copies (or cuts) the selection; not from the password field. */
+static void grid_edit_copy(bool cut)
+{
+   input_keyboard_line_t *line = grid_edit_line();
+   size_t a, b;
+
+   if (     (grid_st.kb == KB_SETUP && grid_st.setup_typing == SETUP_PASS)
+         || !grid_edit_sel(&a, &b))
+      return;
+   bomba_clipboard_set(line->buffer + a, b - a);
+   if (cut)
+      grid_edit_erase_sel();
+}
+
+/* Pastes over the selection, as one line (control characters such as
+ * line breaks are left out). */
+static void grid_edit_paste(void)
+{
+   char *clip = bomba_clipboard_get();
+   char *src, *dst;
+
+   if (!clip)
+      return;
+   for (src = dst = clip; *src; src++)
+      if ((unsigned char)*src >= 0x20 && *src != 0x7f)
+         *dst++ = *src;
+   *dst = '\0';
+
+   grid_edit_erase_sel();
+   if (*clip)
+      input_keyboard_line_append(grid_edit_line(), clip, strlen(clip));
+   free(clip);
+}
+
+/* Escape: closes the text entry, keeping what was there before. */
+static void grid_edit_cancel(void)
+{
+   input_driver_state_t *input_st = input_state_get_ptr();
+
+   input_keyboard_line_free(input_st);
+   input_st->flags &= ~INP_FLAG_KB_MAPPING_BLOCKED;
+   menu_input_dialog_end();
+   if (grid_st.kb != KB_MENU)
+      grid_st.kb = KB_SEARCH;
+}
+
+/* The line's byte nearest the pointer, in the field as last drawn. */
+static size_t grid_edit_index_at(float x)
+{
+   size_t i, best = 0;
+   float best_d   = 1e9f;
+
+   for (i = 0; i <= grid_hits.edit_len; i++)
+   {
+      float d;
+      if (grid_hits.edit_xs[i] < 0.0f) /* inside a UTF-8 character */
+         continue;
+      d = fabsf(grid_hits.edit_x0 + grid_hits.edit_xs[i] - x);
+      if (d < best_d)
+      {
+         best_d = d;
+         best   = i;
+      }
+   }
+   return best;
+}
+
+bool grid_home_mouse(int x, int y, unsigned flags)
+{
+   bool left    = (flags & MENU_INP_PTR_FLG_PRESS_SELECT) ? true : false;
+   bool right   = (flags & MENU_INP_PTR_FLG_PRESS_CANCEL) ? true : false;
+   bool press   = left  && !grid_st.mouse_left;
+   bool rpress  = right && !grid_st.mouse_right;
+   bool moved   = grid_st.mouse_seen
+               && (x != grid_st.mouse_x || y != grid_st.mouse_y);
+   int wheel    = (flags & MENU_INP_PTR_FLG_PRESS_UP) ? -1
+                : (flags & MENU_INP_PTR_FLG_PRESS_DOWN) ? 1 : 0;
+   const grid_hit_t *hit = NULL;
+   unsigned i;
+
+   if (!grid_st.mouse_seen)
+   {
+      grid_st.mouse_rest_x = x;
+      grid_st.mouse_rest_y = y;
+   }
+   grid_st.mouse_seen  = true;
+   grid_st.mouse_x     = x;
+   grid_st.mouse_y     = y;
+   grid_st.mouse_left  = left;
+   grid_st.mouse_right = right;
+
+   /* Gamepad mode until the mouse moves a little, clicks or scrolls. */
+   if (!grid_st.kbm)
+   {
+      if (     !press && !rpress && !wheel
+            && abs(x - grid_st.mouse_rest_x) <= 4
+            && abs(y - grid_st.mouse_rest_y) <= 4)
+         return true;
+      grid_set_kbm(true);
+   }
+
+   /* RetroArch waiting for a control to bind: leave the screen as is. */
+   if (grid_binding() || grid_cc_bind_waiting())
+      return true;
+
+   for (i = grid_hits.count; i-- > 0; )
+   {
+      const grid_hit_t *t = &grid_hits.hit[i];
+      if (     x >= t->x && x < t->x + t->w
+            && y >= t->y && y < t->y + t->h)
+      {
+         hit = t;
+         break;
+      }
+   }
+
+   /* Typing: a click in the field places the caret and dragging selects;
+    * a click elsewhere is done typing (as Enter). */
+   if (menu_input_dialog_get_display_kb())
+   {
+      input_keyboard_line_t *line = grid_edit_line();
+      bool in_field = grid_hits.edit
+            && x >= grid_hits.edit_x && x < grid_hits.edit_x + grid_hits.edit_w
+            && y >= grid_hits.edit_y && y < grid_hits.edit_y + grid_hits.edit_h;
+
+      if (!line->enabled)
+         return true;
+      if (press && in_field)
+      {
+         size_t p = grid_edit_index_at((float)x);
+         line->ptr           = p < line->size ? p : line->size;
+         grid_st.edit_anchor = line->ptr;
+         grid_st.edit_drag   = true;
+      }
+      else if (press)
+         input_keyboard_event(true, '\n', '\n', 0, RETRO_DEVICE_KEYBOARD);
+      else if (left && moved && grid_st.edit_drag)
+      {
+         size_t p  = grid_edit_index_at((float)x);
+         line->ptr = p < line->size ? p : line->size;
+      }
+      if (!left)
+         grid_st.edit_drag = false;
+      return true;
+   }
+
+   if (moved && hit && !left)
+      grid_hit_select(hit);
+   if (press && hit)
+   {
+      grid_hit_select(hit);
+      grid_hit_activate(hit);
+   }
+   /* Right click: a game's menu on its tile, else back. */
+   if (rpress)
+   {
+      if (hit && hit->kind == HIT_TILE)
+      {
+         grid_hit_select(hit);
+         grid_mouse_dispatch(MENU_ACTION_SCAN);
+      }
+      else
+         grid_mouse_dispatch(MENU_ACTION_CANCEL);
+   }
+   if (wheel)
+      grid_mouse_dispatch(grid_wheel_action(wheel > 0));
+   return true;
+}
+
+bool grid_home_key_event(bool down, unsigned code, uint32_t character,
+      uint16_t mod)
+{
+   input_driver_state_t *input_st = input_state_get_ptr();
+   input_keyboard_line_t *line    = &input_st->keyboard_line;
+   bool ctrl = (mod & RETROKMOD_CTRL) && !(mod & RETROKMOD_ALT); /* not AltGr */
+
+   /* The on-screen keyboard's own keys (Backspace, Enter) come as code ==
+    * character: those are the controller's. */
+   if (code && code == character)
+      return false;
+
+   if (down)
+      grid_set_kbm(true);
+
+   if (     !menu_input_dialog_get_display_kb() || !line->enabled
+         || input_st->keyboard_press_cb)
+      return false;
+
+   if (!down)
+   {
+      if (code == RETROK_ESCAPE && grid_st.edit_esc)
+      {
+         grid_st.edit_esc = false;
+         grid_edit_cancel();
+         return true;
+      }
+      return false;
+   }
+
+   /* A key (its character, if any, comes as an event of its own). */
+   if (code != RETROK_UNKNOWN)
+   {
+      switch (code)
+      {
+         case RETROK_LEFT:
+         case RETROK_RIGHT:
+         case RETROK_HOME:
+         case RETROK_END:
+            grid_edit_move(code, (mod & RETROKMOD_SHIFT) ? true : false,
+                  ctrl);
+            return true;
+         case RETROK_DELETE:
+            grid_edit_delete(true);
+            return true;
+         case RETROK_ESCAPE:
+            grid_st.edit_esc = true;
+            return true;
+         case RETROK_UP:
+         case RETROK_DOWN:
+            return true;
+         case RETROK_a:
+            if (!ctrl)
+               break;
+            grid_st.edit_anchor = 0;
+            line->ptr           = line->size;
+            return true;
+         case RETROK_c:
+         case RETROK_x:
+            if (!ctrl)
+               break;
+            grid_edit_copy(code == RETROK_x);
+            return true;
+         case RETROK_v:
+            if (!ctrl)
+               break;
+            grid_edit_paste();
+            return true;
+         default:
+            break;
+      }
+      return false;
+   }
+
+   /* Input method composition: RetroArch's. */
+   if (character & 0xff000000)
+      return false;
+
+   switch (character)
+   {
+      case '\b':
+      case 0x7f:
+         grid_edit_delete(false);
+         return true;
+      case '\r':
+      case '\n':
+         grid_st.edit_anchor = GRID_NO_ANCHOR;
+         return false;
+      default:
+         break;
+   }
+   /* Other control characters (Ctrl+letter, Escape, Tab) type nothing. */
+   if (character < 0x20)
+      return true;
+
+   /* Typing replaces the selection. RetroArch types plain ASCII; anything
+    * else goes in as UTF-8 here (it would type "?"). */
+   grid_edit_erase_sel();
+   if (character < 0x80)
+      return false;
+   if (character < 0xd800 || (character >= 0xe000 && character < 0x10000))
+   {
+      char utf8[4];
+      size_t n;
+      if (character < 0x800)
+      {
+         utf8[0] = (char)(0xc0 | (character >> 6));
+         utf8[1] = (char)(0x80 | (character & 0x3f));
+         n       = 2;
+      }
+      else
+      {
+         utf8[0] = (char)(0xe0 | (character >> 12));
+         utf8[1] = (char)(0x80 | ((character >> 6) & 0x3f));
+         utf8[2] = (char)(0x80 | (character & 0x3f));
+         n       = 3;
+      }
+      input_keyboard_line_append(line, utf8, n);
+   }
+   return true;
+}
+
+/* The on-screen keyboard: four rows of eleven character keys over a row
+ * of the layout, shift, symbols and space keys, and a column on the right
+ * of backspace, cancel and OK:
+ *
+ *    1 2 3 4 5 6 7 8 9 0 +   [ Bksp ]
+ *    q w e r t y u i o p å   [Cancel]
+ *    a s d f g h j k l ö ä   [      ]
+ *    z x c v b n m , . - '   [  OK  ]
+ *    Shift #+= [   Space   ] [      ]
+ *
+ * Keys are character indices (row * 11 + column) or these. */
+enum
+{
+   OSK_BACKSPACE = 100,
+   OSK_CANCEL,
+   OSK_OK,
+   OSK_SHIFT,
+   OSK_SYMBOLS,
+   OSK_SPACE
+};
+
+#define GRID_OSK_COLS 12 /* the character columns and the right one */
+#define GRID_OSK_ROWS 5
+
+/* The symbols page, in place of the character keys. */
+static const char *grid_osk_symbols[BOMBA_KEYMAP_KEYS] = {
+   "!", "@", "#", "$", "%", "^", "&", "*", "(", ")", "_",
+   "[", "]", "{", "}", "<", ">", "\\", "|", "~", "`", "=",
+   "\xe2\x82\xac", "\xc2\xa3", "\xc2\xa5", "\xc2\xa7", "\xc2\xb0",
+   "\xc2\xbf", "\xc2\xa1", "\xc2\xab", "\xc2\xbb", "\xc2\xb4", "\xc2\xa8",
+   "+", "-", "*", "/", ":", ";", "\"", "'", ",", ".", "?"
+};
+
+static int grid_osk_key_at(int row, int col)
+{
+   if (col == GRID_OSK_COLS - 1)
+      return row == 0 ? OSK_BACKSPACE : row <= 2 ? OSK_CANCEL : OSK_OK;
+   if (row < BOMBA_KEYMAP_ROWS)
+      return row * BOMBA_KEYMAP_COLS + col;
+   return col == 0 ? OSK_SHIFT : col == 1 ? OSK_SYMBOLS : OSK_SPACE;
+}
+
+/* A character key's text as it types now (page and shift). */
+static const char *grid_osk_label(int id)
+{
+   if (id < 0 || id >= BOMBA_KEYMAP_KEYS)
+      return "";
+   if (grid_st.osk_symbols)
+      return grid_osk_symbols[id];
+   /* Shift leaves the number row as it is. */
+   return grid_st.osk_shift && id >= BOMBA_KEYMAP_COLS
+      ? grid_st.osk_keys[id].shift : grid_st.osk_keys[id].base;
+}
+
+/* Typing starts: the system's current layout, on the q key. */
+static void grid_osk_prepare(void)
+{
+   if (grid_st.osk_ready)
+      return;
+   grid_st.osk_ready   = true;
+   grid_st.osk_layout  = bomba_keymap_current();
+   bomba_keymap_get(grid_st.osk_layout, grid_st.osk_keys);
+   grid_st.osk_row     = 1;
+   grid_st.osk_col     = 0;
+   grid_st.osk_want    = 0;
+   grid_st.osk_shift   = false;
+   grid_st.osk_symbols = false;
+   grid_st.osk_rep_dir = -1;
+}
+
+/* One step that way, past the rest of a wide key; sideways wraps round. */
+static void grid_osk_step(unsigned dir)
+{
+   int row = grid_st.osk_row, col = grid_st.osk_col;
+   int id  = grid_osk_key_at(row, col);
+
+   if (dir == RETRO_DEVICE_ID_JOYPAD_LEFT || dir == RETRO_DEVICE_ID_JOYPAD_RIGHT)
+   {
+      int dc = dir == RETRO_DEVICE_ID_JOYPAD_LEFT ? -1 : 1;
+      do
+         col = (col + dc + GRID_OSK_COLS) % GRID_OSK_COLS;
+      while (grid_osk_key_at(row, col) == id);
+      grid_st.osk_col  = col;
+      grid_st.osk_want = col;
+      return;
+   }
+
+   col = grid_st.osk_want;
+   do
+   {
+      row += dir == RETRO_DEVICE_ID_JOYPAD_UP ? -1 : 1;
+      if (row < 0 || row >= GRID_OSK_ROWS)
+         return;
+   } while (grid_osk_key_at(row, col) == id);
+   grid_st.osk_row = row;
+   grid_st.osk_col = col;
+}
+
+static void grid_osk_type(const char *s)
+{
+   grid_edit_erase_sel();
+   if (*s)
+      input_keyboard_line_append(grid_edit_line(), s, strlen(s));
+}
+
+static void grid_osk_press(int id)
+{
+   switch (id)
+   {
+      case OSK_BACKSPACE:
+         grid_edit_delete(false);
+         break;
+      case OSK_CANCEL:
+         grid_edit_cancel();
+         break;
+      case OSK_OK:
+         input_keyboard_event(true, '\n', '\n', 0, RETRO_DEVICE_KEYBOARD);
+         break;
+      case OSK_SHIFT:
+         grid_st.osk_shift = !grid_st.osk_shift;
+         break;
+      case OSK_SYMBOLS:
+         grid_st.osk_symbols = !grid_st.osk_symbols;
+         break;
+      case OSK_SPACE:
+         grid_osk_type(" ");
+         break;
+      default:
+         grid_osk_type(grid_osk_label(id));
+         break;
+   }
+}
+
+/* Controller: the D-pad moves (repeating while held), A types the key, B
+ * erases (closes when empty), Y types a space, X cancels, Start is done,
+ * L / R move the caret, the left stick's click shifts, the right's
+ * switches to symbols. */
+bool grid_home_osk_input(const input_bits_t *held,
+      const input_bits_t *pressed)
+{
+   static const unsigned dirs[4] = {
+      RETRO_DEVICE_ID_JOYPAD_UP,   RETRO_DEVICE_ID_JOYPAD_DOWN,
+      RETRO_DEVICE_ID_JOYPAD_LEFT, RETRO_DEVICE_ID_JOYPAD_RIGHT
+   };
+   retro_time_t now = cpu_features_get_time_usec();
+   bool swap        = config_get_ptr()->bools.input_menu_swap_ok_cancel_buttons;
+   unsigned ok_btn  = swap ? RETRO_DEVICE_ID_JOYPAD_B : RETRO_DEVICE_ID_JOYPAD_A;
+   unsigned del_btn = swap ? RETRO_DEVICE_ID_JOYPAD_A : RETRO_DEVICE_ID_JOYPAD_B;
+   bool any_dir     = false;
+   unsigned k;
+
+   /* Mouse and keyboard mode shows no keyboard (a button press switches
+    * to gamepad mode, showing it). */
+   if (grid_st.kbm || !grid_edit_line()->enabled)
+      return true;
+   grid_osk_prepare();
+
+   for (k = 0; k < 4; k++)
+   {
+      unsigned d = dirs[k];
+      if (BIT256_GET_PTR(pressed, d))
+      {
+         grid_osk_step(d);
+         grid_st.osk_rep_dir = (int)d;
+         grid_st.osk_rep_at  = now + 400000;
+      }
+      else if ((int)d == grid_st.osk_rep_dir && BIT256_GET_PTR(held, d)
+            && now >= grid_st.osk_rep_at)
+      {
+         grid_osk_step(d);
+         grid_st.osk_rep_at = now + 70000;
+      }
+      if (BIT256_GET_PTR(held, d))
+         any_dir = true;
+   }
+   if (!any_dir)
+      grid_st.osk_rep_dir = -1;
+
+   /* (Done or cancelled: the line is gone, nothing more to do.) */
+   if (BIT256_GET_PTR(pressed, ok_btn))
+   {
+      grid_osk_press(grid_osk_key_at(grid_st.osk_row, grid_st.osk_col));
+      return true;
+   }
+   if (BIT256_GET_PTR(pressed, del_btn))
+   {
+      if (grid_edit_line()->size)
+         grid_edit_delete(false);
+      else
+         grid_edit_cancel();
+      return true;
+   }
+   /* (RetroPad X: the menu's search, whose glyph is "Y"; RetroPad Y its
+    * scan, "X". See grid_glyph_button.) */
+   if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_X))
+   {
+      grid_edit_cancel();
+      return true;
+   }
+   if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_START))
+   {
+      input_keyboard_event(true, '\n', '\n', 0, RETRO_DEVICE_KEYBOARD);
+      return true;
+   }
+   if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_Y))
+      grid_osk_type(" ");
+   if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_L))
+      grid_edit_move(RETROK_LEFT, false, false);
+   if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_R))
+      grid_edit_move(RETROK_RIGHT, false, false);
+   if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_L3))
+      grid_osk_press(OSK_SHIFT);
+   if (BIT256_GET_PTR(pressed, RETRO_DEVICE_ID_JOYPAD_R3))
+      grid_osk_press(OSK_SYMBOLS);
    return true;
 }
 
@@ -4610,12 +5571,23 @@ static void grid_draw_vgradient(gfx_display_t *p_disp, void *userdata,
          width, height, color, NULL);
 }
 
+static void grid_glyph_key(char glyph, char *s, size_t len);
+
 /* L / R key glyph, as in the reference: a light rectangle with slightly
- * rounded corners and a dark regular-weight letter in the middle. */
+ * rounded corners and a dark regular-weight letter in the middle (in
+ * mouse and keyboard mode the keyboard's key, when it is one letter). */
 static void grid_draw_key(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height, char letter,
       float x, float y, float w, float h)
 {
+   if (grid_st.kbm)
+   {
+      char key[32];
+      grid_glyph_key(letter, key, sizeof(key));
+      if (key[0] && !key[1])
+         letter = key[0];
+   }
+
    grid_draw_rounded(p_disp, userdata, width, height,
          x, y, w, h, h * 0.16f, COL_GLYPH);
 
@@ -4768,56 +5740,299 @@ static void grid_draw_image(gfx_display_t *p_disp, void *userdata,
          (unsigned)iw, (unsigned)ih, width, height, color, tex);
 }
 
-/* Round button glyph (e.g. "A") with its label to the right. Returns the
- * total width drawn. Draws nothing when measure_only. */
+static void grid_bind_key_text(const struct retro_keybind *b,
+      char *s, size_t len);
+
+/* The keyboard key doing what a controller button does in the menu ("A":
+ * Enter; X, Y, L and R as bound for player 1). */
+static void grid_glyph_key(char glyph, char *s, size_t len)
+{
+   unsigned id;
+
+   switch (glyph)
+   {
+      case 'A': strlcpy(s, "Enter", len);     return;
+      case 'B': strlcpy(s, "Esc", len);       return;
+      /* (Glyph "X" is the menu's scan, RetroPad Y; "Y" its search.) */
+      case 'X': id = RETRO_DEVICE_ID_JOYPAD_Y; break;
+      case 'Y': id = RETRO_DEVICE_ID_JOYPAD_X; break;
+      case 'L': id = RETRO_DEVICE_ID_JOYPAD_L; break;
+      case 'R': id = RETRO_DEVICE_ID_JOYPAD_R; break;
+      default:
+         s[0] = glyph;
+         s[1] = '\0';
+         return;
+   }
+   grid_bind_key_text(&input_config_binds[0][id], s, len);
+   if (!s[0])
+   {
+      s[0] = glyph;
+      s[1] = '\0';
+   }
+}
+
+/* Text being typed: shown (the line, or a star per byte of a password)
+ * from x on the line centred at cy, clipped to max_w and scrolled to keep
+ * the caret in view, with the selection behind it and a blinking caret.
+ * Recorded for the mouse (a click places the caret, dragging selects). */
+static void grid_draw_edit(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, const char *shown, float x,
+      float cy, float max_w, float scale, uint32_t color)
+{
+   input_keyboard_line_t *line = &input_state_get_ptr()->keyboard_line;
+   float *xs    = grid_hits_next.edit_xs;
+   size_t len   = strlen(shown);
+   float ty     = grid_text_y(cy, height, scale);
+   float line_h = (height / 32.0f) * scale;
+   float bar_w  = grid_text_width("|", height, scale);
+   float off    = 0.0f;
+   size_t i, a, b, ptr;
+
+   if (len > GRID_EDIT_MAX)
+      len = GRID_EDIT_MAX;
+
+   /* Where each byte starts (inside a UTF-8 character: -1). */
+   for (i = 0; i <= len; i++)
+   {
+      char prefix[GRID_EDIT_MAX + 1];
+      if (i > 0 && i < len && ((unsigned char)shown[i] & 0xc0) == 0x80)
+      {
+         xs[i] = -1.0f;
+         continue;
+      }
+      memcpy(prefix, shown, i);
+      prefix[i] = '\0';
+      xs[i]     = i ? grid_text_width(prefix, height, scale) : 0.0f;
+   }
+
+   ptr = line->ptr < len ? line->ptr : len;
+   while (ptr > 0 && xs[ptr] < 0.0f)
+      ptr--;
+   if (xs[ptr] + bar_w > max_w)
+      off = xs[ptr] + bar_w - max_w;
+
+   if (grid_edit_sel(&a, &b) && b <= len && xs[a] >= 0.0f && xs[b] >= 0.0f)
+   {
+      float x0 = x + xs[a] - off;
+      float x1 = x + xs[b] - off;
+      if (x0 < x)
+         x0 = x;
+      if (x1 > x + max_w)
+         x1 = x + max_w;
+      if (x1 > x0)
+         grid_draw_rect(p_disp, userdata, width, height,
+               x0, cy - line_h * 0.5f, x1 - x0, line_h,
+               (COL_SELECT & 0xffffff00) | 0x90);
+   }
+
+   grid_flush_text(width, height);
+   if (p_disp->dispctx && p_disp->dispctx->scissor_begin)
+      gfx_display_scissor_begin(p_disp, userdata, width, height,
+            (int)x, (int)(ty - line_h * 1.1f),
+            (unsigned)max_w, (unsigned)(line_h * 1.6f));
+
+   grid_draw_text_from(false, shown, x - off, x, ty, width, height, color,
+         scale);
+   if (fmodf(cpu_features_get_time_usec() / 1000000.0f, 1.0f) < 0.5f)
+      grid_draw_text("|", x + xs[ptr] - off, ty, width, height, color,
+            TEXT_ALIGN_LEFT, scale);
+   grid_flush_text(width, height);
+
+   if (p_disp->dispctx && p_disp->dispctx->scissor_end)
+      p_disp->dispctx->scissor_end(userdata, width, height);
+
+   grid_hits_next.edit     = true;
+   grid_hits_next.edit_x   = x;
+   grid_hits_next.edit_w   = max_w;
+   grid_hits_next.edit_y   = cy - line_h;
+   grid_hits_next.edit_h   = 2.0f * line_h;
+   grid_hits_next.edit_x0  = x - off;
+   grid_hits_next.edit_len = len;
+}
+
+/* A text entry's prompt: what is asked over what's typed so far, in a
+ * dark rounded box like the message box. */
+static void grid_draw_text_prompt(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, const char *label, const char *text,
+      float cy)
+{
+   float ts     = CAP(GRID_TEXT_CAP);
+   float line_h = REF(17);
+   float pad    = REF(16);
+   float max_w  = width * 0.7f;
+   float tw     = grid_text_width(text, height, ts)
+                + grid_text_width("|", height, ts);
+   float w      = grid_text_width(label, height, ts);
+   float bx, tx;
+
+   if (w < REF(200))
+      w = REF(200);
+   if (tw > w)
+      w = tw;
+   if (w > max_w)
+      w = max_w;
+   if (tw > w)
+      tw = w;
+   bx = (width - w) / 2.0f;
+   tx = (width - tw) / 2.0f;
+
+   grid_draw_shape(p_disp, userdata, width, height,
+         bx - pad, cy - line_h - pad, w + 2.0f * pad, 2.0f * line_h + 2.0f * pad,
+         REF(12), 0x1c1c1ef0);
+   grid_draw_text(label, width / 2.0f,
+         grid_text_y(cy - line_h / 2.0f, height, ts), width, height,
+         COL_TEXT, TEXT_ALIGN_CENTER, ts);
+   grid_draw_edit(p_disp, userdata, width, height, text, tx,
+         cy + line_h / 2.0f, bx + w - tx, ts, COL_TEXT);
+}
+
+/* The letter printed on the face button that does a grid glyph's action.
+ * Glyphs name actions: "A" OK, "B" back, "X" the menu's scan, "Y" its
+ * search. Which button that is depends on player 1's binds: xinput's
+ * buttons 0-3 are A, B, X, Y; otherwise the RetroPad's buttons are named
+ * by position, as on an Xbox pad (RetroPad X, the top one, is "Y"). */
+static char grid_glyph_button(char glyph)
+{
+   static const char xinput[4] = { 'A', 'B', 'X', 'Y' };
+   bool swap = config_get_ptr()->bools.input_menu_swap_ok_cancel_buttons;
+   const input_device_driver_t *joypad = input_state_get_ptr()->primary_joypad;
+   unsigned id;
+   uint16_t joykey;
+
+   switch (glyph)
+   {
+      case 'A': id = swap ? RETRO_DEVICE_ID_JOYPAD_B : RETRO_DEVICE_ID_JOYPAD_A; break;
+      case 'B': id = swap ? RETRO_DEVICE_ID_JOYPAD_A : RETRO_DEVICE_ID_JOYPAD_B; break;
+      case 'X': id = RETRO_DEVICE_ID_JOYPAD_Y; break;
+      case 'Y': id = RETRO_DEVICE_ID_JOYPAD_X; break;
+      default:  return glyph;
+   }
+
+   joykey = input_config_binds[0][id].joykey;
+   if (joykey == NO_BTN)
+      joykey = input_autoconf_binds[0][id].joykey;
+   if (     joypad && joypad->ident && string_is_equal(joypad->ident, "xinput")
+         && joykey < 4)
+      return xinput[joykey];
+
+   switch (id)
+   {
+      case RETRO_DEVICE_ID_JOYPAD_A: return 'B';
+      case RETRO_DEVICE_ID_JOYPAD_B: return 'A';
+      case RETRO_DEVICE_ID_JOYPAD_X: return 'Y';
+      default:                       return 'X';
+   }
+}
+
+/* A controller button's round glyph, d across at (gx, gy): an action's
+ * button (see grid_glyph_button), a '+' or '-', or a short name ("L3"). */
+static void grid_draw_button_glyph(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, float gx, float gy, float d,
+      const char *glyph)
+{
+   grid_draw_rounded(p_disp, userdata, width, height,
+         gx, gy, d, d, d / 2.0f, COL_GLYPH);
+
+   if (glyph[0] && glyph[1])
+   {
+      /* Two letters: smaller, to fit side by side. */
+      float s = d * 0.36f / (height / 32.0f) / GRID_FONT_CAP;
+      grid_draw_text(glyph, gx + d / 2.0f,
+            grid_text_y(gy + d / 2.0f, height, s), width, height,
+            COL_TEXT_DARK, TEXT_ALIGN_CENTER, s);
+   }
+   else if (glyph[0] == '+' || glyph[0] == '-')
+   {
+      /* Drawn as bars ('+' two, '-' one): the font's symbols sit on the
+       * math axis, not centred. Reference: strokes 2px of 30, arms ~half
+       * the circle; whole pixels. */
+      float t   = floorf(d * 0.07f + 0.5f);
+      float len = 2.0f * floorf(d * 0.25f) + 1.0f;
+      if (t < 1.0f)
+         t = 1.0f;
+      grid_draw_rect(p_disp, userdata, width, height,
+            gx + floorf((d - len) / 2.0f), gy + floorf((d - t) / 2.0f),
+            len, t, COL_TEXT_DARK);
+      if (glyph[0] == '+')
+         grid_draw_rect(p_disp, userdata, width, height,
+               gx + floorf((d - t) / 2.0f), gy + floorf((d - len) / 2.0f),
+               t, len, COL_TEXT_DARK);
+   }
+   else
+      /* Letter cap height ~45% of the circle, so letters have the same
+       * visual size as the '+'. */
+      grid_draw_char_centered(false, grid_glyph_button(glyph[0]),
+            gx + d / 2.0f, gy + d / 2.0f, width, height, COL_TEXT_DARK,
+            d * 0.45f / (height / 32.0f) / GRID_FONT_CAP);
+}
+
+/* Round button glyph (e.g. "A") with its label to the right; in mouse and
+ * keyboard mode the key doing the same instead, the hint clickable.
+ * Returns the total width drawn. Draws nothing when measure_only. */
 static float grid_draw_hint(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height, float x, float cy,
       const char *glyph, const char *label, bool measure_only)
 {
    /* Reference: circle 15px, label 6px after it, label caps GRID_TEXT_CAP.
     * Odd pixel sizes so the circle has a centre pixel row/column and the
-    * symbol's strokes can sit exactly on it. */
+    * symbol's strokes can sit exactly on it. A key: a rounded box as tall,
+    * its name the size of the circle's letter. */
    float scale  = CAP(GRID_TEXT_CAP);
    float d      = 2.0f * floorf(REF(15) / 2.0f) + 1.0f;
    float gap    = REF(6);
    float lw     = grid_text_width(label, height, scale);
+   float ks     = d * 0.45f / (height / 32.0f) / GRID_FONT_CAP;
+   float gw     = d;
+   char key[32];
+
+   if (grid_st.kbm)
+   {
+      grid_glyph_key(glyph[0], key, sizeof(key));
+      gw = floorf(grid_text_width(key, height, ks) + 2.0f * REF(4) + 0.5f);
+      if (gw < d)
+         gw = d;
+   }
 
    if (!measure_only)
    {
       float gx = floorf(x + 0.5f);
       float gy = floorf(cy - d / 2.0f + 0.5f);
+      float hp = floorf(REF(4) + 0.5f);
+      float hw = floorf(gw + gap + lw + 2.0f * hp + 0.5f);
+      enum menu_action action = MENU_ACTION_NOOP;
 
-      grid_draw_rounded(p_disp, userdata, width, height,
-            gx, gy, d, d, d / 2.0f, COL_GLYPH);
-
-      if (glyph[0] == '+' || glyph[0] == '-')
+      switch (glyph[0])
       {
-         /* Drawn as bars ('+' two, '-' one): the font's symbols sit on the
-          * math axis, not centred. Reference: strokes about as thick as
-          * the letters' (3px of 40), arms ~half the circle. Odd sizes keep
-          * it on the centre pixel. */
-         float t   = 2.0f * floorf(d * 0.04f) + 1.0f;
-         float len = 2.0f * floorf(d * 0.25f) + 1.0f;
-         grid_draw_rect(p_disp, userdata, width, height,
-               gx + (d - len) / 2.0f, gy + (d - t) / 2.0f, len, t,
-               COL_TEXT_DARK);
-         if (glyph[0] == '+')
-            grid_draw_rect(p_disp, userdata, width, height,
-                  gx + (d - t) / 2.0f, gy + (d - len) / 2.0f, t, len,
-                  COL_TEXT_DARK);
+         case 'A': action = MENU_ACTION_OK;     break;
+         case 'B': action = MENU_ACTION_CANCEL; break;
+         case 'X': action = MENU_ACTION_SCAN;   break;
+         case 'Y': action = MENU_ACTION_SEARCH; break;
       }
-      else
-         /* Letter cap height ~45% of the circle, so letters have the same
-          * visual size as the '+'. */
-         grid_draw_char_centered(false, glyph[0], gx + d / 2.0f, gy + d / 2.0f,
-               width, height, COL_TEXT_DARK,
-               d * 0.45f / (height / 32.0f) / GRID_FONT_CAP);
+      grid_hit_add(gx - hp, gy - hp, hw, d + 2.0f * hp, HIT_NONE, 0, action);
+      if (grid_hover(gx - hp, gy - hp, hw, d + 2.0f * hp))
+         grid_draw_shape(p_disp, userdata, width, height,
+               gx - hp, gy - hp, hw, d + 2.0f * hp, (d + 2.0f * hp) / 2.0f,
+               COL_DIVIDER);
 
+      if (grid_st.kbm)
+      {
+         grid_draw_rounded(p_disp, userdata, width, height,
+               gx, gy, gw, d, floorf(d * 0.3f), COL_GLYPH);
+         grid_draw_text(key, gx + gw / 2.0f,
+               grid_text_y(gy + d / 2.0f, height, ks), width, height,
+               COL_TEXT_DARK, TEXT_ALIGN_CENTER, ks);
+         grid_draw_text(label, gx + gw + gap, grid_text_y(cy, height, scale),
+               width, height, COL_TEXT, TEXT_ALIGN_LEFT, scale);
+         return gw + gap + lw;
+      }
+
+      grid_draw_button_glyph(p_disp, userdata, width, height, gx, gy, d,
+            glyph);
       grid_draw_text(label, gx + d + gap, grid_text_y(cy, height, scale),
             width, height, COL_TEXT, TEXT_ALIGN_LEFT, scale);
    }
 
-   return d + gap + lw;
+   return gw + gap + lw;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -6046,6 +7261,9 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
                bool sel = grid_st.panel == PANEL_PROFILES
                      && k == grid_st.panel_sel;
 
+               if (grid_st.panel == PANEL_PROFILES)
+                  grid_hit_add(kx, y, d, d, HIT_PANEL, k, MENU_ACTION_OK);
+
                if (k == GRID_STRIP_EXIT)
                {
                   /* Held: the cursor turns into a red ring that fills
@@ -6153,6 +7371,10 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
          if (i == BAR_SEARCH)
             w = d + (open_w - d) * grid_st.search_open;
 
+         if (     grid_st.panel == PANEL_NONE
+               && !(i == BAR_PROFILE && grid_st.profile_open > 0.0f))
+            grid_hit_add(x, y, w, d, HIT_BAR, i, MENU_ACTION_OK);
+
          /* (Installs with its dot draws its own, notched.) */
          if (sel && !(i == BAR_UPDATES && grid_updates_available()))
             grid_draw_cursor(p_disp, userdata, width, height,
@@ -6222,29 +7444,19 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
                   float ts = CAP(GRID_TEXT_CAP);
                   float tx = x + d;
                   float tw = w - d - d / 2.0f;
-                  char text[160];
 
-                  if (typing)
-                  {
-                     /* Blinking caret while the keyboard is open. */
-                     bool caret = fmodf(cpu_features_get_time_usec()
-                           / 1000000.0f, 1.0f) < 0.5f;
-                     snprintf(text, sizeof(text), "%s%s", search,
-                           caret ? "|" : "");
-                  }
-                  else
-                     strlcpy(text, search, sizeof(text));
-
-                  if (string_is_empty(text) || string_is_equal(text, "|"))
-                  {
-                     grid_draw_text(string_is_empty(text) ? "Search games" : "|",
+                  /* Typing: with its caret (and selection). */
+                  if (string_is_empty(search))
+                     grid_draw_text("Search games",
                            tx, grid_text_y(row1, height, ts), width, height,
                            COL_TEXT_DIM, TEXT_ALIGN_LEFT, ts);
-                  }
-                  else if (tw > 0.0f)
+                  if (typing && tw > 0.0f)
+                     grid_draw_edit(p_disp, userdata, width, height, search,
+                           tx, row1, tw, ts, COL_TEXT);
+                  else if (!string_is_empty(search) && tw > 0.0f)
                   {
                      char fit[160];
-                     grid_fit_text(false, text, tw, height, ts,
+                     grid_fit_text(false, search, tw, height, ts,
                            fit, sizeof(fit));
                      grid_draw_text(fit, tx, grid_text_y(row1, height, ts),
                            width, height, COL_TEXT, TEXT_ALIGN_LEFT, ts);
@@ -6296,6 +7508,7 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
       {
          /* The tabs: the categories, or a game's Settings' four. */
          const char *names[GRID_SETTINGS_CAT_COUNT + 4];
+         unsigned cats[GRID_SETTINGS_CAT_COUNT + 4]; /* what a click opens */
          unsigned k, shown = 0, cur = 0;
          bool top      = !grid_st.cc_level
                        && grid_menu_depth() <= grid_settings_base();
@@ -6311,7 +7524,10 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
          if (grid_st.game_settings)
          {
             for (k = 0; k < 4; k++)
+            {
+               cats[shown]    = k;
                names[shown++] = grid_cc_bucket_name[k];
+            }
             cur = (unsigned)grid_st.cc_sub;
             top = grid_st.cc_level == 2;
          }
@@ -6321,6 +7537,7 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
                {
                   if (k == grid_st.settings_cat)
                      cur = shown;
+                  cats[shown]    = k;
                   names[shown++] = grid_settings_cats[k].name;
                }
 
@@ -6341,14 +7558,24 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
          x = floorf((width - total) / 2.0f + 0.5f);
          grid_draw_key(p_disp, userdata, width, height, 'L',
                x, gy, key_w, key_h);
+         grid_hit_add(x, floorf(row1 - pill_h / 2.0f + 0.5f), key_w, pill_h,
+               HIT_NONE, 0, MENU_ACTION_SCROLL_UP);
          x += key_w + gap;
 
          for (k = 0; k < shown; k++)
          {
             float nw = grid_text_width(names[k], height, ls);
+            float py = floorf(row1 - pill_h / 2.0f + 0.5f);
 
             if (k)
                x += cat_gap;
+            grid_hit_add(x, py, nw + 2.0f * pill_px, pill_h, HIT_CAT,
+                  cats[k], MENU_ACTION_NOOP);
+            /* Pointed at: a fainter pill. */
+            if (k != cur && grid_hover(x, py, nw + 2.0f * pill_px, pill_h))
+               grid_draw_shape(p_disp, userdata, width, height,
+                     x, py, nw + 2.0f * pill_px, pill_h, pill_h / 2.0f,
+                     0xffffff18);
             if (k == cur)
                grid_draw_shape(p_disp, userdata, width, height,
                      x, floorf(row1 - pill_h / 2.0f + 0.5f),
@@ -6362,6 +7589,9 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
 
          grid_draw_key(p_disp, userdata, width, height, 'R',
                floorf(x + gap + 0.5f), gy, key_w, key_h);
+         grid_hit_add(floorf(x + gap + 0.5f),
+               floorf(row1 - pill_h / 2.0f + 0.5f), key_w, pill_h,
+               HIT_NONE, 0, MENU_ACTION_SCROLL_DOWN);
          return;
       }
 
@@ -6403,6 +7633,9 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
       x -= gap + key_w;
       grid_draw_key(p_disp, userdata, width, height, 'R',
             floorf(x + 0.5f), gy, key_w, key_h);
+      /* (Clicking the key or its label does what the key does.) */
+      grid_hit_add(x, row1 - REF(10), width - side - x, REF(20),
+            HIT_NONE, 0, MENU_ACTION_SCROLL_DOWN);
 
       if (!con)
          return;
@@ -6424,6 +7657,8 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
       x -= gap + key_w;
       grid_draw_key(p_disp, userdata, width, height, 'L',
             floorf(x + 0.5f), gy, key_w, key_h);
+      grid_hit_add(x, row1 - REF(10), key_w + gap + cw + cgap + cnw, REF(20),
+            HIT_NONE, 0, MENU_ACTION_SCROLL_UP);
    }
 }
 
@@ -6710,6 +7945,10 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
 static void grid_draw_screen_heading(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height, const char **parts, unsigned count);
 
+/* A heading part being typed in: what follows its "Label: " is the line,
+ * drawn with its caret. NULL: none. */
+static const char *grid_heading_edit = NULL;
+
 /* Choosing a profile picture: its own screen like the art screen. "None"
  * (the profile's initial), then every downloaded game icon, as many per row
  * as fit. */
@@ -6759,6 +7998,7 @@ static void grid_draw_picker_screen(gfx_display_t *p_disp, void *userdata,
       float iy     = floorf(top + (i / cols - first_row) * (d + gap) + 0.5f);
       bool current = false;
 
+      grid_hit_add(ix, iy, d, d, HIT_PANEL, (unsigned)i, MENU_ACTION_OK);
       if (i == grid_st.panel_sel)
          grid_draw_cursor(p_disp, userdata, width, height,
                ix, iy, d, d, d / 2.0f);
@@ -7128,6 +8368,20 @@ static void grid_draw_game_drawer(gfx_display_t *p_disp, void *userdata,
             danger, grid_st.gm_sel, tx + tw + out - w, ty, n,
             col_w, item_h, tr, ca);
 
+      /* Its rows, once out. */
+      if (ca >= 1.0f && grid_st.panel == PANEL_GAME_MENU)
+      {
+         unsigned k;
+         for (k = 0; k < n; k++)
+         {
+            float rx, ry;
+            grid_menu_row_pos((float)k, n, col_w, item_h, height, &rx, &ry);
+            grid_hit_add(tx + tw + out - w + rx + GRID_MENU_PAD, ty + ry,
+                  col_w - 2.0f * GRID_MENU_PAD, item_h, HIT_PANEL, k,
+                  MENU_ACTION_OK);
+         }
+      }
+
       grid_flush_text(width, height);
       if (p_disp->dispctx && p_disp->dispctx->scissor_end)
          p_disp->dispctx->scissor_end(userdata, width, height);
@@ -7176,6 +8430,23 @@ static void grid_draw_screen_heading(gfx_display_t *p_disp, void *userdata,
          x += div_sp;
          grid_draw_divider(p_disp, userdata, width, height, x, cy);
          x += div_sp;
+      }
+      if (parts[k] == grid_heading_edit && strstr(parts[k], ": "))
+      {
+         /* "Label: " then the line being typed, to the screen's edge. */
+         char label[64];
+         size_t n = strstr(parts[k], ": ") - parts[k] + 2;
+         strlcpy(label, parts[k], n + 1 < sizeof(label) ? n + 1
+               : sizeof(label));
+         grid_draw_text_font(bold, label, x, y, width, height,
+               bold || one_line ? COL_TEXT : COL_TEXT_DIM, TEXT_ALIGN_LEFT,
+               ts);
+         x += grid_text_width_font(bold, label, height, ts);
+         grid_draw_edit(p_disp, userdata, width, height, parts[k] + n, x, cy,
+               width - x0 - x, ts, COL_TEXT);
+         x += grid_text_width_font(bold, parts[k] + n, height, ts);
+         first = false;
+         continue;
       }
       grid_draw_text_font(bold, parts[k], x, y, width, height,
             bold || one_line ? COL_TEXT : COL_TEXT_DIM, TEXT_ALIGN_LEFT, ts);
@@ -7298,6 +8569,8 @@ static void grid_draw_cheevos_screen(gfx_display_t *p_disp, void *userdata,
       if (!c)
          break;
 
+      grid_hit_add(cx, cy, card_w, card_h, HIT_PANEL, (unsigned)i,
+            MENU_ACTION_NOOP);
       if (i == grid_st.panel_sel)
          grid_draw_cursor(p_disp, userdata, width, height,
                cx, cy, card_w, card_h, REF(10));
@@ -7369,6 +8642,8 @@ static void grid_draw_downloads_screen(gfx_display_t *p_disp,
    static size_t first_row = 0;
    size_t i, shown;
    const char *search = grid_dl_search_text();
+   bool typing        = menu_input_dialog_get_display_kb()
+                     && grid_st.kb == KB_DOWNLOADS;
    float left         = REF(35);
    float top          = REF(70);
    float area_h       = REF(364) - top;
@@ -7400,12 +8675,14 @@ static void grid_draw_downloads_screen(gfx_display_t *p_disp,
       parts[np++] = "Checking...";
    else if (grid_updates_cores_failed())
       parts[np++] = "Couldn't reach the core server";
-   if (!string_is_empty(search))
+   if (!string_is_empty(search) || typing)
    {
       snprintf(search_part, sizeof(search_part), "Search: %s", search);
       parts[np++] = search_part;
    }
+   grid_heading_edit = typing ? search_part : NULL;
    grid_draw_screen_heading(p_disp, userdata, width, height, parts, np);
+   grid_heading_edit = NULL;
 
    if (!shown)
    {
@@ -7463,6 +8740,8 @@ static void grid_draw_downloads_screen(gfx_display_t *p_disp,
       char line[320], console[128];
       float kw, dw = 0.0f;
 
+      grid_hit_add(cx, cy, card_w, card_h, HIT_PANEL, (unsigned)i,
+            MENU_ACTION_OK);
       if (i == grid_st.panel_sel)
       {
          /* X held to remove: the cursor turns into a red ring that fills
@@ -7569,8 +8848,8 @@ static void grid_draw_downloads_screen(gfx_display_t *p_disp,
 /* First start: what Bomba needs and why, then a panel per service (its
  * name, what it gives, its fields, and its web page at the bottom, so
  * both panels line up) and Continue under them (see grid_setup_items).
- * Fields are typed into in place: while the keyboard covers the bottom
- * half, everything moves up to keep the field above it. */
+ * Fields are typed into in place (the on-screen keyboard shows the text
+ * in its own box). */
 static void grid_draw_setup_screen(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height)
 {
@@ -7588,12 +8867,9 @@ static void grid_draw_setup_screen(gfx_display_t *p_disp, void *userdata,
    float cpad        = REF(12);
    float ts          = CAP(GRID_TEXT_CAP);
    float ss          = CAP(GRID_TEXT_CAP - 2);
-   float shift       = 0.0f;
    float intro_y, panel_y, top, panel_h;
    bool typing       = menu_input_dialog_get_display_kb()
                     && grid_st.kb == KB_SETUP;
-   bool caret        = fmodf(cpu_features_get_time_usec() / 1000000.0f,
-                          1.0f) < 0.5f;
    const char *error = bomba_setup_error();
    const char *parts[1];
    char line[256];
@@ -7601,20 +8877,9 @@ static void grid_draw_setup_screen(gfx_display_t *p_disp, void *userdata,
    parts[0] = "Setup";
    grid_draw_screen_heading(p_disp, userdata, width, height, parts, 1);
 
-   /* While typing: the field just above the keyboard (it starts halfway
-    * down), if it would be under it. */
-   if (typing)
-      for (i = 0; i < n; i++)
-         if (items[i] == grid_st.setup_typing)
-         {
-            float bottom = REF(166) + row[i] * (card_h + rgap) + card_h;
-            if (bottom > REF(204))
-               shift = bottom - REF(204);
-         }
-
-   intro_y = REF(96) - shift;
-   panel_y = REF(124) - shift;
-   top     = REF(166) - shift;               /* first row of cards */
+   intro_y = REF(96);
+   panel_y = REF(124);
+   top     = REF(166);                       /* first row of cards */
    panel_h = top - panel_y + prows * (card_h + rgap) - rgap + ppad;
 
    /* What's needed, and why. */
@@ -7685,6 +8950,7 @@ static void grid_draw_setup_screen(gfx_display_t *p_disp, void *userdata,
       }
 
       mid = cy + card_h / 2.0f;
+      grid_hit_add(cx, cy, cw, card_h, HIT_PANEL, i, MENU_ACTION_OK);
       if (sel)
          grid_draw_cursor(p_disp, userdata, width, height,
                cx, cy, cw, card_h, REF(10));
@@ -7721,8 +8987,6 @@ static void grid_draw_setup_screen(gfx_display_t *p_disp, void *userdata,
       }
       else
          strlcpy(shown, value, sizeof(shown));
-      if (typing && grid_st.setup_typing == items[i] && caret)
-         strlcat(shown, "|", sizeof(shown));
 
       /* Empty and not being typed in: just the label, in the middle. */
       if (string_is_empty(shown)
@@ -7735,10 +8999,17 @@ static void grid_draw_setup_screen(gfx_display_t *p_disp, void *userdata,
 
       grid_draw_text(label, cx + cpad, grid_text_y(mid - REF(8), height, ss),
             width, height, COL_TEXT_DIM, TEXT_ALIGN_LEFT, ss);
-      grid_fit_text(false, shown, cw - 2.0f * cpad, height, ts,
-            fitted, sizeof(fitted));
-      grid_draw_text(fitted, cx + cpad, grid_text_y(mid + REF(7), height, ts),
-            width, height, COL_TEXT, TEXT_ALIGN_LEFT, ts);
+      if (typing && grid_st.setup_typing == items[i])
+         grid_draw_edit(p_disp, userdata, width, height, shown, cx + cpad,
+               mid + REF(7), cw - 2.0f * cpad, ts, COL_TEXT);
+      else
+      {
+         grid_fit_text(false, shown, cw - 2.0f * cpad, height, ts,
+               fitted, sizeof(fitted));
+         grid_draw_text(fitted, cx + cpad,
+               grid_text_y(mid + REF(7), height, ts),
+               width, height, COL_TEXT, TEXT_ALIGN_LEFT, ts);
+      }
    }
 
    /* Why the login failed, under Continue. */
@@ -7841,6 +9112,8 @@ static void grid_draw_art_screen(gfx_display_t *p_disp, void *userdata,
       float y = floorf(top + (i / cols - first_row) * (cell_h + gap) + 0.5f);
       const char *thumb = grid_cover_choice_thumb(i);
 
+      grid_hit_add(x, y, cell_w, cell_h, HIT_PANEL, (unsigned)i,
+            MENU_ACTION_OK);
       if (i == grid_st.panel_sel)
          grid_draw_cursor(p_disp, userdata, width, height,
                x, y, cell_w, cell_h, radius);
@@ -7894,20 +9167,189 @@ static void grid_draw_art_screen(gfx_display_t *p_disp, void *userdata,
    }
 }
 
-/* On-screen keyboard while searching (physical keyboards type directly). */
+/* On-screen keyboard (gamepad mode), like a console's: what's typed in a
+ * box at the top, the keys (see grid_osk_key_at) on a dark panel below
+ * and the buttons' hints under them. */
 static void grid_draw_keyboard(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height)
 {
-   input_driver_state_t *input_st = input_state_get_ptr();
+   static const int specials[] = {
+      OSK_BACKSPACE, OSK_CANCEL, OSK_OK, OSK_SHIFT, OSK_SYMBOLS, OSK_SPACE
+   };
+   /* (The keys with a button of their own show it in their corner.) */
+   static const char *hint_glyphs[] = { "L3", "A" };
+   static const char *hint_labels[] = { "Shift", "Select" };
+   /* Reference: 11 key columns 56px apart and a 69px column right of
+    * them, rows 38px apart from y 196, on a panel from y 159; the text box
+    * above, inset 38px from the keys' sides. */
+   float px      = REF(56.4f);
+   float py      = REF(37.6f);
+   float gap     = floorf(REF(3) + 0.5f);
+   float right_w = REF(69);
+   float keys_w  = (GRID_OSK_COLS - 1) * px + right_w;
+   float x0      = floorf((width - keys_w) / 2.0f + 0.5f);
+   float top     = REF(196);
+   float panel_y = REF(159);
+   float r       = REF(3);
+   float ts      = CAP(GRID_TEXT_CAP);
+   float ss      = CAP(GRID_TEXT_CAP - 2);
+   /* Characters big on their keys, caps about 40% of the key (as on a
+    * console's keyboard); named keys at the menu's text size. */
+   float cs      = CAP(13);
+   float sel_x = 0.0f, sel_y = 0.0f, sel_w = 0.0f, sel_h = 0.0f;
+   float bx      = x0 + REF(38);
+   float bw      = keys_w - 2.0f * REF(38);
+   float by      = REF(31);
+   float bh      = REF(103);
+   float pad     = REF(14);
+   int sel       = grid_osk_key_at(grid_st.osk_row, grid_st.osk_col);
+   const char *label = menu_state_get_ptr()->input_dialog_kb_label;
+   const char *buf   = menu_input_dialog_get_buffer();
+   bool password     = false;
+   char shown[GRID_EDIT_MAX + 1];
+   float hints_w = 0.0f, hx;
+   unsigned k;
 
-   /* Dim the screen behind the keyboard. */
+   grid_osk_prepare();
+
+   /* Setup's fields are named by the field. */
+   if (grid_st.kb == KB_SETUP)
+   {
+      label    = grid_st.setup_typing == SETUP_KEY ? "API key"
+               : grid_st.setup_typing == SETUP_USER ? "Username" : "Password";
+      password = grid_st.setup_typing == SETUP_PASS;
+   }
+   if (!buf)
+      buf = "";
+   if (password)
+   {
+      size_t len = strlen(buf);
+      if (len >= sizeof(shown))
+         len = sizeof(shown) - 1;
+      memset(shown, '*', len);
+      shown[len] = '\0';
+   }
+   else
+      strlcpy(shown, buf, sizeof(shown));
+
+   /* The screen dimmed; the typed text in its box. */
+   grid_draw_rect(p_disp, userdata, width, height, 0, 0, width, height,
+         0x000000b0);
+   grid_draw_rounded(p_disp, userdata, width, height, bx, by, bw, bh,
+         REF(10), 0x232325ff);
+   if (!string_is_empty(label))
+      grid_draw_text(label, bx + pad, grid_text_y(by + REF(16), height, ss),
+            width, height, COL_TEXT_DIM, TEXT_ALIGN_LEFT, ss);
+   grid_draw_edit(p_disp, userdata, width, height, shown, bx + pad,
+         by + REF(36), bw - 2.0f * pad, ts, COL_TEXT);
+
    grid_draw_rect(p_disp, userdata, width, height,
-         0, height * 0.5f, width, height * 0.5f, 0x000000c0);
+         0, panel_y, width, height - panel_y, 0x18181aff);
 
-   grid_flush_text(width, height);
-   gfx_display_draw_keyboard(p_disp, userdata, width, height,
-         grid_st.disc, grid_font(false, 1.0f, height), input_st->osk_grid,
-         input_st->osk_ptr, 0xffffffff);
+   for (k = 0; k < BOMBA_KEYMAP_KEYS + ARRAY_SIZE(specials); k++)
+   {
+      int id   = k < BOMBA_KEYMAP_KEYS ? (int)k
+               : specials[k - BOMBA_KEYMAP_KEYS];
+      int col  = id % BOMBA_KEYMAP_COLS, row = id / BOMBA_KEYMAP_COLS;
+      int cols = 1, rows = 1;
+      uint32_t bg = 0x2e2e31ff, fg = COL_TEXT;
+      float x, y, w, h;
+
+      switch (id)
+      {
+         case OSK_BACKSPACE: col = 11; row = 0;            break;
+         case OSK_CANCEL:    col = 11; row = 1; rows = 2;  break;
+         case OSK_OK:        col = 11; row = 3; rows = 2;  break;
+         case OSK_SHIFT:     col = 0;  row = 4;            break;
+         case OSK_SYMBOLS:   col = 1;  row = 4;            break;
+         case OSK_SPACE:     col = 2;  row = 4; cols = 9;  break;
+         default:                                          break;
+      }
+      x = floorf(x0 + col * px + 0.5f);
+      y = floorf(top + row * py + 0.5f);
+      w = floorf((col == GRID_OSK_COLS - 1 ? right_w : cols * px) - gap + 0.5f);
+      h = floorf(rows * py - gap + 0.5f);
+
+      if (id >= OSK_BACKSPACE)
+         bg = 0x232326ff;
+      if (id == OSK_OK)
+         bg = COL_SELECT;
+      if (     (id == OSK_SHIFT && grid_st.osk_shift)
+            || (id == OSK_SYMBOLS && grid_st.osk_symbols))
+         bg = 0x48484cff;
+
+      /* (Its ring goes on last, over the keys round it.) */
+      if (id == sel)
+      {
+         sel_x = x;
+         sel_y = y;
+         sel_w = w;
+         sel_h = h;
+      }
+      grid_draw_rounded(p_disp, userdata, width, height, x, y, w, h, r, bg);
+
+      switch (id)
+      {
+         case OSK_BACKSPACE:
+            grid_icon_draw(p_disp, userdata, width, height,
+                  &grid_st.icon_backspace, x + w / 2.0f, y + h / 2.0f,
+                  h * 0.72f, fg);
+            break;
+         case OSK_SHIFT:
+            grid_icon_draw(p_disp, userdata, width, height,
+                  &grid_st.icon_shift, x + w / 2.0f, y + h / 2.0f,
+                  h * 0.62f, fg);
+            break;
+         case OSK_CANCEL:
+         case OSK_SYMBOLS:
+         case OSK_SPACE:
+            grid_draw_text(id == OSK_CANCEL ? "Cancel"
+                  : id == OSK_SPACE ? "Space"
+                  : grid_st.osk_symbols ? "ABC" : "#+=",
+                  x + w / 2.0f, grid_text_y(y + h / 2.0f, height, ts),
+                  width, height, fg, TEXT_ALIGN_CENTER, ts);
+            break;
+         case OSK_OK:
+            grid_draw_text("OK", x + w / 2.0f,
+                  grid_text_y(y + h / 2.0f, height, ts), width, height,
+                  0xffffffff, TEXT_ALIGN_CENTER, ts);
+            break;
+         default:
+            grid_draw_text(grid_osk_label(id), x + w / 2.0f,
+                  grid_text_y(y + h / 2.0f, height, cs), width, height,
+                  fg, TEXT_ALIGN_CENTER, cs);
+            break;
+      }
+
+      /* A key with a button of its own shows it in its top-right
+       * corner. */
+      {
+         /* (As actions: Space is on the scan button, Cancel on search.) */
+         const char *btn = id == OSK_BACKSPACE ? "B"
+                         : id == OSK_SPACE ? "X" : id == OSK_OK ? "+"
+                         : id == OSK_CANCEL ? "Y" : NULL;
+         if (btn)
+         {
+            float bd = 2.0f * floorf(REF(11) / 2.0f) + 1.0f;
+            grid_draw_button_glyph(p_disp, userdata, width, height,
+                  floorf(x + w - bd - REF(4) + 0.5f),
+                  floorf(y + REF(4) + 0.5f), bd, btn);
+         }
+      }
+   }
+
+   if (sel_w > 0.0f)
+      grid_draw_cursor(p_disp, userdata, width, height,
+            sel_x, sel_y, sel_w, sel_h, r);
+
+   /* The buttons, right-aligned under the keys. */
+   for (k = 0; k < ARRAY_SIZE(hint_glyphs); k++)
+      hints_w += (k ? REF(19) : 0.0f) + grid_draw_hint(p_disp, userdata,
+            width, height, 0, REF(402), hint_glyphs[k], hint_labels[k], true);
+   hx = x0 + keys_w - gap - hints_w;
+   for (k = 0; k < ARRAY_SIZE(hint_glyphs); k++)
+      hx += grid_draw_hint(p_disp, userdata, width, height, hx, REF(402),
+            hint_glyphs[k], hint_labels[k], false) + REF(19);
 }
 
 /* Copies text to out, cut to fit max_w with "..." when too wide. Never
@@ -8304,6 +9746,7 @@ static void grid_draw_cc_screen(gfx_display_t *p_disp, void *userdata,
       float label_w;
       int bind_id        = -1;      /* a Bindings row: its control */
 
+      grid_hit_add(left, ry, list_w, rh, HIT_CC, i, MENU_ACTION_OK);
       if (i == sel && !(  !listing && rows[i].kind == CC_ROW_NOTE))
       {
          grid_draw_cursor(p_disp, userdata, width, height,
@@ -8383,6 +9826,11 @@ static void grid_draw_cc_screen(gfx_display_t *p_disp, void *userdata,
                fit, sizeof(fit));
          grid_draw_cycle_value(fit, left + list_w - pad, box_w, ty,
                i == sel, value_col, width, height, ts);
+         /* Its "<" and ">": back and on (as left / right). */
+         grid_hit_add(left + list_w - pad - box_w, ry, REF(22), rh, HIT_CC,
+               i, MENU_ACTION_LEFT);
+         grid_hit_add(left + list_w - pad - REF(22), ry, REF(22) + pad, rh,
+               HIT_CC, i, MENU_ACTION_RIGHT);
       }
       else if (value)
          grid_draw_text(value, left + list_w - pad, ty, width, height,
@@ -8692,6 +10140,8 @@ static void grid_draw_settings_screen(gfx_display_t *p_disp, void *userdata,
          break;
       y += slot_h;
       kb = grid_row_keybind(list, i, &kb_port);
+      grid_hit_add(left, ry, list_w, rh, HIT_MENU, (unsigned)i,
+            MENU_ACTION_OK);
 
       MENU_ENTRY_INITIALIZE(entry);
       entry.flags |= MENU_ENTRY_FLAG_PATH_ENABLED
@@ -8906,6 +10356,10 @@ bool grid_home_frame(video_frame_info_t *video_info)
                                  && grid_st.panel != PANEL_ICONS
                                  && grid_st.panel != PANEL_UPDATES
                                  && grid_st.panel != PANEL_SETUP;
+
+   /* What the mouse can point at is recorded afresh as it's drawn. */
+   grid_hits_next.count = 0;
+   grid_hits_next.edit  = false;
 
    /* Point saves at the current profile (once). */
    grid_profile_init();
@@ -9144,6 +10598,10 @@ bool grid_home_frame(video_frame_info_t *video_info)
          if (x + tile_w < 0.0f || x > width)
             continue;
 
+         if (grid_st.panel == PANEL_NONE)
+            grid_hit_add(x, y, tile_w, tile_h, HIT_TILE, (unsigned)i,
+                  MENU_ACTION_OK);
+
          if (!game->art_tried)
          {
             game->art_tried = true;
@@ -9260,25 +10718,29 @@ bool grid_home_frame(video_frame_info_t *video_info)
 
    if (menu_input_dialog_get_display_kb())
    {
-      /* A setting's text entry: what is asked and what's typed so far,
-       * over the keyboard (the grid's own prompts show in place). */
-      if (grid_st.kb == KB_MENU)
+      /* Mouse and keyboard mode: a setting's text entry or a profile's
+       * name asks in the middle of the screen (the grid's other fields are
+       * typed into in place). Gamepad mode: the on-screen keyboard, with
+       * its own box for the text. */
+      if (grid_st.kbm)
       {
-         char prompt[sizeof(grid_st.box_msg)];
-         const char *buf = menu_input_dialog_get_buffer();
-         snprintf(prompt, sizeof(prompt), "%s\n%s",
-               menu_state_get_ptr()->input_dialog_kb_label,
-               buf ? buf : "");
-         grid_draw_rect(p_disp, userdata, width, height,
-               0, 0, width, height * 0.5f, 0x00000090);
-         grid_draw_message_box(p_disp, userdata, width, height,
-               prompt, height * 0.25f);
+         if (grid_st.kb == KB_MENU || grid_st.kb == KB_PROFILE_NAME)
+         {
+            const char *buf = menu_input_dialog_get_buffer();
+            grid_draw_rect(p_disp, userdata, width, height,
+                  0, 0, width, height, 0x00000090);
+            grid_draw_text_prompt(p_disp, userdata, width, height,
+                  menu_state_get_ptr()->input_dialog_kb_label,
+                  buf ? buf : "", height * 0.5f);
+         }
       }
-      grid_draw_keyboard(p_disp, userdata, width, height);
+      else
+         grid_draw_keyboard(p_disp, userdata, width, height);
    }
 
    grid_flush_text(width, height);
 
+   grid_hits = grid_hits_next;
    return true;
 }
 
@@ -9329,6 +10791,10 @@ void grid_home_context_reset(bool is_threaded)
       grid_icon_load(&grid_st.icon_trophy, path);
       fill_pathname_join_special(path, icons, "download.png", sizeof(path));
       grid_icon_load(&grid_st.icon_download, path);
+      fill_pathname_join_special(path, icons, "backspace.png", sizeof(path));
+      grid_icon_load(&grid_st.icon_backspace, path);
+      fill_pathname_join_special(path, icons, "shift.png", sizeof(path));
+      grid_icon_load(&grid_st.icon_shift, path);
    }
 }
 
@@ -9354,6 +10820,8 @@ void grid_home_context_destroy(void)
    grid_icon_free(&grid_st.icon_search);
    grid_icon_free(&grid_st.icon_trophy);
    grid_icon_free(&grid_st.icon_download);
+   grid_icon_free(&grid_st.icon_backspace);
+   grid_icon_free(&grid_st.icon_shift);
 
    if (grid_st.disc)
       video_driver_texture_unload(&grid_st.disc);
