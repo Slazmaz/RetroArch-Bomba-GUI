@@ -1324,6 +1324,11 @@ static retro_time_t grid_close_usec(void)
    return grid_st.loading == LOADING_OUT ? GRID_LOADING_USEC : GRID_CLOSE_USEC;
 }
 
+#ifdef HAVE_MIST
+/* steam/steam.c (steam.h needs mist's headers). */
+void steam_set_game_title(const char *path, const char *title);
+#endif
+
 #ifdef _WIN32
 /* (kernel32; windows.h isn't included here.) */
 __declspec(dllimport) int __stdcall SetEnvironmentVariableA(
@@ -1350,6 +1355,10 @@ static void grid_launch_now(void)
    grid_controls_apply(game->system, game->core_path, game->path);
    /* A multiplayer host's guests start it too, once it runs. */
    bomba_steamnet_set_game(game->system, game->title);
+#ifdef HAVE_MIST
+   /* Steam shows friends this name, not the file's. */
+   steam_set_game_title(game->path, game->title);
+#endif
 
    task_push_load_content_with_new_core_from_menu(
          game->core_path, game->path, &content_info,

@@ -2163,7 +2163,9 @@ static DWORD WINAPI manager_main(LPVOID unused)
          ov.suspended = false;
          log_msg("core running again: Eden resumed");
       }
-      else if (stalled && ov.suspend)
+      /* Not in multiplayer: a suspended Eden stops answering the room, and
+       * the other players' games drop it (communication error). */
+      else if (stalled && ov.suspend && !mp.active)
       {
          /* Minimized: hide Eden first, its window can't be handled while
           * suspended. */
