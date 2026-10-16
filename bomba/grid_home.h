@@ -24,6 +24,12 @@ void grid_home_iterate(void);
 /* Handles a menu action. Returns true if consumed. */
 bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth);
 
+/* Whether OK should act as it goes down: on the grid's own screens, which
+ * don't use RetroArch's list (and Exit is held). RetroArch acts on its
+ * release for some list entries (Resume, save states...); the list
+ * hidden under the grid while a game runs may sit on one. */
+bool grid_home_ok_on_press(void);
+
 /* Mouse and keyboard mode: the mouse or keyboard was used last, not a
  * controller. The pointer shows and the on-screen keyboard doesn't. */
 bool grid_home_kbm(void);

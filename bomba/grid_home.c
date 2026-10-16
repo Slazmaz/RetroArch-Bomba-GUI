@@ -3510,8 +3510,18 @@ static void grid_panel_action(enum menu_action action)
                if (!grid_content_running())
                   grid_start_profile_name();
             }
-            else if (grid_profile_select(p))
-               grid_st.panel = PANEL_NONE;
+            else if (grid_content_running() && p == grid_profile_current())
+               grid_st.panel = PANEL_NONE; /* already on it: keep playing */
+            else
+            {
+               /* Another profile: close the game first (its saves are
+                * open in this profile's folders). */
+               if (grid_content_running())
+                  action_ok_close_content(NULL, NULL,
+                        MENU_SETTING_ACTION_CLOSE, 0, 0);
+               if (grid_profile_select(p))
+                  grid_st.panel = PANEL_NONE;
+            }
             break;
          /* The face buttons are labelled as on the player's controller:
           * "X" is the menu's scan action, "Y" its search action. */
@@ -3800,6 +3810,11 @@ static void grid_action_sound(enum menu_action action)
       default:
          break;
    }
+}
+
+bool grid_home_ok_on_press(void)
+{
+   return !grid_settings_shown();
 }
 
 bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth)
@@ -7541,8 +7556,11 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
                grid_draw_text(label, lx + lpad, grid_text_y(lcy, height, ls),
                      width, height, COL_TEXT, TEXT_ALIGN_LEFT, ls);
 
-               if (grid_content_running() && s != GRID_STRIP_EXIT)
-                  grid_draw_text("Close the running game to switch profiles",
+               if (     grid_content_running() && s != GRID_STRIP_EXIT
+                     && s - GRID_STRIP_FIRST != grid_profile_current())
+                  grid_draw_text(s - GRID_STRIP_FIRST < grid_profile_count()
+                        ? "Switching closes the running game"
+                        : "Close the running game to add profiles",
                         x0 - pad, grid_text_y(lcy + lh, height, ls),
                         width, height, COL_TEXT_DIM, TEXT_ALIGN_LEFT, ls);
             }
@@ -7952,7 +7970,7 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
       {
          glyphs[n] = "A"; labels[n++] = "Hold to exit";
       }
-      else if (!running)
+      else if (!running || !on_add)
       {
          glyphs[n] = "A"; labels[n++] = on_add ? "Add" : "Select";
       }
