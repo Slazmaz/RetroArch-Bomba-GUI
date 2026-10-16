@@ -954,6 +954,11 @@ void video_driver_apply_state_changes(void);
 
 void video_driver_cached_frame(void);
 
+/* Bomba: while set, frames are drawn but not shown (the GL driver skips
+ * its swap), so a screenshot can draw the game alone and read it back
+ * while the menu stays on screen. */
+extern bool video_driver_bomba_hold_present;
+
 bool video_driver_is_hw_context(void);
 
 struct retro_hw_render_callback *video_driver_get_hw_context(void);

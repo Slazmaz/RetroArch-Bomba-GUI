@@ -54,6 +54,9 @@
 #include "../paths.h"
 #include "../msg_hash.h"
 #include "../runloop.h"
+#ifdef HAVE_MENU
+#include "../menu/menu_driver.h"
+#endif
 
 #include "tasks_internal.h"
 
@@ -553,15 +556,31 @@ static bool take_screenshot_choice(
 {
    if (supports_vp_read)
    {
+      bool ret;
+#ifdef HAVE_MENU
+      /* Bomba: with the menu up (closing a game saves its state, with this
+       * picture), the game alone is drawn to be read but not shown, so the
+       * menu stays on screen while the state saves; the menu draws again
+       * after. */
+      bool menu_up = (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE)
+         ? true : false;
+      video_driver_bomba_hold_present = menu_up;
+#endif
       /* Avoid taking screenshot of GUI overlays. */
       if (video_st->poke && video_st->poke->set_texture_enable)
          video_st->poke->set_texture_enable(video_st->data,
                false, false);
       if (!(runloop_flags & RUNLOOP_FLAG_IDLE))
          video_driver_cached_frame();
-      return take_screenshot_viewport(screenshot_dir,
+      ret = take_screenshot_viewport(screenshot_dir,
             name_base, savestate, runloop_flags, fullpath, use_thread,
             pixel_format_type);
+#ifdef HAVE_MENU
+      video_driver_bomba_hold_present = false;
+      if (menu_up && video_st->poke && video_st->poke->set_texture_enable)
+         video_st->poke->set_texture_enable(video_st->data, true, false);
+#endif
+      return ret;
    }
 
    if (!has_valid_framebuffer)

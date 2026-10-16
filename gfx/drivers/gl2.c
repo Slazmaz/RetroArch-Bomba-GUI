@@ -146,6 +146,25 @@ static bool gl2_bomba_transparent(void)
    return GetPropA(hwnd, "BombaTransparent") != NULL;
 }
 
+/* How opaque the black over the program still is (0..1): the core sets
+ * "BombaFade" to the tick it went see-through (its loading screen had
+ * faded to black), and the black fades off over GL2_BOMBA_FADE_MS. */
+#define GL2_BOMBA_FADE_MS 150
+static float gl2_bomba_fade(void)
+{
+   HWND hwnd = win32_get_window();
+   DWORD start, t;
+
+   if (!hwnd || !(start = (DWORD)(uintptr_t)GetPropA(hwnd, "BombaFade")))
+      return 0.0f;
+   if ((t = GetTickCount() - start) >= GL2_BOMBA_FADE_MS)
+   {
+      RemovePropA(hwnd, "BombaFade");
+      return 0.0f;
+   }
+   return 1.0f - (float)t / GL2_BOMBA_FADE_MS;
+}
+
 static void gl2_bomba_release(void)
 {
    HWND hwnd = win32_get_window();
@@ -157,6 +176,7 @@ static void gl2_bomba_release(void)
 }
 #else
 #define gl2_bomba_transparent() false
+#define gl2_bomba_fade() 0.0f
 #define gl2_bomba_release()
 #endif
 
@@ -3628,7 +3648,8 @@ static bool gl2_frame(void *data, const void *frame,
          gl2_renderchain_bind_backbuffer();
          gl2_set_viewport(gl, width, height, false, true, video_scale_integer);
       }
-      glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+      /* (Premultiplied: black at the fade's opacity.) */
+      glClearColor(0.0f, 0.0f, 0.0f, gl2_bomba_fade());
       glClear(GL_COLOR_BUFFER_BIT);
    }
    else
@@ -3733,7 +3754,8 @@ static bool gl2_frame(void *data, const void *frame,
 #endif
             gl2_pbo_async_readback(gl);
 
-    if (gl->ctx_driver->swap_buffers)
+    /* Bomba: not shown while held (see video_driver_bomba_hold_present). */
+    if (gl->ctx_driver->swap_buffers && !video_driver_bomba_hold_present)
         gl->ctx_driver->swap_buffers(gl->ctx_data);
 
  /* Emscripten has to do black frame insertion in its main loop */
@@ -3742,6 +3764,7 @@ static bool gl2_frame(void *data, const void *frame,
     * and pause to prevent flicker. */
    if (
          video_info->black_frame_insertion
+         && !video_driver_bomba_hold_present
          && !video_info->input_driver_nonblock_state
          && !video_info->runloop_is_slowmotion
          && !video_info->runloop_is_paused
@@ -3793,6 +3816,7 @@ static bool gl2_frame(void *data, const void *frame,
    if (     (gl->flags & GL2_FLAG_HAVE_SYNC)
          &&  hard_sync
          &&  !input_driver_nonblock_state
+         &&  !video_driver_bomba_hold_present
          )
    {
       glClear(GL_COLOR_BUFFER_BIT);

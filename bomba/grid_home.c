@@ -92,6 +92,10 @@
 #define GRID_MAX_TABS  24
 #define GRID_ROWS_DEFAULT 2 /* rows per column; Select (Zoom) cycles 1-4 */
 #define GRID_ZOOM_USEC 250000 /* zoom animation length */
+#define GRID_OPEN_USEC  260000 /* the menu fading in over a game */
+#define GRID_CLOSE_USEC 200000 /* ...and out when it closes */
+#define GRID_OSK_OPEN_USEC  220000 /* on-screen keyboard sliding in */
+#define GRID_OSK_CLOSE_USEC 150000 /* ...and out */
 /* The layout is measured from a 752x423 reference screen. REF(px)
  * converts a reference pixel length to this screen; CAP(px) gives the
  * font scale whose capital letters are px reference pixels tall
@@ -535,6 +539,9 @@ static struct
    bool gm_open, gm_closing;
    retro_time_t gm_start;
    unsigned gm_sel;         /* its selected row, kept while it closes */
+   /* When the menu opened over a game (it fades in) or closed back to it
+    * (it fades out), 0 not fading. */
+   retro_time_t open_start, close_start;
    enum grid_choice_kind art_kind;
    size_t art_count;        /* previews the textures below were made for */
    unsigned art_cols;       /* previews per row, as last laid out */
@@ -744,13 +751,17 @@ int action_ok_close_content(const char *path, const char *label,
 /* Helpers                                                                */
 /* ---------------------------------------------------------------------- */
 
+/* Opacity of everything drawn this frame (the menu fading in), applied by
+ * grid_set_color and to text. 1 outside the grid's frame. */
+static float grid_alpha = 1.0f;
+
 static void grid_set_color(float *dst, uint32_t rgba)
 {
    int i;
    float r = ((rgba >> 24) & 0xff) / 255.0f;
    float g = ((rgba >> 16) & 0xff) / 255.0f;
    float b = ((rgba >>  8) & 0xff) / 255.0f;
-   float a = ( rgba        & 0xff) / 255.0f;
+   float a = ( rgba        & 0xff) / 255.0f * grid_alpha;
 
    for (i = 0; i < 4; i++)
    {
@@ -1499,12 +1510,19 @@ void grid_home_toggle(bool menu_on)
 
    /* Fresh snapshot of the game each time the menu opens: forget the old
     * one so it is captured again. */
-   if (string_is_equal(grid_st.bg_key, GRID_BG_GAME))
+   if (menu_on && string_is_equal(grid_st.bg_key, GRID_BG_GAME))
       grid_st.bg_key[0] = '\0';
 
    /* The game menu animates afresh, not finishing an old open or close. */
    grid_st.gm_open    = false;
    grid_st.gm_closing = false;
+
+   /* Opening over a game: the menu fades in over it; closing back to it,
+    * out. */
+   grid_st.open_start  = (menu_on && grid_content_running())
+      ? cpu_features_get_time_usec() : 0;
+   grid_st.close_start = (!menu_on && grid_content_running())
+      ? cpu_features_get_time_usec() : 0;
 
    /* Controllers are looked at afresh (what is held as the menu opens
     * isn't a new press); leaving it, the pointer is as RetroArch has it,
@@ -5421,6 +5439,9 @@ static void grid_draw_text_font(bool bold, const char *text,
 
    if (!font)
       return;
+   if (grid_alpha < 1.0f)
+      color = (color & 0xffffff00)
+         | (uint32_t)((color & 0xff) * grid_alpha + 0.5f);
 
    /* Whole-pixel origin keeps glyphs crisp at native size. */
    gfx_display_draw_text(font, text, floorf(x + 0.5f), floorf(y + 0.5f),
@@ -9167,12 +9188,45 @@ static void grid_draw_art_screen(gfx_display_t *p_disp, void *userdata,
    }
 }
 
+/* On-screen keyboard's slide this frame: how far in it is (0 gone .. 1
+ * in), easing out as it opens and in as it closes, and turning back from
+ * wherever it is if it's reopened or closed midway. */
+static float grid_osk_anim(bool open)
+{
+   static bool was_open;
+   static float from, last;
+   static retro_time_t start;
+   retro_time_t now = cpu_features_get_time_usec();
+   float p, q;
+
+   if (open != was_open)
+   {
+      was_open = open;
+      from     = last;
+      start    = now;
+   }
+   p = grid_clamp01((float)(now - start)
+         / (open ? GRID_OSK_OPEN_USEC : GRID_OSK_CLOSE_USEC));
+   if (open)
+   {
+      q    = 1.0f - p;
+      last = from + (1.0f - from) * (1.0f - q * q * q);
+   }
+   else
+      last = from * (1.0f - p * p);
+   return last;
+}
+
 /* On-screen keyboard (gamepad mode), like a console's: what's typed in a
  * box at the top, the keys (see grid_osk_key_at) on a dark panel below
- * and the buttons' hints under them. */
+ * and the buttons' hints under them. shown: how far in it is (it slides
+ * in, box from the top and keys from the bottom); live: open now, else
+ * closing, showing what it last did. */
 static void grid_draw_keyboard(gfx_display_t *p_disp, void *userdata,
-      unsigned width, unsigned height)
+      unsigned width, unsigned height, float shown_t, bool live)
 {
+   static char last_label[128];
+   static char last_shown[GRID_EDIT_MAX + 1];
    static const int specials[] = {
       OSK_BACKSPACE, OSK_CANCEL, OSK_OK, OSK_SHIFT, OSK_SYMBOLS, OSK_SPACE
    };
@@ -9208,33 +9262,53 @@ static void grid_draw_keyboard(gfx_display_t *p_disp, void *userdata,
    bool password     = false;
    char shown[GRID_EDIT_MAX + 1];
    float hints_w = 0.0f, hx;
+   float hint_y;
    unsigned k;
 
    grid_osk_prepare();
 
-   /* Setup's fields are named by the field. */
-   if (grid_st.kb == KB_SETUP)
+   if (live)
    {
-      label    = grid_st.setup_typing == SETUP_KEY ? "API key"
-               : grid_st.setup_typing == SETUP_USER ? "Username" : "Password";
-      password = grid_st.setup_typing == SETUP_PASS;
-   }
-   if (!buf)
-      buf = "";
-   if (password)
-   {
-      size_t len = strlen(buf);
-      if (len >= sizeof(shown))
-         len = sizeof(shown) - 1;
-      memset(shown, '*', len);
-      shown[len] = '\0';
+      /* Setup's fields are named by the field. */
+      if (grid_st.kb == KB_SETUP)
+      {
+         label    = grid_st.setup_typing == SETUP_KEY ? "API key"
+                  : grid_st.setup_typing == SETUP_USER ? "Username" : "Password";
+         password = grid_st.setup_typing == SETUP_PASS;
+      }
+      if (!buf)
+         buf = "";
+      if (password)
+      {
+         size_t len = strlen(buf);
+         if (len >= sizeof(shown))
+            len = sizeof(shown) - 1;
+         memset(shown, '*', len);
+         shown[len] = '\0';
+      }
+      else
+         strlcpy(shown, buf, sizeof(shown));
+      /* Kept to show while it slides out. */
+      strlcpy(last_label, label ? label : "", sizeof(last_label));
+      strlcpy(last_shown, shown, sizeof(last_shown));
    }
    else
-      strlcpy(shown, buf, sizeof(shown));
+      strlcpy(shown, last_shown, sizeof(shown));
+   label = last_label;
+
+   /* Sliding: the keys up from below the screen, the box down from above
+    * it. */
+   {
+      float drop = floorf((1.0f - shown_t) * (height - panel_y) + 0.5f);
+      top     += drop;
+      panel_y += drop;
+      hint_y   = REF(402) + drop;
+      by      -= floorf((1.0f - shown_t) * (by + bh + REF(4)) + 0.5f);
+   }
 
    /* The screen dimmed; the typed text in its box. */
    grid_draw_rect(p_disp, userdata, width, height, 0, 0, width, height,
-         0x000000b0);
+         (uint32_t)(0xb0 * shown_t + 0.5f));
    grid_draw_rounded(p_disp, userdata, width, height, bx, by, bw, bh,
          REF(10), 0x232325ff);
    if (!string_is_empty(label))
@@ -9345,10 +9419,10 @@ static void grid_draw_keyboard(gfx_display_t *p_disp, void *userdata,
    /* The buttons, right-aligned under the keys. */
    for (k = 0; k < ARRAY_SIZE(hint_glyphs); k++)
       hints_w += (k ? REF(19) : 0.0f) + grid_draw_hint(p_disp, userdata,
-            width, height, 0, REF(402), hint_glyphs[k], hint_labels[k], true);
+            width, height, 0, hint_y, hint_glyphs[k], hint_labels[k], true);
    hx = x0 + keys_w - gap - hints_w;
    for (k = 0; k < ARRAY_SIZE(hint_glyphs); k++)
-      hx += grid_draw_hint(p_disp, userdata, width, height, hx, REF(402),
+      hx += grid_draw_hint(p_disp, userdata, width, height, hx, hint_y,
             hint_glyphs[k], hint_labels[k], false) + REF(19);
 }
 
@@ -10361,6 +10435,25 @@ bool grid_home_frame(video_frame_info_t *video_info)
    grid_hits_next.count = 0;
    grid_hits_next.edit  = false;
 
+   /* Just opened over a game: everything fades in; just closed: out
+    * (smoothstep both ways). */
+   grid_alpha = 1.0f;
+   if (grid_st.open_start)
+   {
+      float p = (float)(cpu_features_get_time_usec() - grid_st.open_start)
+            / GRID_OPEN_USEC;
+      if (p >= 1.0f || p < 0.0f)
+         grid_st.open_start = 0;
+      else
+         grid_alpha = p * p * (3.0f - 2.0f * p);
+   }
+   if (grid_st.close_start)
+   {
+      float p = grid_clamp01((float)(cpu_features_get_time_usec()
+            - grid_st.close_start) / GRID_CLOSE_USEC);
+      grid_alpha = 1.0f - p * p * (3.0f - 2.0f * p);
+   }
+
    /* Point saves at the current profile (once). */
    grid_profile_init();
    /* SteamGridDB key and RetroAchievements login, until both are set. */
@@ -10716,32 +10809,47 @@ bool grid_home_frame(video_frame_info_t *video_info)
       grid_flush_text(width, height);
    }
 
-   if (menu_input_dialog_get_display_kb())
+   /* Mouse and keyboard mode: a setting's text entry or a profile's name
+    * asks in the middle of the screen (the grid's other fields are typed
+    * into in place). Gamepad mode: the on-screen keyboard, with its own
+    * box for the text, sliding in and out. */
+   if (menu_input_dialog_get_display_kb() && grid_st.kbm)
    {
-      /* Mouse and keyboard mode: a setting's text entry or a profile's
-       * name asks in the middle of the screen (the grid's other fields are
-       * typed into in place). Gamepad mode: the on-screen keyboard, with
-       * its own box for the text. */
-      if (grid_st.kbm)
+      if (grid_st.kb == KB_MENU || grid_st.kb == KB_PROFILE_NAME)
       {
-         if (grid_st.kb == KB_MENU || grid_st.kb == KB_PROFILE_NAME)
-         {
-            const char *buf = menu_input_dialog_get_buffer();
-            grid_draw_rect(p_disp, userdata, width, height,
-                  0, 0, width, height, 0x00000090);
-            grid_draw_text_prompt(p_disp, userdata, width, height,
-                  menu_state_get_ptr()->input_dialog_kb_label,
-                  buf ? buf : "", height * 0.5f);
-         }
+         const char *buf = menu_input_dialog_get_buffer();
+         grid_draw_rect(p_disp, userdata, width, height,
+               0, 0, width, height, 0x00000090);
+         grid_draw_text_prompt(p_disp, userdata, width, height,
+               menu_state_get_ptr()->input_dialog_kb_label,
+               buf ? buf : "", height * 0.5f);
       }
-      else
-         grid_draw_keyboard(p_disp, userdata, width, height);
+   }
+   {
+      bool osk_on = menu_input_dialog_get_display_kb() && !grid_st.kbm;
+      float shown = grid_osk_anim(osk_on);
+      if (shown > 0.0f)
+         grid_draw_keyboard(p_disp, userdata, width, height, shown, osk_on);
    }
 
    grid_flush_text(width, height);
 
    grid_hits = grid_hits_next;
+   grid_alpha = 1.0f;
    return true;
+}
+
+void grid_home_closing_frame(void *video_info)
+{
+   if (!grid_st.close_start)
+      return;
+   if (     !grid_content_running()
+         || cpu_features_get_time_usec() - grid_st.close_start >= GRID_CLOSE_USEC)
+   {
+      grid_st.close_start = 0;
+      return;
+   }
+   grid_home_frame((video_frame_info_t*)video_info);
 }
 
 /* ---------------------------------------------------------------------- */
