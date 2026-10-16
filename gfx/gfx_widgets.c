@@ -1334,6 +1334,13 @@ void gfx_widgets_frame(void *data)
       video_st->current_video->set_viewport(
             video_st->data, video_width, video_height, true, false);
 
+#ifdef HAVE_MENU
+   /* Bomba: the menu just closed fades out over the game, under the
+    * notifications. */
+   if (!(video_info->menu_st_flags & MENU_ST_FLAG_ALIVE))
+      grid_home_closing_frame(video_info);
+#endif
+
    /* Font setup */
    font_driver_bind_block(p_dispwidget->gfx_widget_fonts.regular.font,
          &p_dispwidget->gfx_widget_fonts.regular.raster_block);

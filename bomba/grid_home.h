@@ -51,6 +51,10 @@ bool grid_home_console_for_file(const char *path, char *s, size_t len);
 /* Call when the menu opens or closes. */
 void grid_home_toggle(bool menu_on);
 
+/* Each frame while the menu is closed (gfx_widgets_frame): the grid
+ * fading out over the game for a moment after the menu closed. */
+void grid_home_closing_frame(void *video_info);
+
 /* RetroArch's menu message box (help, info) for this frame. Returns true
  * if the grid shows it, in which case the caller doesn't. */
 bool grid_home_messagebox(const char *message);

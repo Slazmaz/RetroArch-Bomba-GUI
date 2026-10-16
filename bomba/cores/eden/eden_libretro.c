@@ -17,6 +17,8 @@
  * BOMBA_OVERLAY environment variable and the "BombaOverlay"
  * property on its window): Eden and RetroArch look and act as one window,
  * like Steam's overlay.
+ *  - While Eden boots, RetroArch shows a loading screen (the core's frame)
+ *    and stays over Eden's window until the game runs.
  *  - Eden's borderless fullscreen window is kept exactly under
  *    RetroArch's, which is see-through except for its menu and
  *    notifications.
@@ -44,12 +46,20 @@
 
 #include <libretro.h>
 
-#define FB_WIDTH  320
-#define FB_HEIGHT 240
+/* The loading screen fades in from black, and out to black before Eden
+ * shows, black that then fades off Eden (gl2.c, GL2_BOMBA_FADE_MS). */
+#define FADE_MS          150
 
-/* How long Eden's window must exist before it's taken over (skips the
- * moment it opens blank). */
-#define OVERLAY_DELAY_MS 1500
+/* Eden draws frames (see emu_presenting): shown this long after. */
+#define READY_AFTER_FRAMES_MS 300
+/* No frame count seen: shown this long after Eden opened its audio
+ * (which comes some seconds before its first frame). */
+#define READY_AFTER_AUDIO_MS 8000
+/* Eden's window taken over anyway after loading this long. */
+#define LOADING_MAX_MS   60000
+/* Eden's window restyled: RetroArch turns see-through this long after,
+ * once the window has drawn again and the loading screen faded out. */
+#define SHOW_DELAY_MS    (FADE_MS + 150)
 /* No retro_run for this long: RetroArch paused the core; pause Eden. */
 #define PAUSE_AFTER_MS   250
 /* How often the window arrangement is checked. */
@@ -61,7 +71,8 @@ static retro_environment_t env_cb;
 static retro_video_refresh_t video_cb;
 static retro_input_poll_t input_poll_cb;
 
-static uint32_t framebuffer[FB_WIDTH * FB_HEIGHT];
+/* The frame: the loading screen, at the screen's own size. */
+static unsigned fb_width = 1280, fb_height = 720;
 static HANDLE emu_process;
 static DWORD emu_pid;
 
@@ -70,11 +81,19 @@ static struct
    bool active;        /* overlay mode */
    bool transparent;   /* RetroArch's window is see-through now */
    bool hidden;        /* Eden hidden while RetroArch is minimized */
+   bool topmost;       /* RetroArch's window kept over Eden's while loading */
+   bool styled;        /* Eden's window taken over, see-through next */
    HWND ra;            /* RetroArch's window */
    HWND emu;           /* Eden's game window, once it appears */
-   DWORD emu_seen;     /* tick it appeared */
+   HANDLE emu_thread;  /* Eden's main thread, suspended until RetroArch's
+                          window is on top (set by the launch thread) */
+   DWORD loading_since;/* tick Eden was let run */
+   DWORD audio_seen;   /* tick Eden's audio was first seen, 0 not yet */
+   DWORD frames_seen;  /* tick Eden was first seen drawing, 0 not yet */
+   DWORD styled_at;    /* tick Eden's window was taken over */
    DWORD last_arrange; /* tick the arrangement was last checked */
    RECT placed;        /* where Eden's window was last put */
+   RECT emu_rect;      /* ...and its window rectangle then */
 
    HANDLE thread;      /* manager thread, see manager_main */
    volatile LONG stop;
@@ -88,6 +107,10 @@ static struct
 /* ---------------------------------------------------------------------- */
 /* Helpers                                                                */
 /* ---------------------------------------------------------------------- */
+
+/* RetroArch's save folder for this game, read at load (the launch thread
+ * can't ask). */
+static char save_dir_cache[MAX_PATH * 4];
 
 /* Step-by-step log, <saves>/launcher.log, rewritten each launch. */
 static FILE *log_file;
@@ -633,8 +656,26 @@ static const struct { const char *option, *section, *key; } option_keys[] = {
    { "eden_region",     "System",   "region_index" },
 };
 
+#define OPTION_COUNT (sizeof(option_keys) / sizeof(option_keys[0]))
+
 /* The options' values as last written, to tell a real change. */
 static char options_written[512];
+/* The options' values as last read ("" unset), see read_options. */
+static char option_values[OPTION_COUNT][16];
+
+/* Reads the options' values from RetroArch, on its thread (the launch
+ * thread writes them, see launch_main). */
+static void read_options(void)
+{
+   size_t i;
+   for (i = 0; i < OPTION_COUNT; i++)
+   {
+      struct retro_variable var = { option_keys[i].option, NULL };
+      option_values[i][0] = '\0';
+      if (env_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) && var.value)
+         snprintf(option_values[i], sizeof(option_values[i]), "%s", var.value);
+   }
+}
 
 static void apply_options(char **buf, size_t *len, void *data)
 {
@@ -642,13 +683,12 @@ static void apply_options(char **buf, size_t *len, void *data)
    size_t i;
 
    (void)data;
-   for (i = 0; i < sizeof(option_keys) / sizeof(option_keys[0]); i++)
+   for (i = 0; i < OPTION_COUNT; i++)
    {
-      struct retro_variable var = { option_keys[i].option, NULL };
-      if (!env_cb(RETRO_ENVIRONMENT_GET_VARIABLE, &var) || !var.value)
+      if (!option_values[i][0])
          continue;
-      ini_set(buf, len, option_keys[i].section, option_keys[i].key, var.value);
-      strncat(now, var.value, sizeof(now) - strlen(now) - 2);
+      ini_set(buf, len, option_keys[i].section, option_keys[i].key, option_values[i]);
+      strncat(now, option_values[i], sizeof(now) - strlen(now) - 2);
       strcat(now, ",");
    }
    strcpy(options_written, now);
@@ -793,12 +833,10 @@ static bool make_junction(const wchar_t *link, const wchar_t *target)
 /* Points Eden's game saves at the current profile's (see the top). */
 static void link_saves(const wchar_t *exe)
 {
-   const char *save_dir = NULL;
    wchar_t dir[MAX_PATH * 2], link[MAX_PATH * 2], target[MAX_PATH * 2];
    wchar_t *slash, *p;
 
-   if (!env_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir) || !save_dir
-         || !to_wide(save_dir, dir, MAX_PATH * 2))
+   if (!save_dir_cache[0] || !to_wide(save_dir_cache, dir, MAX_PATH * 2))
       return;
    _snwprintf(target, MAX_PATH * 2, L"%ls\\save", dir);
    target[MAX_PATH * 2 - 1] = L'\0';
@@ -881,7 +919,10 @@ static struct
    char password[128];
    unsigned max_members;
    char name[64];
+   char nick[32];      /* name as Eden takes it, see player_name */
 } mp;
+
+static void player_name(char *out, size_t out_len);
 
 static HANDLE room_job; /* the room server, killed when this closes */
 
@@ -915,6 +956,7 @@ static void read_multiplayer_settings(void)
 
    if (mp.host)
       strcpy(mp.address, "127.0.0.1");
+   player_name(mp.nick, sizeof(mp.nick));
    /* eden-cli splits "nick:password@address:port" at those characters. */
    if (!mp.address[0])
    {
@@ -962,8 +1004,6 @@ static bool start_room(const wchar_t *exe, const wchar_t *workdir, const wchar_t
    wchar_t cmd[MAX_PATH * 8], game[MAX_PATH * 2], log_path[MAX_PATH * 2];
    wchar_t ban_path[MAX_PATH * 2], password[96], name[32];
    const wchar_t *base = wcsrchr(rom, L'\\');
-   const char *save_dir = NULL;
-   char nick[32];
    wchar_t *dot, *p;
    STARTUPINFOW si;
    PROCESS_INFORMATION pi;
@@ -977,8 +1017,7 @@ static bool start_room(const wchar_t *exe, const wchar_t *workdir, const wchar_t
       if (*p == L'"')
          *p = L'\'';
 
-   player_name(nick, sizeof(nick));
-   _snwprintf(name, 32, L"%hs", nick);
+   _snwprintf(name, 32, L"%hs", mp.nick);
    name[31] = L'\0';
 
    password[0] = L'\0';
@@ -987,8 +1026,7 @@ static bool start_room(const wchar_t *exe, const wchar_t *workdir, const wchar_t
    password[95] = L'\0';
 
    log_path[0] = L'\0';
-   if (     env_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir) && save_dir
-         && to_wide(save_dir, log_path, MAX_PATH * 2 - 32))
+   if (save_dir_cache[0] && to_wide(save_dir_cache, log_path, MAX_PATH * 2 - 32))
       wcscat(log_path, L"\\eden-room.log");
    _snwprintf(ban_path, MAX_PATH * 2, L"%ls\\user\\room-ban-list.txt", workdir);
    ban_path[MAX_PATH * 2 - 1] = L'\0';
@@ -1053,6 +1091,241 @@ static void stop_room(void)
    CloseHandle(room_job);
    room_job = NULL;
    log_msg("multiplayer: room closed");
+}
+
+/* ---------------------------------------------------------------------- */
+/* Loading screen                                                         */
+/* ---------------------------------------------------------------------- */
+
+/* The core's frame until Eden's game shows: the game's name and
+ * "Loading...", in the grid's font, sizes and text colours (grid_home.c)
+ * on black, drawn with GDI. */
+#define LD_FONT_CAP  0.60f      /* Baloo 2 cap height, in em */
+#define LD_TEXT      0xececec   /* COL_TEXT */
+#define LD_TEXT_DIM  0x8c8c90   /* COL_TEXT_DIM */
+
+static struct
+{
+   HDC dc;
+   HBITMAP bmp;
+   HGDIOBJ old;
+   uint32_t *bits;      /* XRGB8888, fb_width x fb_height */
+   uint32_t *faded;     /* bits darkened, while fading */
+   HFONT title_font, text_font;
+   wchar_t title[256];
+   wchar_t fonts[2][MAX_PATH * 2];
+   unsigned fonts_added; /* bit per entry of fonts */
+   int dots;             /* dots drawn last; -1 nothing drawn yet */
+   DWORD shown_at;       /* tick of the first frame, 0 none yet */
+} ld;
+
+/* Reference pixels (grid: 423 on the screen's height) to this frame's. */
+static int ld_ref(float px)
+{
+   return (int)(px * (float)fb_height / 423.0f + 0.5f);
+}
+
+static HFONT ld_font(float cap, int weight, const wchar_t *face)
+{
+   return CreateFontW(-ld_ref(cap / LD_FONT_CAP), 0, 0, 0, weight,
+         FALSE, FALSE, FALSE, DEFAULT_CHARSET, OUT_TT_PRECIS,
+         CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, DEFAULT_PITCH, face);
+}
+
+static COLORREF ld_rgb(uint32_t c)
+{
+   return RGB((c >> 16) & 0xff, (c >> 8) & 0xff, c & 0xff);
+}
+
+static void loading_close(void)
+{
+   unsigned i;
+
+   if (ld.dc)
+   {
+      if (ld.old)
+         SelectObject(ld.dc, ld.old);
+      DeleteDC(ld.dc);
+   }
+   if (ld.bmp)
+      DeleteObject(ld.bmp);
+   free(ld.faded);
+   if (ld.title_font)
+      DeleteObject(ld.title_font);
+   if (ld.text_font)
+      DeleteObject(ld.text_font);
+   for (i = 0; i < 2; i++)
+      if (ld.fonts_added & (1u << i))
+         RemoveFontResourceExW(ld.fonts[i], FR_PRIVATE, NULL);
+   memset(&ld, 0, sizeof(ld));
+}
+
+/* Sizes the frame to the screen RetroArch is on (drawn pixel for pixel
+ * there) and gets the drawing ready. The title is the file's name without
+ * extension and tags ("[...]", "(...)"). */
+static void loading_open(const wchar_t *rom)
+{
+   static const wchar_t *files[2] = { L"Baloo2-Bold.ttf", L"Baloo2-Medium.ttf" };
+   MONITORINFO mi;
+   const wchar_t *name = rom, *p;
+   wchar_t dir[MAX_PATH * 2], *cut;
+   BITMAPINFO bi;
+   unsigned i;
+
+   loading_close();
+   fb_width  = 1280;
+   fb_height = 720;
+   mi.cbSize = sizeof(mi);
+   if (GetMonitorInfoW(MonitorFromWindow(GetForegroundWindow(),
+               MONITOR_DEFAULTTOPRIMARY), &mi)
+         && mi.rcMonitor.right > mi.rcMonitor.left
+         && mi.rcMonitor.bottom > mi.rcMonitor.top)
+   {
+      fb_width  = (unsigned)(mi.rcMonitor.right - mi.rcMonitor.left);
+      fb_height = (unsigned)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+   }
+   if (fb_width > 7680 || fb_height > 4320)
+   {
+      fb_width  = 1920;
+      fb_height = 1080;
+   }
+
+   for (p = rom; *p; p++)
+      if (*p == L'\\' || *p == L'/')
+         name = p + 1;
+   wcsncpy(ld.title, name, 255);
+   ld.title[255] = L'\0';
+   if ((cut = wcsrchr(ld.title, L'.')))
+      *cut = L'\0';
+   if ((cut = wcsstr(ld.title, L" [")))
+      *cut = L'\0';
+   if ((cut = wcsstr(ld.title, L" (")))
+      *cut = L'\0';
+
+   /* Baloo 2 ships next to the exe (see build.sh). */
+   if (GetModuleFileNameW(NULL, dir, MAX_PATH * 2) && (cut = wcsrchr(dir, L'\\')))
+   {
+      *cut = L'\0';
+      for (i = 0; i < 2; i++)
+      {
+         _snwprintf(ld.fonts[i], MAX_PATH * 2, L"%ls\\bomba\\fonts\\%ls", dir, files[i]);
+         ld.fonts[i][MAX_PATH * 2 - 1] = L'\0';
+         if (AddFontResourceExW(ld.fonts[i], FR_PRIVATE, NULL) > 0)
+            ld.fonts_added |= 1u << i;
+      }
+   }
+   ld.title_font = ld_font(13, FW_BOLD,
+         (ld.fonts_added & 1) ? L"Baloo 2" : L"Segoe UI");
+   ld.text_font  = ld_font(9, FW_NORMAL,
+         (ld.fonts_added & 2) ? L"Baloo 2 Medium" : L"Segoe UI");
+
+   memset(&bi, 0, sizeof(bi));
+   bi.bmiHeader.biSize        = sizeof(bi.bmiHeader);
+   bi.bmiHeader.biWidth       = (LONG)fb_width;
+   bi.bmiHeader.biHeight      = -(LONG)fb_height; /* top-down */
+   bi.bmiHeader.biPlanes      = 1;
+   bi.bmiHeader.biBitCount    = 32;
+   bi.bmiHeader.biCompression = BI_RGB;
+   if (     !(ld.dc  = CreateCompatibleDC(NULL))
+         || !(ld.bmp = CreateDIBSection(ld.dc, &bi, DIB_RGB_COLORS,
+               (void**)&ld.bits, NULL, 0))
+         || !(ld.faded = (uint32_t*)malloc((size_t)fb_width * fb_height
+               * sizeof(uint32_t))))
+   {
+      log_msg("loading screen: GDI failed (%lu)", (unsigned long)GetLastError());
+      loading_close();
+      return;
+   }
+   ld.old  = SelectObject(ld.dc, ld.bmp);
+   ld.dots = -1;
+   SetBkMode(ld.dc, TRANSPARENT);
+}
+
+/* Black, the title centered, and
+ * "Loading" with 0-3 dots under it, the dots not moving the word. */
+static void loading_draw(int dots)
+{
+   int title_y = ld_ref(208), text_y = ld_ref(232);
+   int max_w   = (int)fb_width - 2 * ld_ref(35);
+   wchar_t buf[260];
+   int len;
+   SIZE sz;
+
+   memset(ld.bits, 0, (size_t)fb_width * fb_height * sizeof(uint32_t));
+
+   /* The title, cut short with "..." if too wide. */
+   SelectObject(ld.dc, ld.title_font);
+   SetTextColor(ld.dc, ld_rgb(LD_TEXT));
+   SetTextAlign(ld.dc, TA_CENTER | TA_BASELINE);
+   len = (int)wcslen(ld.title);
+   wcscpy(buf, ld.title);
+   while (     len > 0 && GetTextExtentPoint32W(ld.dc, buf, (int)wcslen(buf), &sz)
+            && sz.cx > max_w)
+   {
+      len--;
+      while (len > 0 && ld.title[len - 1] == L' ')
+         len--;
+      wcsncpy(buf, ld.title, len);
+      wcscpy(buf + len, L"...");
+   }
+   TextOutW(ld.dc, (int)fb_width / 2, title_y, buf, (int)wcslen(buf));
+
+   SelectObject(ld.dc, ld.text_font);
+   SetTextColor(ld.dc, ld_rgb(LD_TEXT_DIM));
+   SetTextAlign(ld.dc, TA_LEFT | TA_BASELINE);
+   GetTextExtentPoint32W(ld.dc, L"Loading...", 10, &sz);
+   TextOutW(ld.dc, ((int)fb_width - sz.cx) / 2, text_y, L"Loading...", 7 + dots);
+   GdiFlush();
+}
+
+/* How much of the loading screen shows (0 black .. 256 all): fading in
+ * from its first frame, out once Eden's window is taken over. */
+static unsigned loading_level(DWORD now)
+{
+   DWORD in  = now - ld.shown_at;
+   DWORD out = ov.styled ? now - ov.styled_at : 0;
+   unsigned level = in >= FADE_MS ? 256 : in * 256 / FADE_MS;
+
+   if (ov.styled)
+      level = out >= FADE_MS ? 0 : level * (FADE_MS - out) / FADE_MS;
+   return level;
+}
+
+/* Each retro_run: the loading screen until RetroArch turns see-through
+ * (its frame isn't drawn then), the dots stepping on. */
+static void loading_frame(void)
+{
+   DWORD now   = GetTickCount();
+   int dots    = (int)(now / 400 % 4);
+   size_t pitch = fb_width * sizeof(uint32_t);
+   unsigned level;
+
+   if (!ld.bits || ov.transparent)
+   {
+      video_cb(NULL, fb_width, fb_height, pitch);
+      return;
+   }
+   if (!ld.shown_at)
+      ld.shown_at = now ? now : 1;
+   if (dots != ld.dots)
+   {
+      loading_draw(dots);
+      ld.dots = dots;
+   }
+
+   if ((level = loading_level(now)) >= 256)
+      video_cb(ld.bits, fb_width, fb_height, pitch);
+   else
+   {
+      size_t i, n = (size_t)fb_width * fb_height;
+      for (i = 0; i < n; i++)
+      {
+         uint32_t c = ld.bits[i];
+         ld.faded[i] = (((c & 0xff00ffu) * level >> 8) & 0xff00ffu)
+                     | (((c & 0x00ff00u) * level >> 8) & 0x00ff00u);
+      }
+      video_cb(ld.faded, fb_width, fb_height, pitch);
+   }
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1156,10 +1429,18 @@ static void set_ra_transparent(bool on)
    if (region)
       DeleteObject(region);
 
+   /* BombaFade: when the see-through frame started, so the driver fades
+    * black off Eden from then (the loading screen faded out to black). */
    if (on)
+   {
+      SetPropA(ov.ra, "BombaFade", (HANDLE)(uintptr_t)(GetTickCount() | 1));
       SetPropA(ov.ra, "BombaTransparent", (HANDLE)1);
+   }
    else
+   {
       RemovePropA(ov.ra, "BombaTransparent");
+      RemovePropA(ov.ra, "BombaFade");
+   }
    ov.transparent = on;
 }
 
@@ -1185,11 +1466,15 @@ static void style_emu(void)
 }
 
 /* Puts Eden's window exactly under RetroArch's client area, directly
- * below it in the window order. Invisible borders the window may still
- * have are measured (DWM's visible bounds) and placed outside. */
-static void place_emu(void)
+ * below it in the window order (zorder; while loading only the place,
+ * RetroArch's window being topmost). Invisible borders the window may
+ * still have are measured (DWM's visible bounds) and placed outside.
+ * Placed again if Eden moved or resized it since. */
+static void place_emu(bool zorder)
 {
-   const UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER;
+   const UINT flags = SWP_NOACTIVATE | SWP_NOOWNERZORDER
+      | (zorder ? 0 : SWP_NOZORDER);
+   HWND after = zorder ? ov.ra : NULL;
    RECT target, win, vis;
    POINT tl = { 0, 0 };
 
@@ -1199,9 +1484,12 @@ static void place_emu(void)
    if (target.right <= target.left || target.bottom <= target.top)
       return;
 
+   if (GetWindowRect(ov.emu, &win) && !EqualRect(&win, &ov.emu_rect))
+      memset(&ov.placed, 0, sizeof(ov.placed));
+
    if (!EqualRect(&target, &ov.placed))
    {
-      SetWindowPos(ov.emu, ov.ra, target.left, target.top,
+      SetWindowPos(ov.emu, after, target.left, target.top,
             target.right - target.left, target.bottom - target.top, flags);
 
       if (     GetWindowRect(ov.emu, &win)
@@ -1211,52 +1499,232 @@ static void place_emu(void)
       {
          LONG l = vis.left - win.left, t = vis.top - win.top;
          LONG r = win.right - vis.right, b = win.bottom - vis.bottom;
-         SetWindowPos(ov.emu, ov.ra, target.left - l, target.top - t,
+         SetWindowPos(ov.emu, after, target.left - l, target.top - t,
                target.right - target.left + l + r,
                target.bottom - target.top + t + b, flags);
          log_msg("Eden window borders %ld,%ld,%ld,%ld compensated", l, t, r, b);
       }
       if (GetWindowRect(ov.emu, &win))
+      {
          log_msg("Eden window placed at %ld,%ld %ldx%ld (RetroArch %ld,%ld %ldx%ld)",
                win.left, win.top, win.right - win.left, win.bottom - win.top,
                target.left, target.top,
                target.right - target.left, target.bottom - target.top);
+         ov.emu_rect = win;
+      }
       ov.placed = target;
    }
-   else
+   else if (zorder)
       SetWindowPos(ov.emu, ov.ra, 0, 0, 0, 0,
             flags | SWP_NOMOVE | SWP_NOSIZE);
 }
 
-/* Takes Eden's window over once it has been up a moment, then keeps the
- * two windows together. Only while Eden runs: calls on its window wait on
- * its thread. */
+/* While loading RetroArch's window is topmost, so Eden's can't come over
+ * its loading screen. */
+static void set_ra_topmost(bool on)
+{
+   if (on == ov.topmost)
+      return;
+   SetWindowPos(ov.ra, on ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
+         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+   ov.topmost = on;
+   log_msg("RetroArch window %s", on ? "over Eden's (loading)" : "no longer topmost");
+}
+
+/* Lets Eden run, started suspended so its window can't open before
+ * RetroArch's is on top. */
+static void release_emu_thread(void)
+{
+   HANDLE thread = (HANDLE)InterlockedExchangePointer(
+         (PVOID volatile*)&ov.emu_thread, NULL);
+
+   if (!thread)
+      return;
+   ResumeThread(thread);
+   CloseHandle(thread);
+   ov.loading_since = GetTickCount();
+}
+
+/* Eden's window title, without waiting on Eden (its window thread is
+ * often busy while it boots). */
+static bool emu_title(wchar_t *out, int len)
+{
+   return ov.emu && InternalGetWindowText(ov.emu, out, len) > 0;
+}
+
+/* Eden draws frames: its title's frame counter ("... | FPS: 30 (100%)",
+ * updated every second or two) is above 0. Until then its window has
+ * nothing in it (the desktop would show through). */
+static bool emu_presenting(void)
+{
+   wchar_t title[256];
+   const wchar_t *fps;
+
+   return emu_title(title, 256) && (fps = wcsstr(title, L"FPS: "))
+      && wcstod(fps + 5, NULL) >= 1.0;
+}
+
+/* The game shows: Eden has drawn frames for a moment. Failing that (no
+ * frame counter in its title), its audio has run a good while. */
+static bool emu_ready(DWORD now)
+{
+   if (emu_presenting())
+   {
+      if (!ov.frames_seen)
+         ov.frames_seen = now ? now : 1;
+      if (now - ov.frames_seen >= READY_AFTER_FRAMES_MS)
+      {
+         log_msg("Eden ready (drawing for %lu ms)", (unsigned long)(now - ov.frames_seen));
+         return true;
+      }
+   }
+   if (ov.audio_seen && now - ov.audio_seen >= READY_AFTER_AUDIO_MS)
+   {
+      log_msg("Eden ready (audio for %lu ms, no frame count seen)",
+            (unsigned long)(now - ov.audio_seen));
+      return true;
+   }
+   if (now - ov.loading_since >= LOADING_MAX_MS)
+   {
+      log_msg("Eden still loading after %u s: shown anyway", LOADING_MAX_MS / 1000);
+      return true;
+   }
+   return false;
+}
+
+/* While loading: RetroArch keeps focus and stays over Eden, unless
+ * another program was switched to; Eden's window stays where it will
+ * show. */
+static void hold_loading(DWORD now)
+{
+   HWND fg     = GetForegroundWindow();
+   DWORD pid   = 0;
+   bool tick   = now - ov.last_arrange >= ARRANGE_MS;
+
+   if (tick)
+   {
+      ov.last_arrange = now;
+      if (ov.emu && IsWindow(ov.emu))
+         place_emu(false);
+   }
+
+   if (fg)
+      GetWindowThreadProcessId(fg, &pid);
+   if (pid == emu_pid)
+   {
+      set_ra_topmost(true);
+      if (tick)
+         focus_ra();
+   }
+   else if (pid)
+      set_ra_topmost(pid == GetCurrentProcessId());
+}
+
+/* Diagnostics around the switch to see-through: what's on screen (five
+ * points, as composed) and Eden's window state, every 50 ms. */
+static void log_switch_state(void)
+{
+   static const float pts[5][2] = {
+      { 0.5f, 0.5f }, { 0.1f, 0.1f }, { 0.9f, 0.1f }, { 0.1f, 0.9f }, { 0.9f, 0.9f }
+   };
+   static DWORD last;
+   DWORD now = GetTickCount();
+   HDC screen;
+   RECT r;
+   char px[128];
+   int i, n = 0;
+   DWORD cloaked = 0;
+   HWND above;
+   char above_txt[64] = "";
+
+   if (now - last < 50 || !GetWindowRect(ov.ra, &r))
+      return;
+   last = now;
+   px[0] = '\0';
+   if ((screen = GetDC(NULL)))
+   {
+      for (i = 0; i < 5; i++)
+      {
+         COLORREF c = GetPixel(screen,
+               r.left + (int)((r.right - r.left) * pts[i][0]),
+               r.top + (int)((r.bottom - r.top) * pts[i][1]));
+         n += snprintf(px + n, sizeof(px) - n, " %06lx", (unsigned long)c);
+      }
+      ReleaseDC(NULL, screen);
+   }
+   if (ov.emu)
+      DwmGetWindowAttribute(ov.emu, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+   above = ov.emu ? GetWindow(ov.emu, GW_HWNDPREV) : NULL;
+   snprintf(above_txt, sizeof(above_txt), "%p%s", (void*)above,
+         above == ov.ra ? " (RetroArch)" : "");
+   log_msg("diag: screen%s | Eden visible %d iconic %d cloaked %lu above %s | transparent %d",
+         px, ov.emu ? IsWindowVisible(ov.emu) : -1, ov.emu ? IsIconic(ov.emu) : -1,
+         (unsigned long)cloaked, above_txt, ov.transparent);
+}
+
+/* Eden's window title, logged as it changes while loading (tells how far
+ * Eden has got). */
+static void log_emu_title(void)
+{
+   static wchar_t last[256];
+   wchar_t title[256];
+
+   if (!emu_title(title, 256) || !wcscmp(title, last))
+      return;
+   wcscpy(last, title);
+   log_msg("Eden window title: %ls", title);
+}
+
+/* Takes Eden's window over once its game runs, then keeps the two windows
+ * together. Only while Eden runs: calls on its window wait on its
+ * thread. */
 static void arrange(void)
 {
    DWORD now = GetTickCount();
    HWND hwnd, fg;
    DWORD fg_pid = 0;
 
+   /* From the game being ready to 2 s after RetroArch went see-through. */
+   if (ov.styled && now - ov.styled_at < SHOW_DELAY_MS + 2000)
+      log_switch_state();
+
    if (!ov.transparent)
    {
-      if (!(hwnd = current_emu_window()))
-         return;
-      if (hwnd != ov.emu)
+      if (!ov.styled)
       {
-         RECT r;
-         GetWindowRect(hwnd, &r);
-         log_msg("Eden window %p (%ld,%ld %ldx%ld)", (void*)hwnd,
-               r.left, r.top, r.right - r.left, r.bottom - r.top);
-         ov.emu      = hwnd;
-         ov.emu_seen = now;
+         if ((hwnd = current_emu_window()) && hwnd != ov.emu)
+         {
+            RECT r;
+            GetWindowRect(hwnd, &r);
+            log_msg("Eden window %p (%ld,%ld %ldx%ld)", (void*)hwnd,
+                  r.left, r.top, r.right - r.left, r.bottom - r.top);
+            ov.emu = hwnd;
+            /* Taken over at once, under the loading screen, so it has its
+             * size and draws at it well before it shows. */
+            style_emu();
+            place_emu(false);
+         }
+         log_emu_title();
+         if (!ov.emu || !IsWindow(ov.emu) || !emu_ready(now))
+         {
+            hold_loading(now);
+            return;
+         }
+
+         /* Under RetroArch's still opaque window as it stops being
+          * topmost. */
+         set_ra_topmost(false);
+         place_emu(true);
+         ov.styled    = true;
+         ov.styled_at = now;
          return;
       }
-      if (now - ov.emu_seen < OVERLAY_DELAY_MS)
+      if (now - ov.styled_at < SHOW_DELAY_MS)
          return;
 
-      style_emu();
-      place_emu();
+      place_emu(true);
       set_ra_transparent(true);
+      LockSetForegroundWindow(LSFW_UNLOCK);
       focus_ra();
       ov.last_arrange = now;
       /* RetroArch was likely paused (inactive) until now: don't count
@@ -1294,7 +1762,7 @@ static void arrange(void)
          ov.hidden = false;
          memset(&ov.placed, 0, sizeof(ov.placed));
       }
-      place_emu();
+      place_emu(true);
    }
 
    /* Eden got focus somehow: give it back to RetroArch. */
@@ -1395,6 +1863,8 @@ static void follow_volume(void)
 
    if (set_emu_volume(milli >= 1000 ? 1.0f : (float)milli / 1000.0f))
    {
+      if (!ov.audio_seen)
+         ov.audio_seen = now ? now : 1;
       log_msg("volume: Eden at %ld%%", milli >= 1000 ? 100 : milli / 10);
       applied = milli;
    }
@@ -1406,6 +1876,7 @@ static void follow_volume(void)
 static DWORD WINAPI manager_main(LPVOID unused)
 {
    DWORD started = GetTickCount();
+   bool gave_up  = false;
    bool com      = SUCCEEDED(CoInitializeEx(NULL, COINIT_MULTITHREADED)); /* volume */
 
    (void)unused;
@@ -1423,6 +1894,7 @@ static DWORD WINAPI manager_main(LPVOID unused)
          log_msg("RetroArch window went away; looking again");
          ov.ra          = NULL;
          ov.transparent = false;
+         ov.topmost     = false;
          started        = GetTickCount();
       }
       if (!ov.ra)
@@ -1432,10 +1904,23 @@ static DWORD WINAPI manager_main(LPVOID unused)
             log_msg("RetroArch window %p", (void*)ov.ra);
          else if (GetTickCount() - started > 10000)
          {
-            log_msg("RetroArch's window never advertised overlay support");
-            break;
+            /* Eden runs anyway, in its own window. */
+            if (!gave_up)
+               log_msg("RetroArch's window never advertised overlay support");
+            gave_up = true;
+            release_emu_thread();
          }
          continue;
+      }
+
+      /* Eden is started (see launch_main) and RetroArch's window is in
+       * front: keep it there, with focus, while Eden boots. */
+      if (ov.emu_thread)
+      {
+         set_ra_topmost(true);
+         LockSetForegroundWindow(LSFW_LOCK);
+         release_emu_thread();
+         log_msg("Eden started under the loading screen");
       }
 
       if (com)
@@ -1471,23 +1956,33 @@ static DWORD WINAPI manager_main(LPVOID unused)
 
       arrange();
    }
+   release_emu_thread();
    if (com)
       CoUninitialize();
    return 0;
 }
 
+/* Before Eden starts (see launch_main), which hands over its main thread
+ * suspended, to be resumed once RetroArch's window is on top. */
 static void overlay_start(void)
 {
    HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
 
    memset(&ov.placed, 0, sizeof(ov.placed));
-   ov.active       = true;
-   ov.transparent  = false;
-   ov.hidden       = false;
-   ov.ra           = NULL;
-   ov.emu          = NULL;
-   ov.emu_seen     = 0;
-   ov.last_arrange = 0;
+   memset(&ov.emu_rect, 0, sizeof(ov.emu_rect));
+   ov.active        = true;
+   ov.transparent   = false;
+   ov.hidden        = false;
+   ov.topmost       = false;
+   ov.styled        = false;
+   ov.ra            = NULL;
+   ov.emu           = NULL;
+   ov.emu_thread    = NULL;
+   ov.loading_since = GetTickCount();
+   ov.audio_seen    = 0;
+   ov.frames_seen   = 0;
+   ov.styled_at     = 0;
+   ov.last_arrange  = 0;
 
    if (!ov.lock_init)
    {
@@ -1505,6 +2000,8 @@ static void overlay_start(void)
    ov.last_run  = GetTickCount();
    ov.stop      = 0;
    ov.thread    = CreateThread(NULL, 0, manager_main, NULL, 0, NULL);
+   if (!ov.thread)
+      release_emu_thread();
 }
 
 /* Each retro_run: RetroArch runs the core (the manager thread resumes Eden
@@ -1530,10 +2027,15 @@ static void overlay_stop(void)
       CloseHandle(ov.thread);
       ov.thread = NULL;
    }
+   release_emu_thread();
    if (ov.suspended && emu_process)
       ov.resume(emu_process);
    ov.suspended = false;
 
+   if (ov.topmost && IsWindow(ov.ra))
+      set_ra_topmost(false);
+   ov.topmost = false;
+   LockSetForegroundWindow(LSFW_UNLOCK);
    if (ov.transparent && IsWindow(ov.ra))
       set_ra_transparent(false);
    ov.active = false;
@@ -1555,6 +2057,110 @@ static void release_process(void)
       CloseHandle(emu_process);
    emu_process = NULL;
    emu_pid     = 0;
+}
+
+/* ---------------------------------------------------------------------- */
+/* Launch thread                                                          */
+/* ---------------------------------------------------------------------- */
+
+/* Starting Eden takes a few seconds (the room server, eden_padinfo), so
+ * it's done on a thread of its own: RetroArch keeps running and shows the
+ * loading screen meanwhile. Everything it needs from RetroArch is read
+ * before (save folder, options, multiplayer); retro_run reports how it
+ * went. */
+enum { LAUNCH_RUNNING = 0, LAUNCH_DONE, LAUNCH_FAILED };
+
+static struct
+{
+   HANDLE thread;
+   wchar_t exe[MAX_PATH * 2];
+   wchar_t cli[MAX_PATH * 2];
+   wchar_t rom[MAX_PATH * 2];
+   wchar_t workdir[MAX_PATH * 2];
+   bool overlay;        /* hand Eden over suspended to the manager thread */
+   bool fullscreen;
+   volatile LONG state;
+   const char *volatile message; /* for retro_run to show, NULL none */
+} launch;
+
+static DWORD WINAPI launch_main(LPVOID unused)
+{
+   wchar_t cmdline[MAX_PATH * 6];
+   const wchar_t *exe = launch.exe;
+   STARTUPINFOW si;
+   PROCESS_INFORMATION pi;
+   BOOL ok;
+
+   (void)unused;
+   if (mp.active && mp.host && !start_room(launch.exe, launch.workdir, launch.rom))
+   {
+      launch.message = "Multiplayer: the room couldn't be opened. Playing alone.";
+      mp.active      = false;
+   }
+
+   write_config(launch.exe, mp.active);
+   link_saves(launch.exe);
+
+   if (mp.active)
+   {
+      log_msg("multiplayer: joining %s:%u as \"%s\"%s", mp.address, mp.port, mp.nick,
+            mp.password[0] ? " with password" : "");
+      _snwprintf(cmdline, MAX_PATH * 6, L"\"%ls\" %ls-m \"%hs:%hs@%hs:%u\" -g \"%ls\"",
+            launch.cli, launch.fullscreen ? L"-f " : L"", mp.nick, mp.password,
+            mp.address, mp.port, launch.rom);
+      exe = launch.cli;
+      /* Not the room's password, which is on the command line. */
+      log_msg("starting: %ls -g \"%ls\"", exe, launch.rom);
+   }
+   else
+   {
+      _snwprintf(cmdline, MAX_PATH * 6, L"\"%ls\" %ls-g \"%ls\"",
+            exe, launch.fullscreen ? L"-f " : L"", launch.rom);
+      log_msg("starting: %ls", cmdline);
+   }
+   cmdline[MAX_PATH * 6 - 1] = L'\0';
+
+   memset(&si, 0, sizeof(si));
+   si.cb = sizeof(si);
+   {
+      /* Without Steam's SDL settings, see child_environment. */
+      wchar_t *env = child_environment();
+      ok = spawn_process(exe, cmdline, FALSE,
+            (launch.overlay ? CREATE_SUSPENDED : 0)
+            | (env ? CREATE_UNICODE_ENVIRONMENT : 0), env, launch.workdir, &si, &pi);
+      free(env);
+   }
+   if (!ok)
+   {
+      log_msg("CreateProcess failed: %lu", (unsigned long)GetLastError());
+      launch.message = "Failed to start Eden.";
+      stop_room();
+      InterlockedExchange(&launch.state, LAUNCH_FAILED);
+      return 0;
+   }
+
+   emu_process = pi.hProcess;
+   emu_pid     = pi.dwProcessId;
+   if (launch.overlay)
+      InterlockedExchangePointer((PVOID volatile*)&ov.emu_thread, pi.hThread);
+   else
+      CloseHandle(pi.hThread);
+   InterlockedExchange(&launch.state, LAUNCH_DONE);
+   return 0;
+}
+
+/* Waits for the launch thread (bounded, so RetroArch can't hang on it).
+ * True if Eden was started. */
+static bool launch_join(void)
+{
+   if (launch.thread)
+   {
+      if (WaitForSingleObject(launch.thread, 15000) != WAIT_OBJECT_0)
+         log_msg("launch thread didn't finish in time");
+      CloseHandle(launch.thread);
+      launch.thread = NULL;
+   }
+   return launch.state == LAUNCH_DONE;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1588,9 +2194,11 @@ RETRO_API void retro_init(void)
 
 RETRO_API void retro_deinit(void)
 {
+   launch_join();
    overlay_stop();
    release_process();
    stop_room();
+   loading_close();
    if (config_lock_init)
    {
       DeleteCriticalSection(&config_lock);
@@ -1623,11 +2231,11 @@ RETRO_API void retro_get_system_info(struct retro_system_info *info)
 RETRO_API void retro_get_system_av_info(struct retro_system_av_info *info)
 {
    memset(info, 0, sizeof(*info));
-   info->geometry.base_width   = FB_WIDTH;
-   info->geometry.base_height  = FB_HEIGHT;
-   info->geometry.max_width    = FB_WIDTH;
-   info->geometry.max_height   = FB_HEIGHT;
-   info->geometry.aspect_ratio = 4.0f / 3.0f;
+   info->geometry.base_width   = fb_width;
+   info->geometry.base_height  = fb_height;
+   info->geometry.max_width    = fb_width;
+   info->geometry.max_height   = fb_height;
+   info->geometry.aspect_ratio = (float)fb_width / (float)fb_height;
    info->timing.fps            = 60.0;
    info->timing.sample_rate    = 48000.0;
 }
@@ -1643,20 +2251,40 @@ RETRO_API void retro_reset(void) { }
 RETRO_API void retro_run(void)
 {
    input_poll_cb();
-   /* Black until RetroArch turns see-through; ignored after that. */
-   video_cb(framebuffer, FB_WIDTH, FB_HEIGHT, FB_WIDTH * sizeof(uint32_t));
+   loading_frame();
 
    if (ov.active)
       overlay_run();
 
+   /* The launch thread finished: what it had to say, and the end if Eden
+    * didn't start. */
+   if (launch.thread && launch.state != LAUNCH_RUNNING)
+   {
+      bool started = launch_join();
+      if (launch.message)
+      {
+         show_message(launch.message);
+         launch.message = NULL;
+      }
+      if (!started)
+      {
+         overlay_stop();
+         env_cb(RETRO_ENVIRONMENT_SHUTDOWN, NULL);
+         return;
+      }
+   }
+
    /* An option changed (Quick Menu, grid): into Eden's config, which it
-    * reads at its next start. */
+    * reads at its next start. (Once launched: the launch thread writes
+    * the config.) */
+   if (!launch.thread)
    {
       bool updated = false;
       if (env_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       {
          char before[sizeof(options_written)];
          strcpy(before, options_written);
+         read_options();
          config_edit(apply_options, NULL);
          if (strcmp(before, options_written))
          {
@@ -1666,7 +2294,8 @@ RETRO_API void retro_run(void)
       }
    }
 
-   if (emu_process && WaitForSingleObject(emu_process, 0) == WAIT_OBJECT_0)
+   if (     !launch.thread && emu_process
+         && WaitForSingleObject(emu_process, 0) == WAIT_OBJECT_0)
    {
       log_msg("Eden exited");
       overlay_stop();
@@ -1680,14 +2309,9 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
 {
    enum retro_pixel_format fmt = RETRO_PIXEL_FORMAT_XRGB8888;
    wchar_t exe[MAX_PATH * 2];
-   wchar_t cli[MAX_PATH * 2];
    wchar_t rom[MAX_PATH * 2];
-   wchar_t cmdline[MAX_PATH * 6];
-   wchar_t workdir[MAX_PATH * 2];
    wchar_t *slash;
    char env[8];
-   STARTUPINFOW si;
-   PROCESS_INFORMATION pi;
    bool overlay, fullscreen;
 
    if (!game || !game->path)
@@ -1709,6 +2333,7 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
 
    if (!to_wide(game->path, rom, MAX_PATH * 2))
       return false;
+   loading_open(rom);
 
    /* The fork's GL driver says so; its window property can't be checked
     * yet, the driver restarts after this. Under RetroArch Eden runs in
@@ -1718,71 +2343,31 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    log_msg(overlay ? "overlay mode" : "own window mode (no overlay support)");
 
    /* Run from Eden's own folder. */
-   wcscpy(workdir, exe);
-   if ((slash = wcsrchr(workdir, L'\\')))
+   wcscpy(launch.workdir, exe);
+   if ((slash = wcsrchr(launch.workdir, L'\\')))
       *slash = L'\0';
 
    read_multiplayer_settings();
    if (mp.active)
    {
-      _snwprintf(cli, MAX_PATH * 2, L"%ls\\eden-cli.exe", workdir);
-      cli[MAX_PATH * 2 - 1] = L'\0';
-      if (!file_exists(cli))
+      _snwprintf(launch.cli, MAX_PATH * 2, L"%ls\\eden-cli.exe", launch.workdir);
+      launch.cli[MAX_PATH * 2 - 1] = L'\0';
+      if (!file_exists(launch.cli))
       {
          log_msg("multiplayer: eden-cli.exe not found");
          show_message("Multiplayer needs eden-cli.exe, which comes with Eden. Playing alone.");
          mp.active = false;
       }
-      else if (mp.host && !start_room(exe, workdir, rom))
-      {
-         show_message("Multiplayer: the room couldn't be opened. Playing alone.");
-         mp.active = false;
-      }
    }
 
-   write_config(exe, mp.active);
-   link_saves(exe);
-
-   if (mp.active)
+   /* What the launch thread needs from RetroArch. */
    {
-      char nick[32];
-      player_name(nick, sizeof(nick));
-      log_msg("multiplayer: joining %s:%u as \"%s\"%s", mp.address, mp.port, nick,
-            mp.password[0] ? " with password" : "");
-      _snwprintf(cmdline, MAX_PATH * 6, L"\"%ls\" %ls-m \"%hs:%hs@%hs:%u\" -g \"%ls\"",
-            cli, fullscreen ? L"-f " : L"", nick, mp.password, mp.address, mp.port, rom);
-      wcscpy(exe, cli);
+      const char *save_dir = NULL;
+      save_dir_cache[0] = '\0';
+      if (env_cb(RETRO_ENVIRONMENT_GET_SAVE_DIRECTORY, &save_dir) && save_dir)
+         snprintf(save_dir_cache, sizeof(save_dir_cache), "%s", save_dir);
    }
-   else
-      _snwprintf(cmdline, MAX_PATH * 6, L"\"%ls\" %ls-g \"%ls\"",
-            exe, fullscreen ? L"-f " : L"", rom);
-   cmdline[MAX_PATH * 6 - 1] = L'\0';
-
-   memset(&si, 0, sizeof(si));
-   si.cb = sizeof(si);
-   /* Not the room's password, which is on the command line. */
-   if (mp.active)
-      log_msg("starting: %ls -g \"%ls\"", exe, rom);
-   else
-      log_msg("starting: %ls", cmdline);
-   {
-      /* Without Steam's SDL settings, see child_environment. */
-      wchar_t *env = child_environment();
-      BOOL ok = spawn_process(exe, cmdline, FALSE,
-            env ? CREATE_UNICODE_ENVIRONMENT : 0, env, workdir, &si, &pi);
-      free(env);
-      if (!ok)
-      {
-         log_msg("CreateProcess failed: %lu", (unsigned long)GetLastError());
-         show_message("Failed to start Eden.");
-         stop_room();
-         return false;
-      }
-   }
-
-   CloseHandle(pi.hThread);
-   emu_process = pi.hProcess;
-   emu_pid     = pi.dwProcessId;
+   read_options();
 
    /* The Switch's controls under their own names, on the RetroPad
     * controls in the same places, so RetroArch and the grid's Bindings page
@@ -1816,6 +2401,20 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
 
    if (overlay)
       overlay_start();
+
+   wcscpy(launch.exe, exe);
+   wcscpy(launch.rom, rom);
+   launch.overlay    = overlay && ov.thread;
+   launch.fullscreen = fullscreen;
+   launch.message    = NULL;
+   launch.state      = LAUNCH_RUNNING;
+   if (!(launch.thread = CreateThread(NULL, 0, launch_main, NULL, 0, NULL)))
+   {
+      log_msg("launch thread failed (%lu)", (unsigned long)GetLastError());
+      show_message("Failed to start Eden.");
+      overlay_stop();
+      return false;
+   }
    return true;
 }
 
@@ -1830,6 +2429,7 @@ RETRO_API bool retro_load_game_special(unsigned type,
 
 RETRO_API void retro_unload_game(void)
 {
+   launch_join();
    /* Restore RetroArch's window and let Eden run again first. */
    overlay_stop();
 
@@ -1839,6 +2439,7 @@ RETRO_API void retro_unload_game(void)
       EnumWindows(close_window, (LPARAM)emu_pid);
    release_process();
    stop_room();
+   loading_close();
 }
 
 RETRO_API unsigned retro_get_region(void) { return RETRO_REGION_NTSC; }

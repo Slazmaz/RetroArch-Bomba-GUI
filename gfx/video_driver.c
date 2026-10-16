@@ -2833,6 +2833,8 @@ bool video_driver_texture_unload(uintptr_t *id)
  *
  * Renders the current video frame.
  **/
+bool video_driver_bomba_hold_present = false;
+
 void video_driver_cached_frame(void)
 {
    runloop_state_t *runloop_st    = runloop_state_get_ptr();
