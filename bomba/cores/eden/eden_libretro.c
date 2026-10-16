@@ -48,7 +48,7 @@
 
 /* The loading screen fades in from black, and out to black before Eden
  * shows, black that then fades off Eden (gl2.c, GL2_BOMBA_FADE_MS). */
-#define FADE_MS          150
+#define FADE_MS          500
 
 /* Eden draws frames (see emu_presenting): shown this long after. */
 #define READY_AFTER_FRAMES_MS 300
@@ -1117,6 +1117,7 @@ static struct
    unsigned fonts_added; /* bit per entry of fonts */
    int dots;             /* dots drawn last; -1 nothing drawn yet */
    DWORD shown_at;       /* tick of the first frame, 0 none yet */
+   bool from_grid;       /* the grid's loading screen came before */
 } ld;
 
 /* Reference pixels (grid: 423 on the screen's height) to this frame's. */
@@ -1190,17 +1191,31 @@ static void loading_open(const wchar_t *rom)
       fb_height = 1080;
    }
 
-   for (p = rom; *p; p++)
-      if (*p == L'\\' || *p == L'/')
-         name = p + 1;
-   wcsncpy(ld.title, name, 255);
-   ld.title[255] = L'\0';
-   if ((cut = wcsrchr(ld.title, L'.')))
-      *cut = L'\0';
-   if ((cut = wcsstr(ld.title, L" [")))
-      *cut = L'\0';
-   if ((cut = wcsstr(ld.title, L" (")))
-      *cut = L'\0';
+   /* Started from the grid: its loading screen was up already, with the
+    * name it gives the game (BOMBA_GAME_TITLE); this one carries on from
+    * it, no fade in. */
+   {
+      char grid_title[512];
+      DWORD n = GetEnvironmentVariableA("BOMBA_GAME_TITLE", grid_title,
+            sizeof(grid_title));
+      ld.from_grid = n > 0 && n < sizeof(grid_title)
+         && to_wide(grid_title, ld.title, 256);
+      SetEnvironmentVariableA("BOMBA_GAME_TITLE", NULL);
+   }
+   if (!ld.from_grid)
+   {
+      for (p = rom; *p; p++)
+         if (*p == L'\\' || *p == L'/')
+            name = p + 1;
+      wcsncpy(ld.title, name, 255);
+      ld.title[255] = L'\0';
+      if ((cut = wcsrchr(ld.title, L'.')))
+         *cut = L'\0';
+      if ((cut = wcsstr(ld.title, L" [")))
+         *cut = L'\0';
+      if ((cut = wcsstr(ld.title, L" (")))
+         *cut = L'\0';
+   }
 
    /* Baloo 2 ships next to the exe (see build.sh). */
    if (GetModuleFileNameW(NULL, dir, MAX_PATH * 2) && (cut = wcsrchr(dir, L'\\')))
@@ -1284,7 +1299,7 @@ static unsigned loading_level(DWORD now)
 {
    DWORD in  = now - ld.shown_at;
    DWORD out = ov.styled ? now - ov.styled_at : 0;
-   unsigned level = in >= FADE_MS ? 256 : in * 256 / FADE_MS;
+   unsigned level = (ld.from_grid || in >= FADE_MS) ? 256 : in * 256 / FADE_MS;
 
    if (ov.styled)
       level = out >= FADE_MS ? 0 : level * (FADE_MS - out) / FADE_MS;

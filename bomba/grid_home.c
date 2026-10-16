@@ -94,6 +94,7 @@
 #define GRID_ZOOM_USEC 250000 /* zoom animation length */
 #define GRID_OPEN_USEC  260000 /* the menu fading in over a game */
 #define GRID_CLOSE_USEC 200000 /* ...and out when it closes */
+#define GRID_LOADING_USEC 500000 /* the loading screen fading in, and out */
 #define GRID_OSK_OPEN_USEC  220000 /* on-screen keyboard sliding in */
 #define GRID_OSK_CLOSE_USEC 150000 /* ...and out */
 /* The layout is measured from a 752x423 reference screen. REF(px)
@@ -151,6 +152,15 @@ typedef struct
    bool art_tried;
    bool pending;                      /* its core is still downloading */
 } grid_game_t;
+
+/* A game's loading screen (see grid_launch). */
+enum grid_loading
+{
+   LOADING_NONE = 0,
+   LOADING_IN,     /* fading in over the grid */
+   LOADING_START,  /* fully shown: the game starts next */
+   LOADING_OUT     /* the game started: fading out over it */
+};
 
 enum grid_tab_type
 {
@@ -542,6 +552,10 @@ static struct
    /* When the menu opened over a game (it fades in) or closed back to it
     * (it fades out), 0 not fading. */
    retro_time_t open_start, close_start;
+   /* The loading screen of the game being started (see grid_launch). */
+   enum grid_loading loading;
+   retro_time_t loading_start;   /* when it began fading in */
+   grid_game_t loading_game;
    enum grid_choice_kind art_kind;
    size_t art_count;        /* previews the textures below were made for */
    unsigned art_cols;       /* previews per row, as last laid out */
@@ -754,6 +768,10 @@ int action_ok_close_content(const char *path, const char *label,
 /* Opacity of everything drawn this frame (the menu fading in), applied by
  * grid_set_color and to text. 1 outside the grid's frame. */
 static float grid_alpha = 1.0f;
+
+/* How long the menu fades out as it closes: a game's loading screen more
+ * slowly. */
+static retro_time_t grid_close_usec(void);
 
 static void grid_set_color(float *dst, uint32_t rgba)
 {
@@ -1257,14 +1275,46 @@ static bool grid_is_running(const grid_game_t *game)
       && string_is_equal(content, game->path);
 }
 
+/* Starts a game behind its loading screen: the screen fades in over the
+ * grid first (grid_draw_loading), and once it has been drawn whole the
+ * game starts (grid_launch_now, from grid_home_iterate). RetroArch stops
+ * while a game loads, with that screen up; it then fades out over the
+ * game as the menu closes. */
 static void grid_launch(const grid_game_t *game)
 {
+   if (grid_st.loading != LOADING_NONE)
+      return;
+   grid_st.loading_game  = *game;
+   grid_st.loading       = LOADING_IN;
+   grid_st.loading_start = cpu_features_get_time_usec();
+}
+
+static retro_time_t grid_close_usec(void)
+{
+   return grid_st.loading == LOADING_OUT ? GRID_LOADING_USEC : GRID_CLOSE_USEC;
+}
+
+#ifdef _WIN32
+/* (kernel32; windows.h isn't included here.) */
+__declspec(dllimport) int __stdcall SetEnvironmentVariableA(
+      const char *name, const char *value);
+#endif
+
+static void grid_launch_now(void)
+{
+   const grid_game_t *game = &grid_st.loading_game;
    content_ctx_info_t content_info;
 
    content_info.argc        = 0;
    content_info.argv        = NULL;
    content_info.args        = NULL;
    content_info.environ_get = NULL;
+
+#ifdef _WIN32
+   /* For a launcher core's own loading screen (Eden's), so it shows the
+    * same name. */
+   SetEnvironmentVariableA("BOMBA_GAME_TITLE", game->title);
+#endif
 
    /* Its console's game buttons, as RetroArch's remap for this game. */
    grid_controls_apply(game->system, game->core_path, game->path);
@@ -1274,6 +1324,10 @@ static void grid_launch(const grid_game_t *game)
    task_push_load_content_with_new_core_from_menu(
          game->core_path, game->path, &content_info,
          CORE_TYPE_PLAIN, NULL, NULL);
+
+   /* (Loading is done by now.) Started: the screen fades out with the
+    * menu closing. Failed: back to the grid, RetroArch says why. */
+   grid_st.loading = grid_is_running(game) ? LOADING_OUT : LOADING_NONE;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1523,6 +1577,9 @@ void grid_home_toggle(bool menu_on)
       ? cpu_features_get_time_usec() : 0;
    grid_st.close_start = (!menu_on && grid_content_running())
       ? cpu_features_get_time_usec() : 0;
+   /* A started game's loading screen fades out as the menu closes. */
+   if (menu_on || !grid_st.close_start)
+      grid_st.loading = LOADING_NONE;
 
    /* Controllers are looked at afresh (what is held as the menu opens
     * isn't a new press); leaving it, the pointer is as RetroArch has it,
@@ -3341,6 +3398,13 @@ static void grid_input_mode_poll(void);
 
 void grid_home_iterate(void)
 {
+   /* The loading screen is up: start its game. */
+   if (grid_st.loading == LOADING_START)
+   {
+      grid_launch_now();
+      return;
+   }
+
    grid_input_mode_poll();
    grid_dl_hold_iterate();
    grid_mp_follow_host();
@@ -3681,6 +3745,10 @@ bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth)
    if (grid_st.forwarding)
       return false;
 
+   /* A game is starting: nothing to do on its loading screen. */
+   if (grid_st.loading != LOADING_NONE)
+      return true;
+
    /* A console control just bound: keep it. */
    grid_cc_bind_poll();
 
@@ -3766,10 +3834,10 @@ bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth)
       /* Face buttons as labelled on the player's controller: the menu's
        * "search" is Y (top), its "scan" X (left). Select and Start do
        * nothing here. */
-      case MENU_ACTION_SEARCH:      /* Y : zoom */
+      case MENU_ACTION_SCAN:        /* X : zoom */
          grid_zoom();
          break;
-      case MENU_ACTION_SCAN:        /* X : the selected game's menu (quit
+      case MENU_ACTION_SEARCH:      /* Y : the selected game's menu (quit
                                      * the running game is in it) */
          if (     grid_st.selection < grid_st.view_count
                && !grid_st.games[grid_st.view[grid_st.selection]].pending)
@@ -4208,6 +4276,10 @@ bool grid_home_mouse(int x, int y, unsigned flags)
    const grid_hit_t *hit = NULL;
    unsigned i;
 
+   /* A game is starting: nothing to point at on its loading screen. */
+   if (grid_st.loading != LOADING_NONE)
+      return true;
+
    if (!grid_st.mouse_seen)
    {
       grid_st.mouse_rest_x = x;
@@ -4287,7 +4359,7 @@ bool grid_home_mouse(int x, int y, unsigned flags)
       if (hit && hit->kind == HIT_TILE)
       {
          grid_hit_select(hit);
-         grid_mouse_dispatch(MENU_ACTION_SCAN);
+         grid_mouse_dispatch(MENU_ACTION_SEARCH);
       }
       else
          grid_mouse_dispatch(MENU_ACTION_CANCEL);
@@ -7718,12 +7790,17 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
    float hints_w  = 0.0f, hx;
 
    /* Hints, right-aligned, only those that apply right now, in the order
-    * Y, X, A, B: Zoom outside menus, Back only inside them. Face buttons
-    * are labelled as on the player's controller ("X" = the menu's scan
-    * action, "Y" = search). */
+    * Y, X, A, B: Options and Zoom outside menus, Back only inside them.
+    * Face buttons are labelled as on the player's controller ("X" = the
+    * menu's scan action, "Y" = search). */
    if (grid_st.panel == PANEL_NONE && !grid_settings_shown())
    {
-      glyphs[n] = "Y"; labels[n++] = "Zoom";
+      if (     !grid_st.bar_focus && has_sel
+            && !grid_st.games[grid_st.view[grid_st.selection]].pending)
+      {
+         glyphs[n] = "Y"; labels[n++] = "Options";
+      }
+      glyphs[n] = "X"; labels[n++] = "Zoom";
    }
 
    if (grid_settings_shown() && grid_st.cc_level == 1)
@@ -7869,10 +7946,6 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
    }
    else
    {
-      if (has_sel && !grid_st.games[grid_st.view[grid_st.selection]].pending)
-      {
-         glyphs[n] = "X"; labels[n++] = "Options";
-      }
       if (has_sel && !grid_st.games[grid_st.view[grid_st.selection]].pending)
       {
          glyphs[n] = "A";
@@ -9426,6 +9499,37 @@ static void grid_draw_keyboard(gfx_display_t *p_disp, void *userdata,
             hint_glyphs[k], hint_labels[k], false) + REF(19);
 }
 
+/* A game's loading screen (see grid_launch), at opacity a: black, the
+ * game's name and "Loading..." with stepping dots under it. Laid out as
+ * the Switch core's own (eden_libretro.c, loading_draw), which follows it
+ * seamlessly. */
+static void grid_draw_loading(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, float a)
+{
+   float ts = CAP(13);
+   float ss = CAP(GRID_TEXT_CAP);
+   int dots = (int)(cpu_features_get_time_usec() / 400000 % 4);
+   char title[NAME_MAX_LENGTH];
+   char text[16];
+
+   grid_draw_rect(p_disp, userdata, width, height, 0, 0, width, height,
+         grid_fade(0x000000ff, a));
+
+   grid_fit_text(true, grid_st.loading_game.title, width - 2.0f * REF(35),
+         height, ts, title, sizeof(title));
+   grid_draw_text_bold(title, width / 2.0f, floorf(REF(208) + 0.5f),
+         width, height, grid_fade(COL_TEXT, a), TEXT_ALIGN_CENTER, ts);
+
+   /* "Loading" stays put as the dots change. */
+   strlcpy(text, "Loading...", sizeof(text));
+   text[7 + dots] = '\0';
+   grid_draw_text(text,
+         floorf((width - grid_text_width("Loading...", height, ss)) / 2.0f + 0.5f),
+         floorf(REF(232) + 0.5f), width, height, grid_fade(COL_TEXT_DIM, a),
+         TEXT_ALIGN_LEFT, ss);
+   grid_flush_text(width, height);
+}
+
 /* Copies text to out, cut to fit max_w with "..." when too wide. Never
  * splits a UTF-8 character. */
 static void grid_fit_text(bool bold, const char *text, float max_w,
@@ -10450,8 +10554,20 @@ bool grid_home_frame(video_frame_info_t *video_info)
    if (grid_st.close_start)
    {
       float p = grid_clamp01((float)(cpu_features_get_time_usec()
-            - grid_st.close_start) / GRID_CLOSE_USEC);
+            - grid_st.close_start) / grid_close_usec());
       grid_alpha = 1.0f - p * p * (3.0f - 2.0f * p);
+   }
+
+   /* A game started: only its loading screen, fading out over it. */
+   if (grid_st.loading == LOADING_OUT)
+   {
+      if (video_st->current_video && video_st->current_video->set_viewport)
+         video_st->current_video->set_viewport(
+               video_st->data, width, height, true, false);
+      grid_draw_loading(p_disp, userdata, width, height, 1.0f);
+      grid_hits  = grid_hits_next;
+      grid_alpha = 1.0f;
+      return true;
    }
 
    /* Point saves at the current profile (once). */
@@ -10834,6 +10950,20 @@ bool grid_home_frame(video_frame_info_t *video_info)
 
    grid_flush_text(width, height);
 
+   /* A game about to start: its loading screen fades in over all this;
+    * once drawn whole, the game starts (grid_home_iterate). */
+   if (grid_st.loading == LOADING_IN || grid_st.loading == LOADING_START)
+   {
+      float p = (float)(cpu_features_get_time_usec() - grid_st.loading_start)
+            / GRID_LOADING_USEC;
+      if (p >= 1.0f || p < 0.0f)
+      {
+         p               = 1.0f;
+         grid_st.loading = LOADING_START;
+      }
+      grid_draw_loading(p_disp, userdata, width, height, p);
+   }
+
    grid_hits = grid_hits_next;
    grid_alpha = 1.0f;
    return true;
@@ -10844,9 +10974,10 @@ void grid_home_closing_frame(void *video_info)
    if (!grid_st.close_start)
       return;
    if (     !grid_content_running()
-         || cpu_features_get_time_usec() - grid_st.close_start >= GRID_CLOSE_USEC)
+         || cpu_features_get_time_usec() - grid_st.close_start >= grid_close_usec())
    {
       grid_st.close_start = 0;
+      grid_st.loading     = LOADING_NONE;
       return;
    }
    grid_home_frame((video_frame_info_t*)video_info);
