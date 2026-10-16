@@ -211,6 +211,11 @@ if (-not ($argsToPass -contains "--config" -or $argsToPass -contains "-c")) {
 
 $workingDir = Split-Path -Parent $exe
 
+# A release unzipped by Explorer marks retroarch.exe as downloaded, and
+# Start-Process then waits on a security prompt this hidden window never
+# shows: clear the mark first.
+Unblock-File -LiteralPath $exe -ErrorAction SilentlyContinue
+
 if ($argsToPass.Count -gt 0) {
     # Start-Process doesn't quote array args, so paths with spaces would split.
     $argString = ($argsToPass | ForEach-Object {
