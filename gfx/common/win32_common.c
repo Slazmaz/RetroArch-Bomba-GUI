@@ -1892,6 +1892,10 @@ static bool win32_reuse_kept_window(unsigned style)
          || kind != kept_kind
          || (GetWindowLongPtr(hwnd, GWL_STYLE) & mask) != ((LONG_PTR)style & mask))
    {
+      /* Its WM_DESTROY would reach RetroArch's window procedure and flag
+       * a quit, failing the init this window is being replaced for
+       * (e.g. toggling fullscreen). */
+      SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)DefWindowProc);
       DestroyWindow(hwnd);
       return false;
    }
