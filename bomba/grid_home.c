@@ -290,7 +290,7 @@ typedef struct
 
 static const grid_simple_setting_t grid_simple_graphics[] = {
    { MSG_UNKNOWN,                              "Consoles" },
-   { MENU_ENUM_LABEL_VIDEO_FULLSCREEN,         "Fullscreen" },
+   { MENU_ENUM_LABEL_VIDEO_DISPLAY_MODE,       "Display mode" },
    { MENU_ENUM_LABEL_VIDEO_ASPECT_RATIO_INDEX, "Aspect ratio" },
    { MENU_ENUM_LABEL_VIDEO_SCALE_INTEGER,      "Pixel-perfect scaling" },
    { MENU_ENUM_LABEL_VIDEO_SMOOTH,             "Smooth pixels" },
@@ -2247,6 +2247,7 @@ int grid_home_settings_build(void *list, bool main_menu)
    if (!s)
       return -1;
 
+   menu_setting_display_mode_sync();
    for (; s->entry != MSG_UNKNOWN || s->label; s++)
    {
       if (s->entry == MSG_UNKNOWN)

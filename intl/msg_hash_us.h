@@ -2404,6 +2404,14 @@ MSG_HASH(
    "If fullscreen, prefer using a fullscreen window to prevent display mode switching."
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VALUE_VIDEO_DISPLAY_MODE,
+   "Display Mode"
+   )
+MSG_HASH(
+   MENU_ENUM_SUBLABEL_VIDEO_DISPLAY_MODE,
+   "Windowed, borderless fullscreen or exclusive fullscreen."
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_FULLSCREEN_X,
    "Fullscreen Width"
    )
