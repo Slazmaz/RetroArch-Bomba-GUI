@@ -176,6 +176,19 @@ if ($steamExe) {
     }
 }
 
+# retroarch.exe needs Steam's mist (mist.dll, mist\, steam_appid.txt),
+# which releases don't carry: take it from Steam's RetroArch when missing.
+if ($steamExe) {
+    $steamRa = Split-Path -Parent $steamExe
+    foreach ($name in "mist.dll", "mist", "steam_appid.txt") {
+        $src = Join-Path $steamRa $name
+        $dst = Join-Path $app $name
+        if ((Test-Path -LiteralPath $src) -and -not (Test-Path -LiteralPath $dst)) {
+            Copy-Item -LiteralPath $src -Destination $dst -Recurse
+        }
+    }
+}
+
 # Tell the user (via the fork's on-screen messages) when Steam has shipped
 # a newer RetroArch than this build is based on.
 if ($steamExe) {
