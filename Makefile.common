@@ -2718,7 +2718,7 @@ ifeq ($(HAVE_MIST), 1)
 endif
 
 ### Bomba additions
-OBJ += bomba/bomba_notify.o
+OBJ += bomba/bomba_notify.o bomba/bomba_crash.o
 ifeq ($(HAVE_XMB), 1)
    OBJ += bomba/grid_home.o bomba/grid_meta.o bomba/grid_cover.o \
           bomba/grid_cores.o bomba/grid_profile.o \

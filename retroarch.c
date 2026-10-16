@@ -109,6 +109,7 @@
 #endif
 
 #include "bomba/bomba_notify.h"
+#include "bomba/bomba_crash.h"
 
 #include "config.def.h"
 
@@ -5952,6 +5953,7 @@ int rarch_main(int argc, char *argv[], void *data)
                       |  RUNLOOP_FLAG_RUNAHEAD_FORCE_INPUT_DIRTY
                         );
 #endif
+   bomba_crash_init();
 #if defined(_WIN32) && !defined(_XBOX) && !defined(__WINRT__)
    if (FAILED(CoInitialize(NULL)))
    {
