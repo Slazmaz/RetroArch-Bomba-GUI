@@ -4758,6 +4758,10 @@ MSG_HASH(
    "video_windowed_fullscreen"
    )
 MSG_HASH(
+   MENU_ENUM_LABEL_VIDEO_DISPLAY_MODE,
+   "video_display_mode"
+   )
+MSG_HASH(
    MENU_ENUM_LABEL_VIDEO_WINDOW_WIDTH,
    "video_window_width"
    )

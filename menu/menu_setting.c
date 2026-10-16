@@ -9063,6 +9063,84 @@ static void runahead_change_handler(rarch_setting_t *setting)
 }
 #endif
 
+/* Bomba: Display Mode, one choice in place of Fullscreen + Windowed
+ * Fullscreen Mode, kept in those two (so the fullscreen hotkey and saved
+ * configs go on working): windowed, borderless fullscreen (a fullscreen
+ * window) or exclusive fullscreen. */
+enum
+{
+   DISPLAY_MODE_WINDOWED = 0,
+   DISPLAY_MODE_BORDERLESS,
+   DISPLAY_MODE_FULLSCREEN
+};
+
+static unsigned display_mode = DISPLAY_MODE_WINDOWED;
+
+void menu_setting_display_mode_sync(void)
+{
+   settings_t *settings = config_get_ptr();
+
+   if (!settings->bools.video_fullscreen)
+      display_mode = DISPLAY_MODE_WINDOWED;
+   else if (settings->bools.video_windowed_fullscreen)
+      display_mode = DISPLAY_MODE_BORDERLESS;
+   else
+      display_mode = DISPLAY_MODE_FULLSCREEN;
+}
+
+static size_t setting_get_string_representation_display_mode(
+      rarch_setting_t *setting, char *s, size_t len)
+{
+   static const char *names[] = {
+      "Windowed", "Borderless fullscreen", "Fullscreen" };
+   unsigned mode = *setting->value.target.unsigned_integer;
+
+   if (mode <= DISPLAY_MODE_FULLSCREEN)
+      return strlcpy(s, names[mode], len);
+   return 0;
+}
+
+static void display_mode_change_handler(rarch_setting_t *setting)
+{
+   settings_t *settings = config_get_ptr();
+   unsigned mode        = *setting->value.target.unsigned_integer;
+   bool fullscreen      = mode != DISPLAY_MODE_WINDOWED;
+   bool borderless      = mode != DISPLAY_MODE_FULLSCREEN;
+
+   /* Windowed keeps the borderless choice for the fullscreen hotkey. */
+   if (     fullscreen == settings->bools.video_fullscreen
+         && (!fullscreen || borderless == settings->bools.video_windowed_fullscreen))
+      return;
+
+   configuration_set_bool(settings, settings->bools.video_fullscreen, fullscreen);
+   if (fullscreen)
+      configuration_set_bool(settings,
+            settings->bools.video_windowed_fullscreen, borderless);
+   command_event(CMD_EVENT_REINIT_FROM_TOGGLE, NULL);
+}
+
+/* The two settings may have changed since (the hotkey): start from them. */
+static int setting_display_mode_action_left(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   menu_setting_display_mode_sync();
+   return setting_uint_action_left_default(setting, idx, wraparound);
+}
+
+static int setting_display_mode_action_right(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   menu_setting_display_mode_sync();
+   return setting_uint_action_right_default(setting, idx, wraparound);
+}
+
+static int setting_display_mode_action_ok(
+      rarch_setting_t *setting, size_t idx, bool wraparound)
+{
+   menu_setting_display_mode_sync();
+   return setting_action_ok_uint(setting, idx, wraparound);
+}
+
 #ifdef HAVE_OVERLAY
 static void overlay_enable_toggle_change_handler(rarch_setting_t *setting)
 {
@@ -12754,8 +12832,33 @@ static bool setting_append_list(
                      parent_group,
                      general_write_handler,
                      general_read_handler,
-                     SD_FLAG_NONE);
+                     SD_FLAG_CMD_APPLY_AUTO);
+               /* Bomba: switching it while fullscreen applies at once. */
+               MENU_SETTINGS_LIST_CURRENT_ADD_CMD(list, list_info, CMD_EVENT_REINIT_FROM_TOGGLE);
                SETTINGS_DATA_LIST_CURRENT_ADD_FLAGS(list, list_info, SD_FLAG_LAKKA_ADVANCED);
+
+               /* Bomba: Display Mode (see display_mode_change_handler). */
+               menu_setting_display_mode_sync();
+               CONFIG_UINT(
+                     list, list_info,
+                     &display_mode,
+                     MENU_ENUM_LABEL_VIDEO_DISPLAY_MODE,
+                     MENU_ENUM_LABEL_VALUE_VIDEO_DISPLAY_MODE,
+                     DISPLAY_MODE_WINDOWED,
+                     &group_info,
+                     &subgroup_info,
+                     parent_group,
+                     general_write_handler,
+                     general_read_handler);
+               menu_settings_list_current_add_range(list, list_info,
+                     DISPLAY_MODE_WINDOWED, DISPLAY_MODE_FULLSCREEN, 1, true, true);
+               (*list)[list_info->index - 1].ui_type        = ST_UI_TYPE_UINT_COMBOBOX;
+               (*list)[list_info->index - 1].change_handler = display_mode_change_handler;
+               (*list)[list_info->index - 1].action_left    = setting_display_mode_action_left;
+               (*list)[list_info->index - 1].action_right   = setting_display_mode_action_right;
+               (*list)[list_info->index - 1].action_ok      = setting_display_mode_action_ok;
+               (*list)[list_info->index - 1].get_string_representation =
+                  &setting_get_string_representation_display_mode;
 
                CONFIG_UINT(
                      list, list_info,

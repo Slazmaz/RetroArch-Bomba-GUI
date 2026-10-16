@@ -90,6 +90,10 @@ enum setting_type menu_setting_get_browser_selection_type(
 
 void setting_generic_handle_change(rarch_setting_t *setting);
 
+/* Bomba: Display Mode's value from video_fullscreen and
+ * video_windowed_fullscreen, which may have changed (the hotkey). */
+void menu_setting_display_mode_sync(void);
+
 /**
  * menu_setting_new:
  * @mask               : Bitmask of settings to include.
