@@ -6,6 +6,7 @@ used under the Flaticon license (free with attribution). Some are recoloured.
 | File | Icon | Author |
 | --- | --- | --- |
 | `backspace.png` | [Remove](https://www.flaticon.com/free-icon/remove_9661471) | Darius Dan |
+| `crown.png` | [Crown](https://www.flaticon.com/free-icon/crown_5076417) | zky.icon |
 | `download.png` | [Download](https://www.flaticon.com/free-icon/download_4196713) | Cuputo |
 | `friends.png` | [Friend](https://www.flaticon.com/free-icon/friend_8138760) | Anggara |
 | `globe.png` | [Website](https://www.flaticon.com/free-icon/website_12888095) | Khoirul Anwar |

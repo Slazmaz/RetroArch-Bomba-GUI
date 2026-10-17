@@ -23,9 +23,6 @@
 
 #define STEAM_APPID 1118310u
 
-/* steam/steam.c: the rich presence friends join through. */
-void steam_set_connect(const char *connect);
-
 /* Flat Steamworks API (SDK 1.57) as steam_api64.dll exports it; the
  * structures as the SDK lays them out on Windows (8-byte packing). */
 typedef uint64_t steam_id_t;
@@ -68,11 +65,14 @@ enum
    CB_NET_SESSION_REQUEST       = 1251
 };
 
-#define LOBBY_FRIENDS_ONLY       1
+/* Joined only through an invite (no Join Game in friends lists). */
+#define LOBBY_PRIVATE            0
 #define IDENTITY_STEAMID         16
 #define RESULT_OK                1
 #define ENTER_SUCCESS            1
 #define CHAT_LEFT_MASK           (2 | 4 | 8 | 16)
+/* The test player (see sn_fake_wanted): no real Steam ID is this. */
+#define FAKE_ID                  1u
 /* Unreliable, no Nagle (the emulator's protocol does its own
  * reliability), and reopen a session that broke. */
 #define SEND_FLAGS               (1 | 32)
@@ -105,6 +105,12 @@ static struct
 
    const char* (*GetFriendPersonaName)(void*, steam_id_t);
    const char* (*GetPersonaName)(void*);
+   int      (*GetLargeFriendAvatar)(void*, steam_id_t);
+   int      (*GetMediumFriendAvatar)(void*, steam_id_t);
+
+   void*    (*SteamUtils)(void);
+   bool     (*GetImageSize)(void*, int, uint32_t*, uint32_t*);
+   bool     (*GetImageRGBA)(void*, int, uint8_t*, int);
 
    steam_id_t (*GetSteamID)(void*);
 
@@ -123,6 +129,10 @@ static struct
 #define PEER_IDLE_USEC (30 * 1000000LL)
 /* Steam not making a session: asked again after this long. */
 #define SN_RETRY_USEC  (30 * 1000000LL)
+/* How often the session's players are looked at. */
+#define SN_PLAYERS_USEC (250000LL)
+/* The test player joins this long after the session opens. */
+#define SN_FAKE_USEC   (5 * 1000000LL)
 
 typedef struct
 {
@@ -135,7 +145,7 @@ static struct
 {
    bool ok;
    int32_t pipe;
-   void *mm, *friends, *msgs;
+   void *mm, *friends, *msgs, *utils;
    steam_id_t me;
 
    enum bomba_steamnet_state state;
@@ -155,6 +165,24 @@ static struct
    /* Guest: the room's stand-in. */
    SOCKET local;
    unsigned local_port;
+
+   /* The others in the session, as last looked at (players_known: once
+    * looked at, so who is there on arrival isn't news). avatar_of: whose
+    * picture each shows (the test player shows this player's). */
+   bomba_steamnet_player_t players[BOMBA_STEAMNET_MAX_PLAYERS];
+   steam_id_t avatar_of[BOMBA_STEAMNET_MAX_PLAYERS];
+   unsigned nplayers;
+   bool players_known;
+   int64_t players_at;
+
+   /* Host: players kicked who haven't left the lobby yet (read by the
+    * tunnel too). */
+   volatile steam_id_t kicked[BOMBA_STEAMNET_MAX_PLAYERS];
+   volatile unsigned nkicked;
+
+   /* Host: the test player, in the session from fake_at. */
+   bool fake;
+   int64_t fake_at;
 
    sthread_t *thread;
    volatile bool run;
@@ -216,6 +244,15 @@ static SOCKET sn_udp_socket(void)
    WSAIoctl(s, SIO_UDP_CONNRESET, &report, sizeof(report),
          NULL, 0, &bytes, NULL, NULL);
    return s;
+}
+
+static bool sn_is_kicked(steam_id_t id)
+{
+   unsigned i;
+   for (i = 0; i < sn.nkicked; i++)
+      if (sn.kicked[i] == id)
+         return true;
+   return false;
 }
 
 static peer_t *sn_peer(peer_t *peers, size_t *count, steam_id_t id)
@@ -289,7 +326,9 @@ static void sn_tunnel(void *data)
          net_msg_t *m    = msgs[k];
          steam_id_t from = m->peer.type == IDENTITY_STEAMID
             ? m->peer.u.steam_id : 0;
-         if (host && from)
+         if (host && from && sn_is_kicked(from))
+            ; /* sent out of the session */
+         else if (host && from)
          {
             peer_t *p = sn_peer(peers, &npeers, from);
             if (p)
@@ -403,24 +442,11 @@ static void sn_tunnel_stop(void)
 /* Session                                                                */
 /* ---------------------------------------------------------------------- */
 
-/* Friends join through the session's lobby: Steam's "Invite to Game" and
- * "Join Game" hand them this, as a callback or as RetroArch's command
- * line (see launch.ps1). */
-static void sn_advertise(void)
-{
-   char connect[64];
-   snprintf(connect, sizeof(connect), "+connect_lobby %llu",
-         (unsigned long long)sn.lobby);
-   steam_set_connect(connect);
-}
-
 static void sn_end(void)
 {
    sn_tunnel_stop();
    if (sn.lobby)
       api.LeaveLobby(sn.mm, sn.lobby);
-   if (sn.state == BOMBA_STEAMNET_HOSTING || sn.state == BOMBA_STEAMNET_JOINED)
-      steam_set_connect("");
    sn.state          = BOMBA_STEAMNET_OFF;
    sn.lobby          = 0;
    sn.host           = 0;
@@ -429,6 +455,10 @@ static void sn_end(void)
    sn.pub_title[0]   = '\0';
    sn.host_system[0] = '\0';
    sn.host_title[0]  = '\0';
+   sn.nplayers       = 0;
+   sn.players_known  = false;
+   sn.nkicked        = 0;
+   sn.fake           = false;
 }
 
 /* This player's own session (see bomba_steamnet_poll). */
@@ -436,7 +466,7 @@ static void sn_host(void)
 {
    sn_end();
    sn.state = BOMBA_STEAMNET_CREATING;
-   api.CreateLobby(sn.mm, LOBBY_FRIENDS_ONLY, BOMBA_STEAMNET_MAX_PLAYERS);
+   api.CreateLobby(sn.mm, LOBBY_PRIVATE, BOMBA_STEAMNET_MAX_PLAYERS);
 }
 
 /* A friend's session, from an invite or Join Game. */
@@ -458,6 +488,20 @@ static void sn_back_home(int64_t delay)
 {
    sn_end();
    sn.host_at = sn_now() + delay;
+}
+
+/* Testing without a friend: a player who is this player again (name and
+ * picture) joins one's own session, while a file "bomba-fake-player" sits
+ * next to retroarch.exe. Kicking sends it away. */
+static bool sn_fake_wanted(void)
+{
+   char path[MAX_PATH], *slash;
+   GetModuleFileNameA(NULL, path, sizeof(path));
+   if (!(slash = strrchr(path, '\\')))
+      return false;
+   strlcpy(slash + 1, "bomba-fake-player",
+         sizeof(path) - (size_t)(slash + 1 - path));
+   return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
 }
 
 static void sn_on_lobby_created(const lobby_created_t *c)
@@ -483,7 +527,8 @@ static void sn_on_lobby_created(const lobby_created_t *c)
    api.SetLobbyData(sn.mm, sn.lobby, "bomba", "1");
    api.SetLobbyData(sn.mm, sn.lobby, "name", sn.my_name);
    sn.state = BOMBA_STEAMNET_HOSTING;
-   sn_advertise();
+   sn.fake    = sn_fake_wanted();
+   sn.fake_at = sn_now() + SN_FAKE_USEC;
    sn_tunnel_start();
    RARCH_LOG("[Bomba] Hosting Steam lobby %llu.\n",
          (unsigned long long)sn.lobby);
@@ -539,7 +584,6 @@ static void sn_on_lobby_enter(const lobby_enter_t *e)
       sn.local_port = ntohs(addr.sin_port);
    }
    sn.state = BOMBA_STEAMNET_JOINED;
-   sn_advertise();
    sn_tunnel_start();
    RARCH_LOG("[Bomba] Joined Steam lobby %llu (host %llu), local port %u.\n",
          (unsigned long long)sn.lobby, (unsigned long long)sn.host,
@@ -561,10 +605,37 @@ static bool sn_is_member(steam_id_t id)
    return false;
 }
 
+/* Whether the lobby's "kick" list (Steam IDs, space-separated) has id. */
+static bool sn_kick_lists(steam_id_t id)
+{
+   const char *s = sn_lobby_data(sn.lobby, "kick");
+   while (*s)
+   {
+      char *end;
+      steam_id_t k = strtoull(s, &end, 10);
+      if (end == s)
+         break;
+      if (k == id)
+         return true;
+      s = end;
+   }
+   return false;
+}
+
 static void sn_on_lobby_data(const lobby_data_t *d)
 {
-   if (d->lobby == sn.lobby && sn.state == BOMBA_STEAMNET_JOINED)
-      sn_read_host_game();
+   if (d->lobby != sn.lobby || sn.state != BOMBA_STEAMNET_JOINED)
+      return;
+   if (sn_kick_lists(sn.me))
+   {
+      char msg[128];
+      snprintf(msg, sizeof(msg), "Multiplayer: %s removed you from the "
+            "session.", sn.host_name);
+      sn_back_home(0);
+      sn_message(msg);
+      return;
+   }
+   sn_read_host_game();
 }
 
 static void sn_on_lobby_chat(const lobby_chat_t *c)
@@ -612,7 +683,8 @@ static void sn_dispatch(int id, const void *param)
          /* Only players in this session reach the room. */
          if (     sn.state == BOMBA_STEAMNET_HOSTING
                && who->type == IDENTITY_STEAMID
-               && sn_is_member(who->u.steam_id))
+               && sn_is_member(who->u.steam_id)
+               && !sn_is_kicked(who->u.steam_id))
          {
             RARCH_LOG("[Bomba] Connection from %llu accepted (%d).\n",
                   (unsigned long long)who->u.steam_id,
@@ -691,6 +763,11 @@ void bomba_steamnet_init(void)
    SN_SYM(GetLobbyMemberByIndex, "SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex");
    SN_SYM(GetFriendPersonaName,  "SteamAPI_ISteamFriends_GetFriendPersonaName");
    SN_SYM(GetPersonaName,        "SteamAPI_ISteamFriends_GetPersonaName");
+   SN_SYM(GetLargeFriendAvatar,  "SteamAPI_ISteamFriends_GetLargeFriendAvatar");
+   SN_SYM(GetMediumFriendAvatar, "SteamAPI_ISteamFriends_GetMediumFriendAvatar");
+   SN_SYM(SteamUtils,            "SteamAPI_SteamUtils_v010");
+   SN_SYM(GetImageSize,          "SteamAPI_ISteamUtils_GetImageSize");
+   SN_SYM(GetImageRGBA,          "SteamAPI_ISteamUtils_GetImageRGBA");
    SN_SYM(GetSteamID,            "SteamAPI_ISteamUser_GetSteamID");
    SN_SYM(SendMessageToUser,     "SteamAPI_ISteamNetworkingMessages_SendMessageToUser");
    SN_SYM(ReceiveMessages,       "SteamAPI_ISteamNetworkingMessages_ReceiveMessagesOnChannel");
@@ -725,6 +802,7 @@ void bomba_steamnet_init(void)
    sn.friends = api.Friends();
    sn.msgs    = api.Messages();
    sn.me      = api.GetSteamID(api.User());
+   sn.utils   = api.SteamUtils();
    if (!sn.mm || !sn.friends || !sn.msgs)
    {
       api.Shutdown();
@@ -768,6 +846,130 @@ static void sn_publish_game(void)
    api.SetLobbyData(sn.mm, sn.lobby, "title",  title);
 }
 
+static bomba_steamnet_player_t *sn_find_player(
+      bomba_steamnet_player_t *list, unsigned n, steam_id_t id)
+{
+   unsigned i;
+   for (i = 0; i < n; i++)
+      if (list[i].id == id)
+         return &list[i];
+   return NULL;
+}
+
+/* Host: the lobby's kick list from sn.kicked. */
+static void sn_publish_kicked(void)
+{
+   char list[BOMBA_STEAMNET_MAX_PLAYERS * 21 + 1];
+   size_t len = 0;
+   unsigned i;
+   list[0] = '\0';
+   for (i = 0; i < sn.nkicked; i++)
+      len += snprintf(list + len, sizeof(list) - len, "%s%llu",
+            i ? " " : "", (unsigned long long)sn.kicked[i]);
+   api.SetLobbyData(sn.mm, sn.lobby, "kick", list);
+}
+
+/* Who else is in the session (the host first), telling of arrivals and
+ * departures. */
+static void sn_refresh_players(void)
+{
+   bomba_steamnet_player_t now[BOMBA_STEAMNET_MAX_PLAYERS];
+   steam_id_t avatar_of[BOMBA_STEAMNET_MAX_PLAYERS];
+   bool hosting     = sn.state == BOMBA_STEAMNET_HOSTING;
+   steam_id_t owner = api.GetLobbyOwner(sn.mm, sn.lobby);
+   int members      = api.GetNumLobbyMembers(sn.mm, sn.lobby);
+   unsigned n = 0, i;
+   int m;
+
+   for (m = 0; m < members && n < BOMBA_STEAMNET_MAX_PLAYERS; m++)
+   {
+      steam_id_t id = api.GetLobbyMemberByIndex(sn.mm, sn.lobby, m);
+      const char *name;
+      /* (Kicked players linger until their side sees it.) */
+      if (!id || id == sn.me || (hosting && sn_is_kicked(id)))
+         continue;
+      name = api.GetFriendPersonaName(sn.friends, id);
+      memset(&now[n], 0, sizeof(now[n]));
+      now[n].id   = id;
+      now[n].host = id == owner;
+      strlcpy(now[n].name, name ? name : "", sizeof(now[n].name));
+      avatar_of[n++] = id;
+   }
+   if (     hosting && sn.fake && sn_now() >= sn.fake_at
+         && n < BOMBA_STEAMNET_MAX_PLAYERS)
+   {
+      memset(&now[n], 0, sizeof(now[n]));
+      now[n].id = FAKE_ID;
+      strlcpy(now[n].name, sn.my_name, sizeof(now[n].name));
+      avatar_of[n++] = sn.me;
+   }
+
+   /* The host first. */
+   for (i = 1; i < n; i++)
+      if (now[i].host)
+      {
+         bomba_steamnet_player_t p = now[i];
+         steam_id_t a              = avatar_of[i];
+         memmove(&now[1], &now[0], i * sizeof(now[0]));
+         memmove(&avatar_of[1], &avatar_of[0], i * sizeof(avatar_of[0]));
+         now[0]       = p;
+         avatar_of[0] = a;
+         break;
+      }
+
+   for (i = 0; i < n; i++)
+   {
+      /* Steam fetches pictures on demand: the large one once it's in,
+       * the medium one meanwhile. */
+      int a = api.GetLargeFriendAvatar(sn.friends, avatar_of[i]);
+      if (a <= 0)
+         a = api.GetMediumFriendAvatar(sn.friends, avatar_of[i]);
+      now[i].avatar = a > 0 ? a : 0;
+   }
+
+   if (sn.players_known)
+   {
+      char msg[160];
+      for (i = 0; i < n; i++)
+         if (!sn_find_player(sn.players, sn.nplayers, now[i].id))
+         {
+            snprintf(msg, sizeof(msg), "Multiplayer: %s joined %s.",
+                  now[i].name, hosting ? "your session" : "the session");
+            sn_message(msg);
+         }
+      for (i = 0; i < sn.nplayers; i++)
+         if (     !sn_find_player(now, n, sn.players[i].id)
+               && !sn_is_kicked(sn.players[i].id)
+               && !sn.players[i].host) /* (sn_on_lobby_chat tells) */
+         {
+            snprintf(msg, sizeof(msg), "Multiplayer: %s left %s.",
+                  sn.players[i].name,
+                  hosting ? "your session" : "the session");
+            sn_message(msg);
+         }
+   }
+
+   /* Kicked players gone: free to be invited again. */
+   if (hosting)
+   {
+      unsigned before = sn.nkicked;
+      for (i = 0; i < sn.nkicked; )
+      {
+         if (!sn_is_member(sn.kicked[i]))
+            sn.kicked[i] = sn.kicked[--sn.nkicked];
+         else
+            i++;
+      }
+      if (sn.nkicked != before)
+         sn_publish_kicked();
+   }
+
+   memcpy(sn.players, now, n * sizeof(now[0]));
+   memcpy(sn.avatar_of, avatar_of, n * sizeof(avatar_of[0]));
+   sn.nplayers      = n;
+   sn.players_known = true;
+}
+
 void bomba_steamnet_poll(void)
 {
    cb_msg_t msg;
@@ -807,6 +1009,14 @@ void bomba_steamnet_poll(void)
       api.FreeLastCallback(sn.pipe);
    }
 
+   if (     (sn.state == BOMBA_STEAMNET_HOSTING
+            || sn.state == BOMBA_STEAMNET_JOINED)
+         && sn_now() >= sn.players_at)
+   {
+      sn.players_at = sn_now() + SN_PLAYERS_USEC;
+      sn_refresh_players();
+   }
+
    if (sn.state == BOMBA_STEAMNET_HOSTING)
       sn_publish_game();
    /* In no session: this player's own, so friends can be invited. */
@@ -833,6 +1043,83 @@ unsigned bomba_steamnet_local_port(void)     { return sn.local_port; }
 const char *bomba_steamnet_my_name(void)     { return sn.my_name; }
 const char *bomba_steamnet_host_system(void) { return sn.host_system; }
 const char *bomba_steamnet_host_title(void)  { return sn.host_title; }
+
+unsigned bomba_steamnet_players(const bomba_steamnet_player_t **players)
+{
+   *players = sn.players;
+   return sn.nplayers;
+}
+
+uint8_t *bomba_steamnet_avatar_rgba(int avatar, unsigned *w, unsigned *h)
+{
+   uint32_t iw = 0, ih = 0;
+   uint8_t *rgba;
+
+   if (     !sn.ok || avatar <= 0 || !sn.utils
+         || !api.GetImageSize(sn.utils, avatar, &iw, &ih) || !iw || !ih)
+      return NULL;
+   if (!(rgba = (uint8_t*)malloc((size_t)iw * ih * 4)))
+      return NULL;
+   if (!api.GetImageRGBA(sn.utils, avatar, rgba, (int)(iw * ih * 4)))
+   {
+      free(rgba);
+      return NULL;
+   }
+   *w = iw;
+   *h = ih;
+   return rgba;
+}
+
+void bomba_steamnet_kick(uint64_t id)
+{
+   bomba_steamnet_player_t *p;
+   char msg[128];
+
+   if (     sn.state != BOMBA_STEAMNET_HOSTING
+         || !(p = sn_find_player(sn.players, sn.nplayers, id)))
+      return;
+   snprintf(msg, sizeof(msg), "Multiplayer: %s was kicked.", p->name);
+
+   if (id == FAKE_ID)
+      sn.fake = false;
+   else if (!sn_is_kicked(id) && sn.nkicked < BOMBA_STEAMNET_MAX_PLAYERS)
+   {
+      net_identity_t who;
+      /* Its traffic stops at once; the guest leaves on seeing the list. */
+      sn.kicked[sn.nkicked] = id;
+      sn.nkicked++;
+      sn_publish_kicked();
+      sn_identity(&who, id);
+      api.CloseSession(sn.msgs, &who);
+   }
+   RARCH_LOG("[Bomba] Kicked %llu.\n", (unsigned long long)id);
+
+   /* Off the list now, not on the next look. */
+   {
+      size_t i    = (size_t)(p - sn.players);
+      size_t tail = sn.nplayers - i - 1;
+      memmove(&sn.players[i], &sn.players[i + 1], tail * sizeof(sn.players[0]));
+      memmove(&sn.avatar_of[i], &sn.avatar_of[i + 1],
+            tail * sizeof(sn.avatar_of[0]));
+      sn.nplayers--;
+   }
+   sn_message(msg);
+}
+
+void bomba_steamnet_leave(void)
+{
+   char msg[128];
+
+   if (sn.state != BOMBA_STEAMNET_JOINED && sn.state != BOMBA_STEAMNET_JOINING)
+      return;
+   if (sn.host_name[0])
+      snprintf(msg, sizeof(msg), "Multiplayer: left %s's session.",
+            sn.host_name);
+   else
+      strlcpy(msg, "Multiplayer: left the session.", sizeof(msg));
+   sn_back_home(0);
+   sn_message(msg);
+}
 
 void bomba_steamnet_set_game(const char *system, const char *title)
 {

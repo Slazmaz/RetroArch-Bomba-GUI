@@ -134,6 +134,7 @@
 #define COL_CHEEVO      0x7ce400ff /* achievement progress (lime) */
 #define COL_DANGER      0xff5c52ff /* Quit game: its label, white when... */
 #define COL_DANGER_BG   0xd93a30ff /* ...its row is selected, on this */
+#define COL_CROWN       0xf5c330ff /* multiplayer host's crown */
 
 typedef struct
 {
@@ -525,6 +526,9 @@ static struct
 
    bool bar_focus;          /* D-pad is on the icon bar, not the grid */
    unsigned bar_sel;        /* selected icon */
+   /* On the profile button: 0 the button, k the k-th other player of
+    * the multiplayer session beside it. */
+   unsigned bar_player;
    retro_time_t exit_hold_start; /* OK went down on Exit (0: not held) */
    float exit_blend;        /* Exit's cursor, 0 blue .. 1 hold ring */
    float exit_hold_t;       /* hold progress last drawn, 0 .. 1 */
@@ -589,6 +593,14 @@ static struct
     * ("system\ttitle"), so it starts once. */
    char mp_started[320];
 
+   /* The multiplayer session's players' Steam pictures (circle-clipped),
+    * by Steam's picture handle. */
+   struct
+   {
+      int avatar;
+      uintptr_t tex;
+   } mp_tex[BOMBA_STEAMNET_MAX_PLAYERS];
+
    /* Profile pictures (circle-clipped), reloaded when the path changes. */
    uintptr_t profile_tex[GRID_PROFILE_MAX];
    char profile_tex_path[GRID_PROFILE_MAX][PATH_MAX_LENGTH];
@@ -650,6 +662,7 @@ static struct
    grid_icon_t icon_download;/* Installs, in the icon bar */
    grid_icon_t icon_backspace; /* on-screen keyboard keys */
    grid_icon_t icon_shift;
+   grid_icon_t icon_crown;   /* on the multiplayer host's picture */
    /* Background of the selected game. */
    grid_bg_t bg;
    char bg_key[PATH_MAX_LENGTH];   /* what bg shows: "", GRID_BG_GAME or a
@@ -702,6 +715,7 @@ enum grid_hit_kind
    HIT_NONE = 0,
    HIT_TILE,     /* a game in the grid (index into view) */
    HIT_BAR,      /* an icon bar button */
+   HIT_PLAYER,   /* a multiplayer session's player, after the profile */
    HIT_PANEL,    /* an item of the open panel or screen (panel_sel) */
    HIT_MENU,     /* a row of RetroArch's list on the Settings screen */
    HIT_CC,       /* a row of the Consoles page (cc_sel) */
@@ -3742,17 +3756,56 @@ static void grid_panel_action(enum menu_action action)
    grid_st.panel_sel = sel;
 }
 
+/* The other players of the multiplayer session, beside the profile. */
+static unsigned grid_mp_players(const bomba_steamnet_player_t **players)
+{
+   unsigned n = bomba_steamnet_players(players);
+   if (grid_st.bar_player > n)
+      grid_st.bar_player = n;
+   return n;
+}
+
+/* OK on a player: the host kicks them, a guest leaves the session (from
+ * the host's picture). */
+static void grid_mp_player_action(unsigned k)
+{
+   const bomba_steamnet_player_t *players;
+   unsigned n = grid_mp_players(&players);
+
+   if (!k || k > n)
+      return;
+   if (bomba_steamnet_state() == BOMBA_STEAMNET_HOSTING)
+      bomba_steamnet_kick(players[k - 1].id);
+   else if (players[k - 1].host)
+      bomba_steamnet_leave();
+   grid_mp_players(&players);
+}
+
 static void grid_bar_action(enum menu_action action)
 {
+   const bomba_steamnet_player_t *players;
+   unsigned nplayers = grid_mp_players(&players);
+
    switch (action)
    {
       case MENU_ACTION_LEFT:
-         if (grid_st.bar_sel > 0)
+         if (grid_st.bar_sel == BAR_PROFILE && grid_st.bar_player > 0)
+            grid_st.bar_player--;
+         else if (grid_st.bar_sel > 0)
+         {
             grid_st.bar_sel--;
+            grid_st.bar_player = grid_st.bar_sel == BAR_PROFILE
+               ? nplayers : 0;
+         }
          break;
       case MENU_ACTION_RIGHT:
-         if (grid_st.bar_sel + 1 < BAR_COUNT)
+         if (grid_st.bar_sel == BAR_PROFILE && grid_st.bar_player < nplayers)
+            grid_st.bar_player++;
+         else if (grid_st.bar_sel + 1 < BAR_COUNT)
+         {
             grid_st.bar_sel++;
+            grid_st.bar_player = 0;
+         }
          break;
       case MENU_ACTION_DOWN:
       case MENU_ACTION_CANCEL:
@@ -3762,7 +3815,10 @@ static void grid_bar_action(enum menu_action action)
          switch (grid_st.bar_sel)
          {
             case BAR_PROFILE:
-               grid_open_panel(PANEL_PROFILES);
+               if (grid_st.bar_player)
+                  grid_mp_player_action(grid_st.bar_player);
+               else
+                  grid_open_panel(PANEL_PROFILES);
                break;
             case BAR_SETTINGS:
                grid_open_settings();
@@ -3868,6 +3924,7 @@ typedef struct
 {
    size_t selection;
    unsigned bar_sel;
+   unsigned bar_player;
    unsigned panel_sel;
    unsigned cc_sel;
    int panel;
@@ -3881,6 +3938,7 @@ static void grid_cursor_get(grid_cursor_t *c)
    memset(c, 0, sizeof(*c));
    c->selection = grid_st.selection;
    c->bar_sel   = (unsigned)grid_st.bar_sel;
+   c->bar_player = grid_st.bar_player;
    c->panel_sel = (unsigned)grid_st.panel_sel;
    c->cc_sel    = (unsigned)grid_st.cc_sel;
    c->panel     = (int)grid_st.panel;
@@ -4196,8 +4254,14 @@ static void grid_hit_select(const grid_hit_t *t)
          }
          break;
       case HIT_BAR:
-         grid_st.bar_focus = true;
-         grid_st.bar_sel   = t->idx;
+         grid_st.bar_focus  = true;
+         grid_st.bar_sel    = t->idx;
+         grid_st.bar_player = 0;
+         break;
+      case HIT_PLAYER:
+         grid_st.bar_focus  = true;
+         grid_st.bar_sel    = BAR_PROFILE;
+         grid_st.bar_player = t->idx;
          break;
       case HIT_PANEL:
          grid_st.panel_sel = t->idx;
@@ -5059,41 +5123,28 @@ static void grid_crop_to_aspect(struct texture_image *ti, float aspect)
  * a fraction of the image width), so covers look rounded over any
  * background. If aspect > 0, the image is first cropped to that
  * width/height ratio. */
-static bool grid_load_rounded_texture(const char *path, uintptr_t *tex,
-      unsigned *w, unsigned *h, float radius_frac, float aspect)
+/* Rounds an image's corners (radius a fraction of its width; 0.5 on a
+ * square: a circle), through alpha. */
+static void grid_round_corners(struct texture_image *ti, float radius_frac)
 {
-   struct texture_image ti;
    unsigned x, y;
-   float r;
-
-   ti.width         = 0;
-   ti.height        = 0;
-   ti.pixels        = NULL;
-   ti.supports_rgba = video_driver_supports_rgba();
-
-   if (string_is_empty(path) || !image_texture_load(&ti, path))
-      return false;
-
-   if (aspect > 0.0f)
-      grid_crop_to_aspect(&ti, aspect);
-
-   r = ti.width * radius_frac;
+   float r = ti->width * radius_frac;
 
    /* Alpha is the top byte in both ARGB and ABGR layouts. Only pixels in
     * the four corner squares can be affected. */
-   for (y = 0; y < ti.height; y++)
+   for (y = 0; y < ti->height; y++)
    {
       float cy = y + 0.5f;
       float dy = cy < r ? r - cy
-               : cy > ti.height - r ? cy - (ti.height - r) : 0.0f;
+               : cy > ti->height - r ? cy - (ti->height - r) : 0.0f;
       if (dy <= 0.0f)
          continue;
 
-      for (x = 0; x < ti.width; x++)
+      for (x = 0; x < ti->width; x++)
       {
          float cx = x + 0.5f;
          float dx = cx < r ? r - cx
-                  : cx > ti.width - r ? cx - (ti.width - r) : 0.0f;
+                  : cx > ti->width - r ? cx - (ti->width - r) : 0.0f;
          float cover;
          uint32_t *p, a;
 
@@ -5107,17 +5158,64 @@ static bool grid_load_rounded_texture(const char *path, uintptr_t *tex,
          if (cover < 0.0f)
             cover = 0.0f;
 
-         p  = &ti.pixels[y * ti.width + x];
+         p  = &ti->pixels[y * ti->width + x];
          a  = (uint32_t)(((*p >> 24) & 0xff) * cover);
          *p = (*p & 0x00ffffff) | (a << 24);
       }
    }
+}
+
+static bool grid_load_rounded_texture(const char *path, uintptr_t *tex,
+      unsigned *w, unsigned *h, float radius_frac, float aspect)
+{
+   struct texture_image ti;
+
+   ti.width         = 0;
+   ti.height        = 0;
+   ti.pixels        = NULL;
+   ti.supports_rgba = video_driver_supports_rgba();
+
+   if (string_is_empty(path) || !image_texture_load(&ti, path))
+      return false;
+
+   if (aspect > 0.0f)
+      grid_crop_to_aspect(&ti, aspect);
+
+   grid_round_corners(&ti, radius_frac);
 
    *w = ti.width;
    *h = ti.height;
    video_driver_texture_load(&ti, TEXTURE_FILTER_MIPMAP_LINEAR, tex);
    image_texture_free(&ti);
    return true;
+}
+
+/* A Steam picture (RGBA bytes) as a circle. */
+static bool grid_load_avatar_texture(const uint8_t *rgba,
+      unsigned w, unsigned h, uintptr_t *tex)
+{
+   struct texture_image ti;
+   bool as_rgba = video_driver_supports_rgba();
+   size_t i, n  = (size_t)w * h;
+
+   ti.width         = w;
+   ti.height        = h;
+   ti.supports_rgba = as_rgba;
+   if (!(ti.pixels = (uint32_t*)malloc(n * sizeof(uint32_t))))
+      return false;
+   for (i = 0; i < n; i++)
+   {
+      const uint8_t *px = rgba + i * 4;
+      ti.pixels[i] = as_rgba
+         ? ((uint32_t)px[3] << 24) | ((uint32_t)px[2] << 16)
+           | ((uint32_t)px[1] << 8) | px[0]
+         : ((uint32_t)px[3] << 24) | ((uint32_t)px[0] << 16)
+           | ((uint32_t)px[1] << 8) | px[2];
+   }
+   grid_round_corners(&ti, 0.5f);
+   video_driver_texture_load(&ti, TEXTURE_FILTER_MIPMAP_LINEAR, tex);
+   free(ti.pixels);
+   return *tex != 0;
 }
 
 /* Scroll indicator for a list screen, in the right margin beside its area
@@ -7160,6 +7258,58 @@ static void grid_icon_load(grid_icon_t *ic, const char *path)
    image_texture_free(&ti);
 }
 
+/* Turns a loaded icon by deg (clockwise), onto a canvas big enough for
+ * any angle. */
+static void grid_icon_rotate(grid_icon_t *ic, float deg)
+{
+   float a  = deg * 3.14159265f / 180.0f;
+   float cs = cosf(a), sn = sinf(a);
+   unsigned n = (unsigned)ceilf(sqrtf((float)(ic->w * ic->w + ic->h * ic->h)));
+   uint8_t *out;
+   unsigned x, y;
+   unsigned x0 = n, y0 = n, x1 = 0, y1 = 0;
+
+   if (!ic->alpha || !(out = (uint8_t*)malloc(n * n)))
+      return;
+
+   for (y = 0; y < n; y++)
+      for (x = 0; x < n; x++)
+      {
+         /* Bilinear sample of the source at the point turned back. */
+         float dx = x + 0.5f - n / 2.0f, dy = y + 0.5f - n / 2.0f;
+         float sx = cs * dx + sn * dy + ic->w / 2.0f - 0.5f;
+         float sy = -sn * dx + cs * dy + ic->h / 2.0f - 0.5f;
+         int ix   = (int)floorf(sx), iy = (int)floorf(sy);
+         float fx = sx - ix, fy = sy - iy, v = 0.0f;
+         int k;
+         for (k = 0; k < 4; k++)
+         {
+            int px = ix + (k & 1), py = iy + (k >> 1);
+            float wgt = ((k & 1) ? fx : 1.0f - fx) * ((k >> 1) ? fy : 1.0f - fy);
+            if (px >= 0 && py >= 0 && px < (int)ic->w && py < (int)ic->h)
+               v += wgt * ic->alpha[py * ic->w + px];
+         }
+         out[y * n + x] = (uint8_t)(v + 0.5f);
+         if (out[y * n + x] > 127)
+         {
+            if (x < x0) x0 = x;
+            if (x > x1) x1 = x;
+            if (y < y0) y0 = y;
+            if (y > y1) y1 = y;
+         }
+      }
+
+   free(ic->alpha);
+   ic->alpha = out;
+   ic->w     = n;
+   ic->h     = n;
+   if (x1 >= x0 && y1 >= y0)
+   {
+      ic->off_x = ((x0 + x1 + 1) / 2.0f - n / 2.0f) / n;
+      ic->off_y = ((y0 + y1 + 1) / 2.0f - n / 2.0f) / n;
+   }
+}
+
 static void grid_icon_free(grid_icon_t *ic)
 {
    if (ic->tex)
@@ -7450,6 +7600,71 @@ static void grid_draw_profile_avatar(gfx_display_t *p_disp, void *userdata,
          d * 0.42f / (height / 32.0f) / GRID_FONT_CAP);
 }
 
+static void grid_free_mp_textures(void)
+{
+   unsigned i;
+   for (i = 0; i < BOMBA_STEAMNET_MAX_PLAYERS; i++)
+   {
+      if (grid_st.mp_tex[i].tex)
+         video_driver_texture_unload(&grid_st.mp_tex[i].tex);
+      grid_st.mp_tex[i].tex    = 0;
+      grid_st.mp_tex[i].avatar = 0;
+   }
+}
+
+/* A player's Steam picture, d wide at (x, y), from its slot's texture
+ * (made again when the picture changes); its initial until it's in. */
+static void grid_draw_mp_avatar(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, unsigned slot,
+      const bomba_steamnet_player_t *pl, float x, float y, float d)
+{
+   if (grid_st.mp_tex[slot].avatar != pl->avatar)
+   {
+      unsigned w, h;
+      uint8_t *rgba;
+      if (grid_st.mp_tex[slot].tex)
+         video_driver_texture_unload(&grid_st.mp_tex[slot].tex);
+      grid_st.mp_tex[slot].tex    = 0;
+      grid_st.mp_tex[slot].avatar = pl->avatar;
+      if ((rgba = bomba_steamnet_avatar_rgba(pl->avatar, &w, &h)))
+      {
+         grid_load_avatar_texture(rgba, w, h, &grid_st.mp_tex[slot].tex);
+         free(rgba);
+      }
+   }
+
+   if (grid_st.mp_tex[slot].tex)
+   {
+      grid_draw_icon(p_disp, userdata, width, height,
+            &grid_st.mp_tex[slot].tex, x + d / 2.0f, y + d / 2.0f, d,
+            0xffffffff);
+      return;
+   }
+   grid_draw_rounded(p_disp, userdata, width, height,
+         x, y, d, d, d / 2.0f, COL_SEARCH);
+   grid_draw_char_centered(true,
+         (char)toupper((unsigned char)(pl->name[0] ? pl->name[0] : '?')),
+         x + d / 2.0f, y + d / 2.0f, width, height, 0xffffffff,
+         d * 0.42f / (height / 32.0f) / GRID_FONT_CAP);
+}
+
+/* The session host's crown, tilted on the top right of its picture (d
+ * wide at (x, y)), over a drop shadow. (Its square image was turned onto
+ * a canvas sqrt(2) as wide; see grid_icon_rotate.) */
+static void grid_draw_crown(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, float x, float y, float d)
+{
+   float size = d * 0.62f * 1.4142f;
+   float cx   = x + d * 0.66f;
+   float cy   = y - d * 0.04f;
+   float sh   = floorf(d * 0.03f + 0.5f); /* whole pixels: same texture */
+
+   grid_icon_draw(p_disp, userdata, width, height, &grid_st.icon_crown,
+         cx, cy + sh, size, 0x00000060);
+   grid_icon_draw(p_disp, userdata, width, height, &grid_st.icon_crown,
+         cx, cy, size, COL_CROWN);
+}
+
 /* Top row: icon bar on the left (profile, settings, installs, search; the
  * search icon grows into a search box while searching); on the right
  * "[L] console count", a divider and "[R] sort order". No bar behind it:
@@ -7674,7 +7889,8 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
          x   = floorf(x + 0.5f);
          w   = d;
          sel = grid_st.bar_focus && grid_st.bar_sel == i
-               && grid_st.panel == PANEL_NONE && !grid_settings_shown();
+               && grid_st.panel == PANEL_NONE && !grid_settings_shown()
+               && !(i == BAR_PROFILE && grid_st.bar_player);
 
          if (i == BAR_SEARCH)
             w = d + (open_w - d) * grid_st.search_open;
@@ -7691,11 +7907,76 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
          switch (i)
          {
             case BAR_PROFILE:
+            {
+               const bomba_steamnet_player_t *players;
+               unsigned np = grid_mp_players(&players), k;
+               float pgap  = REF(5); /* between the players' pictures */
+
                /* Hidden under the profiles strip while it is open. */
                if (grid_st.profile_open <= 0.0f)
+               {
                   grid_draw_profile_avatar(p_disp, userdata, width, height,
                         grid_profile_current(), x, y, d);
+                  /* The crown: this player hosts others. */
+                  if (np && bomba_steamnet_state() == BOMBA_STEAMNET_HOSTING)
+                     grid_draw_crown(p_disp, userdata, width, height, x, y, d);
+               }
+
+               /* The session's other players, after it. */
+               for (k = 0; k < np; k++)
+               {
+                  float px  = floorf(x + (k + 1) * (d + pgap) + 0.5f);
+                  bool psel = grid_st.bar_focus && grid_st.bar_sel == i
+                        && grid_st.bar_player == k + 1
+                        && grid_st.panel == PANEL_NONE
+                        && !grid_settings_shown();
+
+                  if (grid_st.panel == PANEL_NONE)
+                     grid_hit_add(px, y, d, d, HIT_PLAYER, k + 1,
+                           MENU_ACTION_OK);
+                  if (psel)
+                     grid_draw_cursor(p_disp, userdata, width, height,
+                           px, y, d, d, d / 2.0f);
+                  grid_draw_mp_avatar(p_disp, userdata, width, height, k,
+                        &players[k], px, y, d);
+                  if (players[k].host)
+                     grid_draw_crown(p_disp, userdata, width, height,
+                           px, y, d);
+
+                  /* Selected: who, and what OK does, under it. */
+                  if (psel)
+                  {
+                     char label[128];
+                     float ls   = CAP(GRID_TEXT_CAP - 2);
+                     float lcy  = y + d + REF(17);
+                     float lh   = REF(15);
+                     float lpad = REF(8);
+                     float lw, lx;
+
+                     if (bomba_steamnet_state() == BOMBA_STEAMNET_HOSTING)
+                        snprintf(label, sizeof(label), "Kick %s",
+                              players[k].name);
+                     else if (players[k].host)
+                        snprintf(label, sizeof(label), "Leave %s's session",
+                              players[k].name);
+                     else
+                        strlcpy(label, players[k].name, sizeof(label));
+                     lw = grid_text_width(label, height, ls);
+                     lx = floorf(px + d / 2.0f - lw / 2.0f - lpad + 0.5f);
+                     if (lx < side)
+                        lx = side;
+                     grid_draw_shape(p_disp, userdata, width, height,
+                           lx, lcy - lh / 2.0f, lw + 2.0f * lpad, lh,
+                           lh / 2.0f, 0x000000b0);
+                     grid_draw_text(label, lx + lpad,
+                           grid_text_y(lcy, height, ls), width, height,
+                           COL_TEXT, TEXT_ALIGN_LEFT, ls);
+                  }
+               }
+               if (np)
+                  x += np * (d + pgap);
                break;
+            }
             case BAR_SETTINGS:
                grid_icon_button_draw(p_disp, userdata, width, height,
                      &grid_st.icon_settings, x, y, (unsigned)d, 0.6f,
@@ -11248,6 +11529,9 @@ void grid_home_context_reset(bool is_threaded)
       grid_icon_load(&grid_st.icon_backspace, path);
       fill_pathname_join_special(path, icons, "shift.png", sizeof(path));
       grid_icon_load(&grid_st.icon_shift, path);
+      fill_pathname_join_special(path, icons, "crown.png", sizeof(path));
+      grid_icon_load(&grid_st.icon_crown, path);
+      grid_icon_rotate(&grid_st.icon_crown, 12.0f);
    }
 }
 
@@ -11275,6 +11559,8 @@ void grid_home_context_destroy(void)
    grid_icon_free(&grid_st.icon_download);
    grid_icon_free(&grid_st.icon_backspace);
    grid_icon_free(&grid_st.icon_shift);
+   grid_icon_free(&grid_st.icon_crown);
+   grid_free_mp_textures();
 
    if (grid_st.disc)
       video_driver_texture_unload(&grid_st.disc);
