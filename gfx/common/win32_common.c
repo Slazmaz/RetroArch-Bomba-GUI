@@ -1862,6 +1862,9 @@ static enum win32_window_kind win32_wndproc_kind(WNDPROC proc)
  * when freeing a D3D/WGL driver: the window stays open for the next init. */
 void win32_keep_window(void)
 {
+   /* What WM_DESTROY would save: the next init sizes the window from
+    * these, and a resize alone (no WM_MOVE) isn't saved otherwise. */
+   win32_save_position();
 #ifndef _XBOX
    win32_monitor_last = MonitorFromWindow(main_window.hwnd,
          MONITOR_DEFAULTTONEAREST);
@@ -2647,6 +2650,21 @@ void win32_set_window(unsigned *width, unsigned *height,
 
       if (window)
          window->set_focused(&main_window);
+   }
+
+   /* A reused window gets no WM_SIZE (nor WM_CREATE's first one): the
+    * size to render at is its client area, not the window size computed
+    * above (which counts borders and caption). */
+   if (window_reused)
+   {
+      RECT client;
+      if (     GetClientRect(main_window.hwnd, &client)
+            && client.right > 0 && client.bottom > 0)
+      {
+         g_win32_resize_width  = *width  = client.right;
+         g_win32_resize_height = *height = client.bottom;
+         g_win32_flags        |= WIN32_CMN_FLAG_RESIZED;
+      }
    }
 
    win32_show_cursor(NULL, !fullscreen);

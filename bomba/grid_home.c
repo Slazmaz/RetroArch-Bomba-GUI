@@ -7982,7 +7982,7 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
                const bomba_steamnet_player_t *players;
                unsigned slots;
                unsigned np = grid_mp_players(&players, &slots), k;
-               float pgap  = REF(5); /* between the players' pictures */
+               float pgap  = gap; /* as between the other buttons */
 
                /* Hidden under the profiles strip while it is open. */
                if (grid_st.profile_open <= 0.0f)
@@ -11756,9 +11756,9 @@ void grid_home_context_reset(bool is_threaded)
       grid_icon_rotate(&grid_st.icon_crown, 12.0f);
       fill_pathname_join_special(path, icons, "invite.png", sizeof(path));
       grid_icon_load(&grid_st.icon_invite, path);
-      /* Centred on the person (under its head at x 215 of 512), not on
+      /* Between centred on the person (its head at x 215 of 512) and on
        * person and "+". */
-      grid_st.icon_invite.btn_shift = 0.5f - 215.0f / 512.0f;
+      grid_st.icon_invite.btn_shift = 0.5f - 235.0f / 512.0f;
    }
 }
 

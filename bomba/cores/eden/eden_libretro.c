@@ -53,9 +53,9 @@
 
 /* Eden draws frames (see emu_presenting): shown this long after. */
 #define READY_AFTER_FRAMES_MS 300
-/* No frame count seen: shown this long after Eden opened its audio
- * (which comes some seconds before its first frame). */
-#define READY_AFTER_AUDIO_MS 8000
+/* No frame count seen yet: shown this long after Eden opened its audio
+ * (the game is heard by then; eden-cli's frame count can lag seconds). */
+#define READY_AFTER_AUDIO_MS 1000
 /* Eden's window taken over anyway after loading this long. */
 #define LOADING_MAX_MS   60000
 /* Eden's window restyled: RetroArch turns see-through this long after,
@@ -1370,13 +1370,17 @@ static void loading_close(void)
    memset(&ld, 0, sizeof(ld));
 }
 
-/* Sizes the frame to the screen RetroArch is on (drawn pixel for pixel
- * there) and gets the drawing ready. The title is the file's name without
- * extension and tags ("[...]", "(...)"). */
+/* Sizes the frame to RetroArch's window (drawn pixel for pixel there, so
+ * it lines up with the grid's loading screen before it), or else the
+ * screen it's on, and gets the drawing ready. The title is the file's
+ * name without extension and tags ("[...]", "(...)"). */
 static void loading_open(const wchar_t *rom)
 {
    static const wchar_t *files[2] = { L"Baloo2-Bold.ttf", L"Baloo2-Medium.ttf" };
    MONITORINFO mi;
+   RECT client;
+   HWND fg = GetForegroundWindow();
+   DWORD fg_pid = 0;
    const wchar_t *name = rom, *p;
    wchar_t dir[MAX_PATH * 2], *cut;
    BITMAPINFO bi;
@@ -1386,8 +1390,16 @@ static void loading_open(const wchar_t *rom)
    fb_width  = 1280;
    fb_height = 720;
    mi.cbSize = sizeof(mi);
-   if (GetMonitorInfoW(MonitorFromWindow(GetForegroundWindow(),
-               MONITOR_DEFAULTTOPRIMARY), &mi)
+   if (fg)
+      GetWindowThreadProcessId(fg, &fg_pid);
+   if (     fg_pid == GetCurrentProcessId() && !IsIconic(fg)
+         && GetClientRect(fg, &client)
+         && client.right >= 320 && client.bottom >= 180)
+   {
+      fb_width  = (unsigned)client.right;
+      fb_height = (unsigned)client.bottom;
+   }
+   else if (GetMonitorInfoW(MonitorFromWindow(fg, MONITOR_DEFAULTTOPRIMARY), &mi)
          && mi.rcMonitor.right > mi.rcMonitor.left
          && mi.rcMonitor.bottom > mi.rcMonitor.top)
    {
@@ -1570,7 +1582,9 @@ static BOOL CALLBACK find_ra_window(HWND hwnd, LPARAM out)
 
 struct emu_window_search { HWND best; LONGLONG area; };
 
-/* Eden's largest visible top-level window: its game window. */
+/* Eden's largest visible top-level window: its game window. Before its
+ * window is taken over, a hidden one counts too (Eden started hidden,
+ * see launch_main), if game-window sized. */
 static BOOL CALLBACK find_emu_window(HWND hwnd, LPARAM data)
 {
    struct emu_window_search *s = (struct emu_window_search*)data;
@@ -1579,8 +1593,11 @@ static BOOL CALLBACK find_emu_window(HWND hwnd, LPARAM data)
    LONGLONG area;
 
    GetWindowThreadProcessId(hwnd, &pid);
-   if (     pid != emu_pid || !IsWindowVisible(hwnd)
-         || GetWindow(hwnd, GW_OWNER) || !GetWindowRect(hwnd, &r))
+   if (     pid != emu_pid || GetWindow(hwnd, GW_OWNER)
+         || !GetWindowRect(hwnd, &r))
+      return TRUE;
+   if (     !IsWindowVisible(hwnd)
+         && (ov.emu || r.right - r.left < 640 || r.bottom - r.top < 360))
       return TRUE;
 
    area = (LONGLONG)(r.right - r.left) * (r.bottom - r.top);
@@ -1668,10 +1685,13 @@ static void set_ra_transparent(bool on)
    ov.transparent = on;
 }
 
+static void place_emu(bool zorder);
+
 /* Eden's window as part of RetroArch's: no border or caption, no taskbar
  * / Alt-Tab entry (a tool window), never activated. Hidden and shown
- * again so the taskbar notices. */
-static void style_emu(void)
+ * again so the taskbar notices; placed in between, so it never shows
+ * anywhere else. */
+static void style_emu(bool zorder)
 {
    LONG_PTR style = GetWindowLongPtrW(ov.emu, GWL_STYLE);
    LONG_PTR ex    = GetWindowLongPtrW(ov.emu, GWL_EXSTYLE);
@@ -1683,10 +1703,11 @@ static void style_emu(void)
          (ex | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE) & ~WS_EX_APPWINDOW);
    SetWindowPos(ov.emu, NULL, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE
          | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
-   ShowWindow(ov.emu, SW_SHOWNOACTIVATE);
-   memset(&ov.placed, 0, sizeof(ov.placed));
    log_msg("Eden window %p styled (style %08lx -> %08lx)", (void*)ov.emu,
          (unsigned long)style, (unsigned long)GetWindowLongPtrW(ov.emu, GWL_STYLE));
+   memset(&ov.placed, 0, sizeof(ov.placed));
+   place_emu(zorder);
+   ShowWindow(ov.emu, SW_SHOWNOACTIVATE);
 }
 
 /* Puts Eden's window exactly under RetroArch's client area, directly
@@ -1925,8 +1946,7 @@ static void arrange(void)
             ov.emu = hwnd;
             /* Taken over at once, under the loading screen, so it has its
              * size and draws at it well before it shows. */
-            style_emu();
-            place_emu(false);
+            style_emu(false);
          }
          log_emu_title();
          if (!ov.emu || !IsWindow(ov.emu) || !emu_ready(now))
@@ -1968,7 +1988,7 @@ static void arrange(void)
       {
          log_msg("Eden window changed to %p", (void*)hwnd);
          ov.emu = hwnd;
-         style_emu();
+         style_emu(true);
       }
 
       if (IsIconic(ov.ra))
@@ -2464,6 +2484,13 @@ static DWORD WINAPI launch_main(LPVOID unused)
 
    memset(&si, 0, sizeof(si));
    si.cb = sizeof(si);
+   if (launch.overlay)
+   {
+      /* Its window's first show is a hide: it opens fullscreen and stays
+       * black (its thread busy loading) until taken over, see style_emu. */
+      si.dwFlags     = STARTF_USESHOWWINDOW;
+      si.wShowWindow = SW_HIDE;
+   }
    {
       /* Without Steam's SDL settings, see child_environment. */
       wchar_t *env = child_environment();

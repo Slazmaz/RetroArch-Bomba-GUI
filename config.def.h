@@ -1709,7 +1709,8 @@
  * for over time (ignores core) */
 #define DEFAULT_CONTENT_RUNTIME_LOG_AGGREGATE false
 
-#define DEFAULT_UI_MENUBAR_ENABLE true
+/* Bomba: no Win32 menu bar (File, Command...) on the window. */
+#define DEFAULT_UI_MENUBAR_ENABLE false
 
 #if defined(__QNX__) || defined(_XBOX1) || defined(_XBOX360) || (defined(__MACH__) && defined(IOS)) || defined(ANDROID) || defined(WIIU) || defined(HAVE_NEON) || defined(GEKKO) || defined(__ARM_NEON__) || defined(__PS3__)
 #define DEFAULT_AUDIO_RESAMPLER_QUALITY_LEVEL RESAMPLER_QUALITY_LOWER
