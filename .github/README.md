@@ -34,9 +34,10 @@ Launching with steam integrates steam multiplayer, overlay, and cloud saves.
 
 4. Play RetroArch from Steam.
 
-To play multiplayer, start Retroarch and right-click a friend in Steam's
-friends list → **Invite to Game**. Once they accept, the game sees them as
-a LAN player. Only works with Eden for now.
+To play multiplayer, start Retroarch from Steam. Next to your profile icon
+there will be an **Invite Friends** button; simply open that menu and select
+the friends you want to invite. Once they accept, games will see them as a
+LAN player. Only works with Eden for now.
 
 ## Updating
 
