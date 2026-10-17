@@ -71,8 +71,6 @@ enum
 #define RESULT_OK                1
 #define ENTER_SUCCESS            1
 #define CHAT_LEFT_MASK           (2 | 4 | 8 | 16)
-/* The test player (see sn_fake_wanted): no real Steam ID is this. */
-#define FAKE_ID                  1u
 /* Unreliable, no Nagle (the emulator's protocol does its own
  * reliability), and reopen a session that broke. */
 #define SEND_FLAGS               (1 | 32)
@@ -131,8 +129,6 @@ static struct
 #define SN_RETRY_USEC  (30 * 1000000LL)
 /* How often the session's players are looked at. */
 #define SN_PLAYERS_USEC (250000LL)
-/* The test player joins this long after the session opens. */
-#define SN_FAKE_USEC   (5 * 1000000LL)
 
 typedef struct
 {
@@ -168,7 +164,7 @@ static struct
 
    /* The others in the session, as last looked at (players_known: once
     * looked at, so who is there on arrival isn't news). avatar_of: whose
-    * picture each shows (the test player shows this player's). */
+    * picture each shows. */
    bomba_steamnet_player_t players[BOMBA_STEAMNET_MAX_PLAYERS];
    steam_id_t avatar_of[BOMBA_STEAMNET_MAX_PLAYERS];
    unsigned nplayers;
@@ -179,10 +175,6 @@ static struct
     * tunnel too). */
    volatile steam_id_t kicked[BOMBA_STEAMNET_MAX_PLAYERS];
    volatile unsigned nkicked;
-
-   /* Host: the test player, in the session from fake_at. */
-   bool fake;
-   int64_t fake_at;
 
    sthread_t *thread;
    volatile bool run;
@@ -458,7 +450,6 @@ static void sn_end(void)
    sn.nplayers       = 0;
    sn.players_known  = false;
    sn.nkicked        = 0;
-   sn.fake           = false;
 }
 
 /* This player's own session (see bomba_steamnet_poll). */
@@ -490,20 +481,6 @@ static void sn_back_home(int64_t delay)
    sn.host_at = sn_now() + delay;
 }
 
-/* Testing without a friend: a player who is this player again (name and
- * picture) joins one's own session, while a file "bomba-fake-player" sits
- * next to retroarch.exe. Kicking sends it away. */
-static bool sn_fake_wanted(void)
-{
-   char path[MAX_PATH], *slash;
-   GetModuleFileNameA(NULL, path, sizeof(path));
-   if (!(slash = strrchr(path, '\\')))
-      return false;
-   strlcpy(slash + 1, "bomba-fake-player",
-         sizeof(path) - (size_t)(slash + 1 - path));
-   return GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES;
-}
-
 static void sn_on_lobby_created(const lobby_created_t *c)
 {
    if (sn.state != BOMBA_STEAMNET_CREATING)
@@ -527,8 +504,6 @@ static void sn_on_lobby_created(const lobby_created_t *c)
    api.SetLobbyData(sn.mm, sn.lobby, "bomba", "1");
    api.SetLobbyData(sn.mm, sn.lobby, "name", sn.my_name);
    sn.state = BOMBA_STEAMNET_HOSTING;
-   sn.fake    = sn_fake_wanted();
-   sn.fake_at = sn_now() + SN_FAKE_USEC;
    sn_tunnel_start();
    RARCH_LOG("[Bomba] Hosting Steam lobby %llu.\n",
          (unsigned long long)sn.lobby);
@@ -895,14 +870,6 @@ static void sn_refresh_players(void)
       strlcpy(now[n].name, name ? name : "", sizeof(now[n].name));
       avatar_of[n++] = id;
    }
-   if (     hosting && sn.fake && sn_now() >= sn.fake_at
-         && n < BOMBA_STEAMNET_MAX_PLAYERS)
-   {
-      memset(&now[n], 0, sizeof(now[n]));
-      now[n].id = FAKE_ID;
-      strlcpy(now[n].name, sn.my_name, sizeof(now[n].name));
-      avatar_of[n++] = sn.me;
-   }
 
    /* The host first. */
    for (i = 1; i < n; i++)
@@ -1080,9 +1047,7 @@ void bomba_steamnet_kick(uint64_t id)
       return;
    snprintf(msg, sizeof(msg), "Multiplayer: %s was kicked.", p->name);
 
-   if (id == FAKE_ID)
-      sn.fake = false;
-   else if (!sn_is_kicked(id) && sn.nkicked < BOMBA_STEAMNET_MAX_PLAYERS)
+   if (!sn_is_kicked(id) && sn.nkicked < BOMBA_STEAMNET_MAX_PLAYERS)
    {
       net_identity_t who;
       /* Its traffic stops at once; the guest leaves on seeing the list. */
