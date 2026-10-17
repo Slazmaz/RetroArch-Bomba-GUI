@@ -11,7 +11,10 @@
  * keyboard."); the applet's members as its InitializeKeyboard stores them
  * (KeyboardInitializeParameters from +0x08, the normal keyboard's callback,
  * a std::function, at +0xd0). Eden's strings are libstdc++ std::u16string.
- * If anything doesn't match, nothing is patched and the DLL doesn't load. */
+ * If anything doesn't match, nothing is patched.
+ *
+ * Also: TCP sockets outside Eden's room (see install_sockets). The DLL
+ * loads if either patch went in. */
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <stdbool.h>
@@ -322,7 +325,7 @@ static submit_fn find_submit(const RUNTIME_FUNCTION *show)
    return NULL;
 }
 
-static bool install(void)
+static bool install_keyboard(void)
 {
    const RUNTIME_FUNCTION *show;
    uint32_t msg;
@@ -330,13 +333,6 @@ static bool install(void)
    uint8_t *at;
    void *hook = (void*)show_normal_keyboard;
    DWORD old;
-
-   image = (uint8_t*)GetModuleHandleW(NULL);
-   nt    = (IMAGE_NT_HEADERS64*)(image + ((IMAGE_DOS_HEADER*)image)->e_lfanew);
-   if (     nt->Signature != IMAGE_NT_SIGNATURE
-         || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)
-      return false;
-   sec = IMAGE_FIRST_SECTION(nt);
 
    if (     !(msg = find_string("(STUBBED) called, backend requested to show "
                   "the normal software keyboard."))
@@ -356,11 +352,169 @@ static bool install(void)
    return true;
 }
 
+/* ---------------------------------------------------------------------- */
+/* TCP outside the room                                                   */
+/* ---------------------------------------------------------------------- */
+
+/* In a room, every socket the game makes is a ProxySocket (BSD_USA::
+ * SocketImpl, service/sockets/bsd.cpp: "room_member->IsConnected() ?
+ * ProxySocket : Socket"), which carries datagrams over the room only: its
+ * Connect, Send and Recv are stubs, so TCP through the room never works.
+ * Here SocketImpl's IsConnected() answers false for stream sockets, so
+ * those are real sockets (a game's own servers, through RetroArch's shared
+ * ports); datagrams stay in the room, for LAN play.
+ *
+ * Found by what SocketImpl logs ("New socket fd={}"): the register keeping
+ * its type (mov from r8d, the third argument, at the start; masked with
+ * and 0xdfffffff), and its one IsConnected() call (call; test al, al;
+ * jz/je). That call goes to a stub near Eden's image:
+ *   cmp <type>, 1 (Type::STREAM); jne real; xor eax, eax; ret
+ *   real: jmp [IsConnected] */
+
+#define TYPE_STREAM 1
+
+/* The register (0-15) SocketImpl keeps its type in, -1 if not found. */
+static int find_type_reg(const RUNTIME_FUNCTION *f)
+{
+   const uint8_t *p = image + f->BeginAddress;
+   uint32_t len     = f->EndAddress - f->BeginAddress, k;
+   int reg          = -1;
+
+   for (k = 0; k + 3 <= len && k < 0x40; k++)
+   {
+      /* mov r32, r8d: 44/45 89 (11 000 rm), or 41/45 8B (11 reg 000). */
+      if ((p[k] == 0x44 || p[k] == 0x45) && p[k + 1] == 0x89
+            && (p[k + 2] & 0xF8) == 0xC0)
+         reg = (p[k + 2] & 7) | (p[k] == 0x45 ? 8 : 0);
+      else if ((p[k] == 0x41 || p[k] == 0x45) && p[k + 1] == 0x8B
+            && (p[k + 2] & 0xC7) == 0xC0)
+         reg = ((p[k + 2] >> 3) & 7) | (p[k] == 0x45 ? 8 : 0);
+      if (reg >= 0)
+         break;
+   }
+   /* Only one kept across calls (rbx, rbp, rsi, rdi, r12-r15). */
+   if (reg < 0 || reg == 0 || reg == 1 || reg == 2 || reg == 4
+         || (reg >= 8 && reg <= 11))
+      return -1;
+
+   /* and <reg>, 0xdfffffff: the type, its flag bit cleared. */
+   for (k = 0; k + 7 <= len; k++)
+   {
+      const uint8_t *q = p + k;
+      if (reg >= 8 && q[0] != 0x41)
+         continue;
+      if (reg >= 8)
+         q++;
+      if (     q[0] == 0x81 && q[1] == (0xE0 | (reg & 7))
+            && q[2] == 0xFF && q[3] == 0xFF && q[4] == 0xFF && q[5] == 0xDF)
+         return reg;
+   }
+   return -1;
+}
+
+/* The one "call rel32; test al, al; jz" in SocketImpl (IsConnected()),
+ * NULL if not exactly one. */
+static uint8_t *find_is_connected_call(const RUNTIME_FUNCTION *f)
+{
+   uint8_t *p   = image + f->BeginAddress;
+   uint32_t len = f->EndAddress - f->BeginAddress, k;
+   uint8_t *hit = NULL;
+
+   for (k = 0; k + 11 <= len; k++)
+      if (     p[k] == 0xE8 && p[k + 5] == 0x84 && p[k + 6] == 0xC0
+            && (p[k + 7] == 0x74 || (p[k + 7] == 0x0F && p[k + 8] == 0x84)))
+      {
+         if (hit)
+            return NULL;
+         hit = p + k;
+      }
+   return hit;
+}
+
+/* Memory for code within reach of a rel32 from near (2 GB). */
+static uint8_t *alloc_near(uint8_t *near_at, size_t size)
+{
+   uintptr_t base = (uintptr_t)near_at & ~(uintptr_t)0xFFFF;
+   uintptr_t step;
+
+   for (step = 0x10000; step < 0x7FF00000; step += 0x10000)
+   {
+      void *m;
+      if (base > step && (m = VirtualAlloc((void*)(base - step), size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)))
+         return (uint8_t*)m;
+      if ((m = VirtualAlloc((void*)(base + step), size,
+            MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)))
+         return (uint8_t*)m;
+   }
+   return NULL;
+}
+
+static bool install_sockets(void)
+{
+   const RUNTIME_FUNCTION *f;
+   uint32_t msg;
+   uint8_t *call, *stub, *real;
+   int32_t disp;
+   int reg;
+   size_t n = 0;
+   DWORD old;
+
+   if (     !(msg = find_string("New socket fd={}"))
+         || !(f = function_using(msg))
+         || (reg = find_type_reg(f)) < 0
+         || !(call = find_is_connected_call(f))
+         || !(stub = alloc_near(call, 64)))
+      return false;
+   memcpy(&disp, call + 1, 4);
+   real = call + 5 + disp;
+
+   /* cmp <reg>, TYPE_STREAM */
+   if (reg >= 8)
+      stub[n++] = 0x41;
+   stub[n++] = 0x83;
+   stub[n++] = (uint8_t)(0xF8 | (reg & 7));
+   stub[n++] = TYPE_STREAM;
+   /* jne real; xor eax, eax; ret */
+   stub[n++] = 0x75;
+   stub[n++] = 0x03;
+   stub[n++] = 0x31;
+   stub[n++] = 0xC0;
+   stub[n++] = 0xC3;
+   /* real: jmp [rip + 0]; IsConnected */
+   stub[n++] = 0xFF;
+   stub[n++] = 0x25;
+   memset(stub + n, 0, 4);
+   n += 4;
+   memcpy(stub + n, &real, 8);
+   n += 8;
+   FlushInstructionCache(GetCurrentProcess(), stub, n);
+
+   disp = (int32_t)(stub - (call + 5));
+   if (!VirtualProtect(call, 5, PAGE_EXECUTE_READWRITE, &old))
+      return false;
+   memcpy(call + 1, &disp, 4);
+   VirtualProtect(call, 5, old, &old);
+   FlushInstructionCache(GetCurrentProcess(), call, 5);
+   return true;
+}
+
 BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
 {
+   bool keyboard, sockets;
    (void)inst;
    (void)reserved;
-   if (reason == DLL_PROCESS_ATTACH)
-      return install();
-   return TRUE;
+   if (reason != DLL_PROCESS_ATTACH)
+      return TRUE;
+
+   image = (uint8_t*)GetModuleHandleW(NULL);
+   nt    = (IMAGE_NT_HEADERS64*)(image + ((IMAGE_DOS_HEADER*)image)->e_lfanew);
+   if (     nt->Signature != IMAGE_NT_SIGNATURE
+         || nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64)
+      return FALSE;
+   sec = IMAGE_FIRST_SECTION(nt);
+
+   keyboard = install_keyboard();
+   sockets  = install_sockets();
+   return keyboard || sockets;
 }
