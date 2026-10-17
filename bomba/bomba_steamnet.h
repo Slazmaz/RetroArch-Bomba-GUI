@@ -11,11 +11,10 @@ RETRO_BEGIN_DECLS
 
 /* Multiplayer sessions over Steam, so nobody forwards ports.
  *
- * A session is a friends-only Steam lobby owned by the host. Every player
- * hosts their own from the start, so friends can be invited at any time
- * from Steam's overlay; accepting an invite (or Join Game in the friends
- * list) moves into the friend's session instead, and back to one's own when
- * it ends. The emulator's own room traffic (UDP) goes through a tunnel over
+ * A session is a private (invite-only) Steam lobby owned by the host. Every
+ * player hosts their own from the start, so friends can be invited at any
+ * time from Steam's overlay; accepting an invite moves into the friend's
+ * session instead, and back to one's own when it ends (or the host kicks). The emulator's own room traffic (UDP) goes through a tunnel over
  * Steam's relays (SteamNetworkingMessages):
  *   host:  the launcher core runs the room on 127.0.0.1:BOMBA_STEAMNET_ROOM_PORT
  *          as usual; each guest's packets reach it from a socket of their own.
@@ -55,6 +54,26 @@ void bomba_steamnet_set_game(const char *system, const char *title);
 /* Guest: the host's game; "" while the host plays nothing. */
 const char *bomba_steamnet_host_system(void);
 const char *bomba_steamnet_host_title(void);
+
+/* The other players in this player's session (never this player), the
+ * host first. avatar is Steam's picture of them (see
+ * bomba_steamnet_avatar_rgba): 0 while it loads, and a new value when it
+ * changes. */
+typedef struct
+{
+   uint64_t id;
+   char name[64];
+   bool host;
+   int avatar;
+} bomba_steamnet_player_t;
+
+unsigned bomba_steamnet_players(const bomba_steamnet_player_t **players);
+/* A Steam picture as RGBA bytes (free() them); NULL if not there. */
+uint8_t *bomba_steamnet_avatar_rgba(int avatar, unsigned *w, unsigned *h);
+/* Host: sends a player out of the session. */
+void bomba_steamnet_kick(uint64_t id);
+/* Guest: leaves the host's session (back to one's own). */
+void bomba_steamnet_leave(void);
 
 RETRO_END_DECLS
 
