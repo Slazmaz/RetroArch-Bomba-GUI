@@ -385,6 +385,11 @@ typedef struct settings
 
       unsigned cheevos_appearance_anchor;
       unsigned cheevos_visibility_summary;
+
+      unsigned bomba_select_rgb;   /* Bomba: selection colour, 0xRRGGBB */
+      unsigned bomba_select_rgb2;  /* Bomba: its second colour */
+      unsigned bomba_select_style; /* Bomba: selection pattern (grid_home.c) */
+      unsigned bomba_grid_rows;    /* Bomba: rows the grid starts with, 1-4 */
    } uints;
 
    struct

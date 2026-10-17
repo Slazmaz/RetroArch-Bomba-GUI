@@ -2410,6 +2410,10 @@ static struct config_uint_setting *populate_settings_uint(
    SETTING_UINT("replay_max_keep",               &settings->uints.replay_max_keep, true, DEFAULT_REPLAY_MAX_KEEP, false);
    SETTING_UINT("replay_checkpoint_interval",    &settings->uints.replay_checkpoint_interval,  true, DEFAULT_REPLAY_CHECKPOINT_INTERVAL, false);
    SETTING_UINT("savestate_max_keep",            &settings->uints.savestate_max_keep, true, DEFAULT_SAVESTATE_MAX_KEEP, false);
+   SETTING_UINT("bomba_select_rgb",              &settings->uints.bomba_select_rgb, true, 0x0099ff, false);
+   SETTING_UINT("bomba_select_rgb2",             &settings->uints.bomba_select_rgb2, true, 0x00e5ff, false);
+   SETTING_UINT("bomba_select_style",            &settings->uints.bomba_select_style, true, 1, false);
+   SETTING_UINT("bomba_grid_rows",               &settings->uints.bomba_grid_rows, true, 2, false);
 #ifdef HAVE_MENU
    SETTING_UINT("content_show_add_entry",        &settings->uints.menu_content_show_add_entry, true, DEFAULT_MENU_CONTENT_SHOW_ADD_ENTRY, false);
    SETTING_UINT("content_show_contentless_cores",&settings->uints.menu_content_show_contentless_cores, true, DEFAULT_MENU_CONTENT_SHOW_CONTENTLESS_CORES, false);
