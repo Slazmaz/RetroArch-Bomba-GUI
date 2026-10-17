@@ -1591,6 +1591,7 @@ static struct config_array_setting *populate_settings_array(
    SETTING_ARRAY("location_driver",              settings->arrays.location_driver, false, NULL, true);
    SETTING_ARRAY("cloud_sync_driver",            settings->arrays.cloud_sync_driver, false, NULL, true);
    SETTING_ARRAY("bomba_steamgriddb_key",        settings->arrays.bomba_steamgriddb_key, false, NULL, true);
+   SETTING_ARRAY("bomba_shared_tcp_ports",       settings->arrays.bomba_shared_tcp_ports, false, NULL, true);
 
 #ifdef HAVE_CHEEVOS
    SETTING_ARRAY("cheevos_custom_host",          settings->arrays.cheevos_custom_host, false, NULL, true);
@@ -2897,6 +2898,10 @@ void config_set_defaults(void *data)
 
       free(float_settings);
    }
+
+   /* Bomba: ports game servers commonly use (1027: SMO Online). */
+   configuration_set_string(settings,
+         settings->arrays.bomba_shared_tcp_ports, "1027 7777");
 
    if (def_camera)
       configuration_set_string(settings,

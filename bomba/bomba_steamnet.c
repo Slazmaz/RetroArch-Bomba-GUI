@@ -1,5 +1,7 @@
 /* Bomba: multiplayer sessions over Steam (see bomba_steamnet.h). */
 
+/* (The tunnel waits on more sockets than Windows' 64.) */
+#define FD_SETSIZE 256
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <mstcpip.h>
@@ -15,6 +17,7 @@
 
 #include "bomba_steamnet.h"
 #include "../command.h"
+#include "../configuration.h"
 #include "../core_info.h"
 #include "../paths.h"
 #include "../runahead.h"
@@ -94,12 +97,14 @@ enum
  * order, no Nagle, reopening. */
 #define SEND_STREAM_FLAGS        (8 | 1 | 32)
 
-/* Channels: a launcher core's room, netplay's connections. Each netplay
- * message is a byte saying what, the connection's number (the guest
- * counts them: what's left of one before isn't taken for the next), then
- * the data. */
+/* Channels: a launcher core's room, netplay's connections, connections to
+ * the host's shared ports. Each netplay or shared message is a byte saying
+ * what, the connection's number (the guest counts them: what's left of one
+ * before isn't taken for the next), then the data; a shared connection's
+ * OPEN has the port (2 bytes, high first). */
 #define CH_ROOM                  0
 #define CH_NETPLAY               1
+#define CH_SHARED                2
 #define STREAM_OPEN              'O'
 #define STREAM_DATA              'D'
 #define STREAM_CLOSE             'C'
@@ -158,6 +163,9 @@ static struct
 } api;
 
 #define MAX_PEERS   16
+/* Connections to shared ports at once (all guests), and ports shared. */
+#define MAX_SHARED  64
+#define MAX_SHARED_PORTS 8
 /* A guest the host hasn't heard from this long has gone. */
 #define PEER_IDLE_USEC (30 * 1000000LL)
 /* Steam not making a session: asked again after this long. */
@@ -179,12 +187,14 @@ typedef struct
    int64_t last;
 } peer_t;
 
-/* A netplay connection through the tunnel. */
+/* A netplay or shared connection through the tunnel. */
 typedef struct
 {
    steam_id_t id;      /* the other end: host, a guest; guest, the host */
    SOCKET s;           /* INVALID_SOCKET: none (host: maybe trying again) */
    uint8_t num;
+   uint8_t ch;         /* CH_NETPLAY, CH_SHARED */
+   uint16_t port;      /* host: where it's passed on to */
    bool live;          /* host: wanted, connected or not */
    bool connecting;    /* host: connect() under way */
    int64_t opened, retry_at;
@@ -222,6 +232,12 @@ static struct
    unsigned local_port;
    SOCKET listen;
    unsigned netplay_port;
+
+   /* TCP ports the host shares (bomba_shared_tcp_ports; guest: from the
+    * lobby), and guest: the stand-ins listening on the same ports here. */
+   uint16_t shared_ports[MAX_SHARED_PORTS];
+   unsigned nshared_ports;
+   SOCKET shared_listen[MAX_SHARED_PORTS];
 
    /* Host: netplay for the running game (sn_host_netplay): which game it
     * was tried for, and whether it runs for the session. */
@@ -366,7 +382,8 @@ static SOCKET sn_tcp_socket(void)
    return s;
 }
 
-static SOCKET sn_tcp_listener(void)
+/* On 127.0.0.1:port (0: any free one). */
+static SOCKET sn_tcp_listener(uint16_t port)
 {
    struct sockaddr_in addr;
    SOCKET s = sn_tcp_socket();
@@ -375,8 +392,9 @@ static SOCKET sn_tcp_listener(void)
    memset(&addr, 0, sizeof(addr));
    addr.sin_family      = AF_INET;
    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+   addr.sin_port        = htons(port);
    if (     bind(s, (struct sockaddr*)&addr, sizeof(addr)) != 0
-         || listen(s, 1) != 0)
+         || listen(s, port ? SOMAXCONN : 1) != 0)
    {
       closesocket(s);
       return INVALID_SOCKET;
@@ -404,7 +422,7 @@ static int sn_stream_send(stream_t *st, char what, char *msg, uint32_t len)
    msg[1] = (char)st->num;
    sn_identity(&id, st->id);
    return api.SendMessageToUser(sn.msgs, &id, msg, STREAM_HEADER + len,
-         SEND_STREAM_FLAGS, CH_NETPLAY);
+         SEND_STREAM_FLAGS, st->ch);
 }
 
 static void sn_stream_tell(stream_t *st, char what)
@@ -452,7 +470,7 @@ static void sn_stream_take(stream_t *st, const char *data, size_t len)
    st->out_len += len;
 }
 
-/* Host: (again) to the host's netplay. */
+/* Host: (again) to the host's netplay, or the shared port. */
 static void sn_stream_connect(stream_t *st)
 {
    struct sockaddr_in addr;
@@ -462,7 +480,7 @@ static void sn_stream_connect(stream_t *st)
    memset(&addr, 0, sizeof(addr));
    addr.sin_family      = AF_INET;
    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-   addr.sin_port        = htons(BOMBA_STEAMNET_NETPLAY_PORT);
+   addr.sin_port        = htons(st->port);
    st->connecting = true;
    if (     connect(st->s, (struct sockaddr*)&addr, sizeof(addr)) == 0)
       st->connecting = false;
@@ -490,18 +508,18 @@ static void sn_stream_check_connect(stream_t *st, int64_t now)
       if (FD_ISSET(st->s, &w) && !FD_ISSET(st->s, &e))
       {
          st->connecting = false;
-         RARCH_LOG("[Bomba] Guest %llu reached netplay.\n",
-               (unsigned long long)st->id);
+         RARCH_LOG("[Bomba] Guest %llu reached port %u.\n",
+               (unsigned long long)st->id, st->port);
          return;
       }
-      /* (Netplay not started yet.) */
+      /* (Netplay, or what's on the shared port, not started yet.) */
       closesocket(st->s);
       st->s        = INVALID_SOCKET;
       st->retry_at = now + STREAM_RETRY_USEC;
    }
    if (now - st->opened > STREAM_CONNECT_USEC)
    {
-      RARCH_WARN("[Bomba] No netplay for guest %llu.\n",
+      RARCH_WARN("[Bomba] Nothing on port %u for guest %llu.\n", st->port,
             (unsigned long long)st->id);
       sn_stream_close(st, true);
    }
@@ -577,8 +595,10 @@ static stream_t *sn_stream_of(stream_t *streams, size_t *count, steam_id_t id)
    if (*count >= MAX_PEERS)
       return NULL;
    memset(&streams[*count], 0, sizeof(streams[0]));
-   streams[*count].id = id;
-   streams[*count].s  = INVALID_SOCKET;
+   streams[*count].id   = id;
+   streams[*count].s    = INVALID_SOCKET;
+   streams[*count].ch   = CH_NETPLAY;
+   streams[*count].port = BOMBA_STEAMNET_NETPLAY_PORT;
    return &streams[(*count)++];
 }
 
@@ -635,12 +655,140 @@ static void sn_stream_message(stream_t *streams, size_t *count, bool host,
    }
 }
 
+/* Shared ports' connections ---------------------------------------------- */
+
+static bool sn_is_shared_port(uint16_t port)
+{
+   unsigned i;
+   for (i = 0; i < sn.nshared_ports; i++)
+      if (sn.shared_ports[i] == port)
+         return true;
+   return false;
+}
+
+/* The live connection with id and num; with new, else a free one made. */
+static stream_t *sn_shared_of(stream_t *shared, size_t *count, steam_id_t id,
+      uint8_t num, bool new_one)
+{
+   size_t i;
+   for (i = 0; i < *count; i++)
+      if (shared[i].live && shared[i].id == id && shared[i].num == num)
+         return &shared[i];
+   if (!new_one)
+      return NULL;
+   for (i = 0; i < *count; i++)
+      if (!shared[i].live)
+         break;
+   if (i == *count)
+   {
+      if (*count >= MAX_SHARED)
+         return NULL;
+      memset(&shared[i], 0, sizeof(shared[0]));
+      shared[i].s = INVALID_SOCKET;
+      (*count)++;
+   }
+   shared[i].id = id;
+   shared[i].ch = CH_SHARED;
+   return &shared[i];
+}
+
+/* A shared connection's message from the other end. */
+static void sn_shared_message(stream_t *shared, size_t *count, bool host,
+      steam_id_t from, const char *data, int size)
+{
+   stream_t *st;
+   char what;
+   uint8_t num;
+
+   if (size < STREAM_HEADER)
+      return;
+   what = data[0];
+   num  = (uint8_t)data[1];
+
+   if (host && what == STREAM_OPEN)
+   {
+      uint16_t port;
+      if (size < STREAM_HEADER + 2)
+         return;
+      port = (uint16_t)(((uint8_t)data[2] << 8) | (uint8_t)data[3]);
+      if ((st = sn_shared_of(shared, count, from, num, false)))
+         sn_stream_close(st, false);
+      if (!(st = sn_shared_of(shared, count, from, num, true)))
+         return;
+      st->num      = num;
+      st->port     = port;
+      st->live     = true;
+      st->opened   = sn_now();
+      st->retry_at = 0;
+      /* Only to what the host shares. */
+      if (!sn_is_shared_port(port))
+      {
+         RARCH_WARN("[Bomba] Guest %llu asked for port %u, not shared.\n",
+               (unsigned long long)from, port);
+         sn_stream_close(st, true);
+         return;
+      }
+      sn_stream_connect(st);
+      RARCH_LOG("[Bomba] Guest %llu opened a connection to port %u.\n",
+            (unsigned long long)from, port);
+      return;
+   }
+   if (!host && from != sn.host)
+      return;
+   if (!(st = sn_shared_of(shared, count, from, num, false)))
+      return; /* (an earlier connection's) */
+   if (what == STREAM_DATA)
+      sn_stream_take(st, data + STREAM_HEADER, size - STREAM_HEADER);
+   else if (what == STREAM_CLOSE)
+   {
+      if (!st->connecting && st->s != INVALID_SOCKET)
+         sn_stream_flush(st);
+      sn_stream_close(st, false);
+   }
+}
+
+/* Guest: a connection to a shared port here, passed on to the host's. */
+static void sn_shared_accept(stream_t *shared, size_t *count, unsigned which,
+      uint8_t *num)
+{
+   char msg[STREAM_HEADER + 2];
+   u_long nonblock = 1;
+   BOOL nodelay    = TRUE;
+   uint16_t port   = sn.shared_ports[which];
+   stream_t *st;
+   SOCKET s        = accept(sn.shared_listen[which], NULL, NULL);
+
+   if (s == INVALID_SOCKET)
+      return;
+   (*num)++;
+   if (!(st = sn_shared_of(shared, count, sn.host, *num, true)))
+   {
+      closesocket(s);
+      return;
+   }
+   ioctlsocket(s, FIONBIO, &nonblock);
+   setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay,
+         sizeof(nodelay));
+   st->num  = *num;
+   st->port = port;
+   st->s    = s;
+   st->live = true;
+   msg[STREAM_HEADER]     = (char)(port >> 8);
+   msg[STREAM_HEADER + 1] = (char)(port & 0xff);
+   sn_stream_send(st, STREAM_OPEN, msg, 2);
+   RARCH_LOG("[Bomba] Connection to the host's port %u.\n", port);
+}
+
 static void sn_tunnel(void *data)
 {
    static char buf[65536];
    peer_t peers[MAX_PEERS];
    /* Netplay's connections: host, one per guest; guest, [0] (the host). */
    stream_t streams[MAX_PEERS];
+   /* Connections to shared ports (guest: numbered by shared_num). */
+   static stream_t shared[MAX_SHARED];
+   size_t nshared = 0;
+   uint8_t shared_num = 0;
    size_t npeers = 0, nstreams = 0, i;
    bool host     = sn.state == BOMBA_STEAMNET_HOSTING;
    steam_id_t to = sn.host;
@@ -654,9 +802,11 @@ static void sn_tunnel(void *data)
    if (!host)
    {
       memset(&streams[0], 0, sizeof(streams[0]));
-      streams[0].id = to;
-      streams[0].s  = INVALID_SOCKET;
-      nstreams      = 1;
+      streams[0].id   = to;
+      streams[0].s    = INVALID_SOCKET;
+      streams[0].ch   = CH_NETPLAY;
+      streams[0].port = BOMBA_STEAMNET_NETPLAY_PORT;
+      nstreams        = 1;
    }
 
    while (sn.run)
@@ -678,11 +828,18 @@ static void sn_tunnel(void *data)
          FD_SET(sn.local, &set);
          if (sn.listen != INVALID_SOCKET)
             FD_SET(sn.listen, &set);
+         for (i = 0; i < sn.nshared_ports; i++)
+            if (sn.shared_listen[i] != INVALID_SOCKET)
+               FD_SET(sn.shared_listen[i], &set);
       }
       for (i = 0; i < nstreams; i++)
          if (     streams[i].live && !streams[i].connecting
                && streams[i].s != INVALID_SOCKET)
             FD_SET(streams[i].s, &set);
+      for (i = 0; i < nshared; i++)
+         if (     shared[i].live && !shared[i].connecting
+               && shared[i].s != INVALID_SOCKET)
+            FD_SET(shared[i].s, &set);
       tv.tv_sec  = 0;
       tv.tv_usec = 1000;
       if (set.fd_count)
@@ -736,6 +893,40 @@ static void sn_tunnel(void *data)
          {
             RARCH_LOG("[Bomba] Guest %llu's netplay connection ended.\n",
                   (unsigned long long)st->id);
+            sn_stream_close(st, true);
+            continue;
+         }
+         if (st->connecting)
+            sn_stream_check_connect(st, now);
+         sn_stream_pump(st, buf, sizeof(buf));
+      }
+
+      /* Shared ports: the same. */
+      n = api.ReceiveMessages(sn.msgs, CH_SHARED, msgs, 32);
+      for (k = 0; k < n; k++)
+      {
+         net_msg_t *m    = msgs[k];
+         steam_id_t from = m->peer.type == IDENTITY_STEAMID
+            ? m->peer.u.steam_id : 0;
+         if (from && !(host && sn_is_kicked(from)))
+            sn_shared_message(shared, &nshared, host, from,
+                  (const char*)m->data, m->size);
+         api.ReleaseMessage(m);
+      }
+      if (!host)
+         for (i = 0; i < sn.nshared_ports; i++)
+            if (sn.shared_listen[i] != INVALID_SOCKET)
+               sn_shared_accept(shared, &nshared, (unsigned)i, &shared_num);
+      now = sn_now();
+      for (i = 0; i < nshared; i++)
+      {
+         stream_t *st = &shared[i];
+         if (!st->live)
+            continue;
+         if (host && (sn_is_kicked(st->id)
+               || (now - st->opened > STREAM_GRACE_USEC
+                  && !sn_is_member_now(st->id))))
+         {
             sn_stream_close(st, true);
             continue;
          }
@@ -835,6 +1026,17 @@ static void sn_tunnel(void *data)
       sn_stream_close(&streams[i], true);
       sn_stream_free(&streams[i]);
    }
+   for (i = 0; i < nshared; i++)
+   {
+      sn_stream_close(&shared[i], true);
+      sn_stream_free(&shared[i]);
+   }
+   for (i = 0; host && i < nshared; i++)
+   {
+      net_identity_t id;
+      sn_identity(&id, shared[i].id);
+      api.CloseSession(sn.msgs, &id);
+   }
    for (i = 0; i < npeers; i++)
    {
       net_identity_t id;
@@ -861,6 +1063,7 @@ static void sn_tunnel_start(void)
 
 static void sn_tunnel_stop(void)
 {
+   unsigned i;
    if (sn.thread)
    {
       sn.run = false;
@@ -877,8 +1080,45 @@ static void sn_tunnel_stop(void)
       closesocket(sn.listen);
       sn.listen = INVALID_SOCKET;
    }
-   sn.local_port   = 0;
-   sn.netplay_port = 0;
+   for (i = 0; i < sn.nshared_ports; i++)
+      if (sn.shared_listen[i] != INVALID_SOCKET)
+         closesocket(sn.shared_listen[i]);
+   sn.nshared_ports = 0;
+   sn.local_port    = 0;
+   sn.netplay_port  = 0;
+}
+
+/* Ports from a list like "1027, 7777" (at most MAX_SHARED_PORTS). */
+static void sn_read_ports(const char *s)
+{
+   sn.nshared_ports = 0;
+   while (*s && sn.nshared_ports < MAX_SHARED_PORTS)
+   {
+      char *end;
+      unsigned long port = strtoul(s, &end, 10);
+      if (end == s)
+      {
+         s++;
+         continue;
+      }
+      if (port > 0 && port < 65536 && !sn_is_shared_port((uint16_t)port))
+      {
+         sn.shared_listen[sn.nshared_ports]  = INVALID_SOCKET;
+         sn.shared_ports[sn.nshared_ports++] = (uint16_t)port;
+      }
+      s = end;
+   }
+}
+
+/* The ports as a list, "1027 7777". */
+static void sn_ports_list(char *s, size_t len)
+{
+   size_t n = 0;
+   unsigned i;
+   s[0] = '\0';
+   for (i = 0; i < sn.nshared_ports && n < len; i++)
+      n += snprintf(s + n, len - n, "%s%u", i ? " " : "",
+            sn.shared_ports[i]);
 }
 
 /* ---------------------------------------------------------------------- */
@@ -963,6 +1203,14 @@ static void sn_on_lobby_created(const lobby_created_t *c)
    sn.host  = sn.me;
    api.SetLobbyData(sn.mm, sn.lobby, "bomba", "1");
    api.SetLobbyData(sn.mm, sn.lobby, "name", sn.my_name);
+   {
+      char ports[MAX_SHARED_PORTS * 6 + 1];
+      sn_read_ports(config_get_ptr()->arrays.bomba_shared_tcp_ports);
+      sn_ports_list(ports, sizeof(ports));
+      api.SetLobbyData(sn.mm, sn.lobby, "ports", ports);
+      if (*ports)
+         RARCH_LOG("[Bomba] Sharing TCP ports %s with the session.\n", ports);
+   }
    sn.state = BOMBA_STEAMNET_HOSTING;
    sn_tunnel_start();
    RARCH_LOG("[Bomba] Hosting Steam lobby %llu.\n",
@@ -1007,11 +1255,31 @@ static void sn_on_lobby_enter(const lobby_enter_t *e)
    sn_read_host_game();
 
    if (     (sn.local  = sn_udp_socket())   == INVALID_SOCKET
-         || (sn.listen = sn_tcp_listener()) == INVALID_SOCKET)
+         || (sn.listen = sn_tcp_listener(0)) == INVALID_SOCKET)
    {
       sn_message("Multiplayer: couldn't open the session's local port.");
       sn_back_home(0);
       return;
+   }
+   /* The host's shared ports, on the same ports here. */
+   {
+      unsigned i;
+      sn_read_ports(sn_lobby_data(sn.lobby, "ports"));
+      for (i = 0; i < sn.nshared_ports; i++)
+      {
+         if ((sn.shared_listen[i] = sn_tcp_listener(sn.shared_ports[i]))
+               == INVALID_SOCKET)
+         {
+            char msg[128];
+            snprintf(msg, sizeof(msg), "Multiplayer: port %u is in use "
+                  "here; the host's can't be reached on it.",
+                  sn.shared_ports[i]);
+            sn_message(msg);
+         }
+         else
+            RARCH_LOG("[Bomba] The host's port %u is on 127.0.0.1:%u.\n",
+                  sn.shared_ports[i], sn.shared_ports[i]);
+      }
    }
    {
       struct sockaddr_in addr;

@@ -27,6 +27,12 @@ RETRO_BEGIN_DECLS
  *            guests are in the session (started here, on the running game);
  *            each guest's connection is passed on to it.
  *     guest: netplay connects to 127.0.0.1:bomba_steamnet_netplay_port.
+ *   - TCP ports the host shares (setting bomba_shared_tcp_ports, e.g.
+ *     "1027"), for a server the host runs on their own (a game mod's):
+ *     host:  each guest's connection is passed on to 127.0.0.1:port, only
+ *            for the ports shared.
+ *     guest: the same ports listen on 127.0.0.1, so the game connects to
+ *            127.0.0.1 as if the server were here.
  * The host's lobby also carries the game the host is playing, which guests
  * start too (see grid_home.c).
  *

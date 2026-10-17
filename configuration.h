@@ -510,6 +510,7 @@ typedef struct settings
       char input_keyboard_layout[64];
       char cheevos_custom_host[64];
       char bomba_steamgriddb_key[64]; /* Bomba: covers and banners */
+      char bomba_shared_tcp_ports[64]; /* Bomba: TCP ports a Steam session's host shares (bomba_steamnet.c) */
 
 #ifdef HAVE_LAKKA
       char timezone[TIMEZONE_LENGTH];

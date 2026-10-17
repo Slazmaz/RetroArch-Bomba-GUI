@@ -1512,8 +1512,9 @@ static void kbd_inject(HANDLE process)
       CloseHandle(thread);
    }
    VirtualFreeEx(process, remote, 0, MEM_RELEASE);
-   log_msg(code ? "keyboard: hooked into Eden"
-                : "keyboard: Eden's keyboard not found; it answers \"Eden\"");
+   log_msg(code ? "keyboard: eden_kbd.dll hooked into Eden (keyboard, TCP sockets)"
+                : "keyboard: neither Eden's keyboard nor its sockets found; "
+                  "it answers \"Eden\"");
 }
 
 /* Once Eden runs (the overlay starts it suspended), after its C runtime
