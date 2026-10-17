@@ -192,6 +192,7 @@ typedef struct
    uintptr_t btn_tex;
    unsigned btn_d, btn_ip; /* circle and icon size it was made for */
    float btn_nx, btn_ny, btn_nr; /* ...and notch (see grid_icon_button_draw_notch) */
+   float btn_shift; /* icon moved right in its button by this much of it */
 } grid_icon_t;
 
 /* Blurred background image. */
@@ -228,6 +229,16 @@ static const char *grid_sort_label[SORT_COUNT] = {
    "Time Played"
 };
 
+/* A Steam picture's texture, by Steam's picture handle. */
+typedef struct
+{
+   int avatar;
+   uintptr_t tex;
+} grid_avatar_tex_t;
+
+/* Invite screen cards with a picture loaded at once. */
+#define GRID_INVITE_SLOTS 16
+
 /* Top-left icon bar, in order. */
 enum grid_bar_item
 {
@@ -248,7 +259,8 @@ enum grid_panel
    PANEL_CHEEVOS,  /* the game's achievements */
    PANEL_ART,      /* choosing the game's cover art or wallpaper */
    PANEL_UPDATES,  /* Installs: updates and things to install */
-   PANEL_SETUP     /* first start: SteamGridDB key, RetroAchievements login */
+   PANEL_SETUP,    /* first start: SteamGridDB key, RetroAchievements login */
+   PANEL_INVITE    /* Steam friends to invite into the session */
 };
 
 /* Game menu entries, in order. Settings are its console's (its emulator's
@@ -595,11 +607,17 @@ static struct
 
    /* The multiplayer session's players' Steam pictures (circle-clipped),
     * by Steam's picture handle. */
-   struct
-   {
-      int avatar;
-      uintptr_t tex;
-   } mp_tex[BOMBA_STEAMNET_MAX_PLAYERS];
+   grid_avatar_tex_t mp_tex[BOMBA_STEAMNET_MAX_PLAYERS];
+
+   /* Invite screen: the friends listed (looked at again every so often),
+    * the first row shown, when it opened, and its cards' pictures (by card
+    * on screen). */
+   const bomba_steamnet_friend_t *inv_list;
+   unsigned inv_count;
+   unsigned inv_first;
+   retro_time_t inv_open_start;
+   retro_time_t inv_refresh_at;
+   grid_avatar_tex_t inv_tex[GRID_INVITE_SLOTS];
 
    /* Profile pictures (circle-clipped), reloaded when the path changes. */
    uintptr_t profile_tex[GRID_PROFILE_MAX];
@@ -663,6 +681,7 @@ static struct
    grid_icon_t icon_backspace; /* on-screen keyboard keys */
    grid_icon_t icon_shift;
    grid_icon_t icon_crown;   /* on the multiplayer host's picture */
+   grid_icon_t icon_invite;  /* Invite friends, after the players */
    /* Background of the selected game. */
    grid_bg_t bg;
    char bg_key[PATH_MAX_LENGTH];   /* what bg shows: "", GRID_BG_GAME or a
@@ -1795,6 +1814,12 @@ static void grid_open_panel(enum grid_panel panel)
 
    if (panel == PANEL_PROFILES)
       grid_st.panel_sel = grid_profile_current() + GRID_STRIP_FIRST;
+   else if (panel == PANEL_INVITE)
+   {
+      grid_st.inv_first      = 0;
+      grid_st.inv_open_start = cpu_features_get_time_usec();
+      grid_st.inv_refresh_at = 0;
+   }
    else if (panel == PANEL_UPDATES)
    {
       /* Opens on everything, the search empty. */
@@ -3526,6 +3551,12 @@ void grid_home_iterate(void)
    }
 }
 
+/* Invite screen: friends offline, or invited already, can't be. */
+static bool grid_inv_can_invite(const bomba_steamnet_friend_t *f)
+{
+   return !f->invited && f->status != BOMBA_FRIEND_OFFLINE;
+}
+
 static void grid_panel_action(enum menu_action action)
 {
    unsigned sel;
@@ -3626,6 +3657,24 @@ static void grid_panel_action(enum menu_action action)
          default:
             sel = grid_move_in_grid(sel, grid_st.pick_count + 1,
                   grid_st.pick_cols ? grid_st.pick_cols : 1, action);
+            break;
+      }
+   }
+   else if (grid_st.panel == PANEL_INVITE)
+   {
+      unsigned n = grid_st.inv_count;
+
+      switch (action)
+      {
+         case MENU_ACTION_OK:
+            if (sel < n && grid_inv_can_invite(&grid_st.inv_list[sel]))
+               bomba_steamnet_invite(grid_st.inv_list[sel].id);
+            return;
+         case MENU_ACTION_CANCEL:
+            grid_st.panel = PANEL_NONE;
+            break;
+         default:
+            sel = grid_move_in_grid(sel, n, GRID_DL_COLS, action);
             break;
       }
    }
@@ -3756,35 +3805,48 @@ static void grid_panel_action(enum menu_action action)
    grid_st.panel_sel = sel;
 }
 
-/* The other players of the multiplayer session, beside the profile. */
-static unsigned grid_mp_players(const bomba_steamnet_player_t **players)
+/* The other players of the multiplayer session, beside the profile, then
+ * Invite: *slots of them in all (bar_player 1 .. *slots). */
+static unsigned grid_mp_players(const bomba_steamnet_player_t **players,
+      unsigned *slots)
 {
    unsigned n = bomba_steamnet_players(players);
-   if (grid_st.bar_player > n)
-      grid_st.bar_player = n;
+   unsigned s = n + (bomba_steamnet_can_invite() ? 1 : 0);
+   if (grid_st.bar_player > s)
+      grid_st.bar_player = s;
+   if (slots)
+      *slots = s;
    return n;
 }
 
 /* OK on a player: the host kicks them, a guest leaves the session (from
- * the host's picture). */
+ * the host's picture). After them, Invite. */
 static void grid_mp_player_action(unsigned k)
 {
    const bomba_steamnet_player_t *players;
-   unsigned n = grid_mp_players(&players);
+   unsigned slots;
+   unsigned n = grid_mp_players(&players, &slots);
 
+   if (k == n + 1 && k == slots)
+   {
+      grid_open_panel(PANEL_INVITE);
+      return;
+   }
    if (!k || k > n)
       return;
    if (bomba_steamnet_state() == BOMBA_STEAMNET_HOSTING)
       bomba_steamnet_kick(players[k - 1].id);
    else if (players[k - 1].host)
       bomba_steamnet_leave();
-   grid_mp_players(&players);
+   grid_mp_players(&players, NULL);
 }
 
 static void grid_bar_action(enum menu_action action)
 {
    const bomba_steamnet_player_t *players;
-   unsigned nplayers = grid_mp_players(&players);
+   unsigned nplayers;
+
+   grid_mp_players(&players, &nplayers);
 
    switch (action)
    {
@@ -7370,6 +7432,7 @@ static void grid_icon_button_draw_notch(gfx_display_t *p_disp,
       struct texture_image ti;
       unsigned px, py;
       unsigned m = (d - ip) / 2; /* icon margin */
+      int sx     = (int)floorf(ic->btn_shift * ip + 0.5f);
       float r    = d / 2.0f;
       float cr   = ((circle_rgba >> 24) & 0xff), cg = ((circle_rgba >> 16) & 0xff);
       float cb   = ((circle_rgba >> 8) & 0xff);
@@ -7404,8 +7467,9 @@ static void grid_icon_button_draw_notch(gfx_display_t *p_disp,
 
             if (ac < 0.0f) ac = 0.0f;
             if (ac > 1.0f) ac = 1.0f;
-            if (px >= m && py >= m && px < m + ip && py < m + ip)
-               ai = grid_icon_coverage(ic, ip, px - m, py - m) / 255.0f;
+            if (     (int)px >= (int)m + sx && py >= m
+                  && (int)px < (int)(m + ip) + sx && py < m + ip)
+               ai = grid_icon_coverage(ic, ip, px - m - sx, py - m) / 255.0f;
 
             /* Icon over circle, each with its own opacity (the circle
              * may be translucent); a fully transparent icon colour cuts
@@ -7600,53 +7664,59 @@ static void grid_draw_profile_avatar(gfx_display_t *p_disp, void *userdata,
          d * 0.42f / (height / 32.0f) / GRID_FONT_CAP);
 }
 
-static void grid_free_mp_textures(void)
+static void grid_free_avatar_textures(grid_avatar_tex_t *slots, unsigned n)
 {
    unsigned i;
-   for (i = 0; i < BOMBA_STEAMNET_MAX_PLAYERS; i++)
+   for (i = 0; i < n; i++)
    {
-      if (grid_st.mp_tex[i].tex)
-         video_driver_texture_unload(&grid_st.mp_tex[i].tex);
-      grid_st.mp_tex[i].tex    = 0;
-      grid_st.mp_tex[i].avatar = 0;
+      if (slots[i].tex)
+         video_driver_texture_unload(&slots[i].tex);
+      slots[i].tex    = 0;
+      slots[i].avatar = 0;
    }
 }
 
-/* A player's Steam picture, d wide at (x, y), from its slot's texture
- * (made again when the picture changes); its initial until it's in. */
-static void grid_draw_mp_avatar(gfx_display_t *p_disp, void *userdata,
-      unsigned width, unsigned height, unsigned slot,
-      const bomba_steamnet_player_t *pl, float x, float y, float d)
+static void grid_free_mp_textures(void)
 {
-   if (grid_st.mp_tex[slot].avatar != pl->avatar)
+   grid_free_avatar_textures(grid_st.mp_tex, BOMBA_STEAMNET_MAX_PLAYERS);
+   grid_free_avatar_textures(grid_st.inv_tex, GRID_INVITE_SLOTS);
+}
+
+/* A Steam picture (avatar), d wide at (x, y), from its slot's texture
+ * (made again when the picture changes); name's initial until it's in. */
+static void grid_draw_steam_avatar(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, grid_avatar_tex_t *slot,
+      int avatar, const char *name, float x, float y, float d)
+{
+   if (slot->avatar != avatar)
    {
       unsigned w, h;
       uint8_t *rgba;
-      if (grid_st.mp_tex[slot].tex)
-         video_driver_texture_unload(&grid_st.mp_tex[slot].tex);
-      grid_st.mp_tex[slot].tex    = 0;
-      grid_st.mp_tex[slot].avatar = pl->avatar;
-      if ((rgba = bomba_steamnet_avatar_rgba(pl->avatar, &w, &h)))
+      if (slot->tex)
+         video_driver_texture_unload(&slot->tex);
+      slot->tex    = 0;
+      slot->avatar = avatar;
+      if ((rgba = bomba_steamnet_avatar_rgba(avatar, &w, &h)))
       {
-         grid_load_avatar_texture(rgba, w, h, &grid_st.mp_tex[slot].tex);
+         grid_load_avatar_texture(rgba, w, h, &slot->tex);
          free(rgba);
       }
    }
 
-   if (grid_st.mp_tex[slot].tex)
+   if (slot->tex)
    {
       grid_draw_icon(p_disp, userdata, width, height,
-            &grid_st.mp_tex[slot].tex, x + d / 2.0f, y + d / 2.0f, d,
-            0xffffffff);
+            &slot->tex, x + d / 2.0f, y + d / 2.0f, d, 0xffffffff);
       return;
    }
    grid_draw_rounded(p_disp, userdata, width, height,
          x, y, d, d, d / 2.0f, COL_SEARCH);
    grid_draw_char_centered(true,
-         (char)toupper((unsigned char)(pl->name[0] ? pl->name[0] : '?')),
+         (char)toupper((unsigned char)(name[0] ? name[0] : '?')),
          x + d / 2.0f, y + d / 2.0f, width, height, 0xffffffff,
          d * 0.42f / (height / 32.0f) / GRID_FONT_CAP);
 }
+
 
 /* The session host's crown, tilted on the top right of its picture (d
  * wide at (x, y)), over a drop shadow. (Its square image was turned onto
@@ -7683,7 +7753,8 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
                      || grid_st.panel == PANEL_ART
                      || grid_st.panel == PANEL_ICONS
                      || grid_st.panel == PANEL_UPDATES
-                     || grid_st.panel == PANEL_SETUP;
+                     || grid_st.panel == PANEL_SETUP
+                     || grid_st.panel == PANEL_INVITE;
 
    /* Icon bar: 27px circles, 9px apart. */
    if (!full_screen)
@@ -7909,7 +7980,8 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
             case BAR_PROFILE:
             {
                const bomba_steamnet_player_t *players;
-               unsigned np = grid_mp_players(&players), k;
+               unsigned slots;
+               unsigned np = grid_mp_players(&players, &slots), k;
                float pgap  = REF(5); /* between the players' pictures */
 
                /* Hidden under the profiles strip while it is open. */
@@ -7922,8 +7994,8 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
                      grid_draw_crown(p_disp, userdata, width, height, x, y, d);
                }
 
-               /* The session's other players, after it. */
-               for (k = 0; k < np; k++)
+               /* The session's other players, after it, then Invite. */
+               for (k = 0; k < slots; k++)
                {
                   float px  = floorf(x + (k + 1) * (d + pgap) + 0.5f);
                   bool psel = grid_st.bar_focus && grid_st.bar_sel == i
@@ -7937,11 +8009,19 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
                   if (psel)
                      grid_draw_cursor(p_disp, userdata, width, height,
                            px, y, d, d, d / 2.0f);
-                  grid_draw_mp_avatar(p_disp, userdata, width, height, k,
-                        &players[k], px, y, d);
-                  if (players[k].host)
-                     grid_draw_crown(p_disp, userdata, width, height,
-                           px, y, d);
+                  if (k == np)
+                     grid_icon_button_draw(p_disp, userdata, width, height,
+                           &grid_st.icon_invite, px, y, (unsigned)d, 0.55f,
+                           COL_DIVIDER, COL_TEXT);
+                  else
+                  {
+                     grid_draw_steam_avatar(p_disp, userdata, width,
+                           height, &grid_st.mp_tex[k], players[k].avatar,
+                           players[k].name, px, y, d);
+                     if (players[k].host)
+                        grid_draw_crown(p_disp, userdata, width, height,
+                              px, y, d);
+                  }
 
                   /* Selected: who, and what OK does, under it. */
                   if (psel)
@@ -7953,7 +8033,9 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
                      float lpad = REF(8);
                      float lw, lx;
 
-                     if (bomba_steamnet_state() == BOMBA_STEAMNET_HOSTING)
+                     if (k == np)
+                        strlcpy(label, "Invite friends", sizeof(label));
+                     else if (bomba_steamnet_state() == BOMBA_STEAMNET_HOSTING)
                         snprintf(label, sizeof(label), "Kick %s",
                               players[k].name);
                      else if (players[k].host)
@@ -7973,8 +8055,7 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
                            COL_TEXT, TEXT_ALIGN_LEFT, ls);
                   }
                }
-               if (np)
-                  x += np * (d + pgap);
+               x += slots * (d + pgap);
                break;
             }
             case BAR_SETTINGS:
@@ -8204,6 +8285,7 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
          case PANEL_ART:
          case PANEL_ICONS:
          case PANEL_SETUP:
+         case PANEL_INVITE:
             srt = con = NULL;
             break;
          default:
@@ -8355,6 +8437,15 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
    else if (grid_st.panel == PANEL_GAME_MENU)
    {
       glyphs[n] = "A"; labels[n++] = "Open";
+      glyphs[n] = "B"; labels[n++] = "Back";
+   }
+   else if (grid_st.panel == PANEL_INVITE)
+   {
+      if (     grid_st.panel_sel < grid_st.inv_count && grid_st.inv_list
+            && grid_inv_can_invite(&grid_st.inv_list[grid_st.panel_sel]))
+      {
+         glyphs[n] = "A"; labels[n++] = "Invite";
+      }
       glyphs[n] = "B"; labels[n++] = "Back";
    }
    else if (grid_st.panel == PANEL_CHEEVOS)
@@ -9431,6 +9522,134 @@ static void grid_draw_downloads_screen(gfx_display_t *p_disp,
                tx, by, tw * (u->progress > 100 ? 100 : u->progress) / 100.0f,
                bh, bh / 2.0f, COL_CURSOR);
       }
+   }
+}
+
+/* Invite screen: Steam friends as cards (as Installs), each with their
+ * picture, name and what they're up to as Steam shows it: in a game
+ * (green), online (blue), offline (grey); or invited already. A invites the
+ * selected one. */
+static void grid_draw_invite_screen(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height)
+{
+   retro_time_t now = cpu_features_get_time_usec();
+   float left       = REF(35);
+   float top        = REF(70);
+   float area_h     = REF(364) - top;
+   float cgap       = REF(10);
+   float card_w     = (width - 2.0f * left - (GRID_DL_COLS - 1) * cgap)
+                      / GRID_DL_COLS;
+   float card_h     = REF(46);
+   float cpad       = REF(12);
+   float ad         = 2.0f * floorf((card_h - REF(14)) / 2.0f) + 1.0f;
+   float ts         = CAP(GRID_TEXT_CAP);
+   float ss         = CAP(GRID_TEXT_CAP - 2);
+   const char *parts[2];
+   char online[32];
+   size_t i, n, rows, sel_row, on = 0;
+
+   /* Who's online changes: looked at again every second. */
+   if (now >= grid_st.inv_refresh_at)
+   {
+      grid_st.inv_count      = bomba_steamnet_friends(&grid_st.inv_list);
+      grid_st.inv_refresh_at = now + 1000000;
+   }
+   n = grid_st.inv_count;
+   if (grid_st.panel_sel >= n)
+      grid_st.panel_sel = n ? (unsigned)n - 1 : 0;
+
+   /* Invite friends | 5 online */
+   for (i = 0; i < n; i++)
+      if (grid_st.inv_list[i].status != BOMBA_FRIEND_OFFLINE)
+         on++;
+   parts[0] = "Invite friends";
+   snprintf(online, sizeof(online), "%u online", (unsigned)on);
+   parts[1] = online;
+   grid_draw_screen_heading(p_disp, userdata, width, height, parts, 2);
+
+   if (!n)
+   {
+      grid_draw_text("No Steam friends", width / 2.0f,
+            grid_text_y(top + area_h / 2.0f, height, ts), width, height,
+            COL_TEXT_SOFT, TEXT_ALIGN_CENTER, ts);
+      return;
+   }
+
+   /* Keep the selected row visible. */
+   rows = (size_t)((area_h + cgap) / (card_h + cgap));
+   if (rows < 1)
+      rows = 1;
+   if (rows * GRID_DL_COLS > GRID_INVITE_SLOTS)
+      rows = GRID_INVITE_SLOTS / GRID_DL_COLS;
+   sel_row = grid_st.panel_sel / GRID_DL_COLS;
+   if (sel_row < grid_st.inv_first)
+      grid_st.inv_first = (unsigned)sel_row;
+   else if (sel_row >= grid_st.inv_first + rows)
+      grid_st.inv_first = (unsigned)(sel_row - rows + 1);
+   grid_draw_scrollbar(p_disp, userdata, width, height, top, area_h,
+         grid_st.inv_first, rows, (n + GRID_DL_COLS - 1) / GRID_DL_COLS);
+
+   for (i = grid_st.inv_first * GRID_DL_COLS;
+         i < n && i < (grid_st.inv_first + rows) * GRID_DL_COLS; i++)
+   {
+      const bomba_steamnet_friend_t *f = &grid_st.inv_list[i];
+      size_t col  = i % GRID_DL_COLS;
+      size_t row  = i / GRID_DL_COLS - grid_st.inv_first;
+      float cx    = floorf(left + col * (card_w + cgap) + 0.5f);
+      float cy    = floorf(top + row * (card_h + cgap) + 0.5f);
+      float mid   = cy + card_h / 2.0f;
+      float tx    = cx + cpad + ad + REF(10);
+      float tw    = cx + card_w - cpad - tx;
+      bool off      = f->status == BOMBA_FRIEND_OFFLINE;
+      uint32_t dcol = COL_SELECT;
+      char detail[128], line[128];
+
+      switch (f->status)
+      {
+         case BOMBA_FRIEND_PLAYING:
+            strlcpy(detail, "Playing Bomba", sizeof(detail));
+            dcol = COL_LIME;
+            break;
+         case BOMBA_FRIEND_IN_GAME:
+            if (*f->game)
+               snprintf(detail, sizeof(detail), "Playing %s", f->game);
+            else
+               strlcpy(detail, "In-game", sizeof(detail));
+            dcol = COL_LIME;
+            break;
+         case BOMBA_FRIEND_ONLINE:
+            strlcpy(detail, "Online", sizeof(detail));
+            break;
+         default:
+            strlcpy(detail, "Offline", sizeof(detail));
+            dcol = COL_TEXT_DIM;
+            break;
+      }
+      if (f->invited)
+      {
+         strlcpy(detail, "Invited", sizeof(detail));
+         dcol = COL_TEXT_DIM;
+      }
+
+      grid_hit_add(cx, cy, card_w, card_h, HIT_PANEL, (unsigned)i,
+            MENU_ACTION_OK);
+      if (i == grid_st.panel_sel)
+         grid_draw_cursor(p_disp, userdata, width, height,
+               cx, cy, card_w, card_h, REF(10));
+      grid_draw_shape(p_disp, userdata, width, height,
+            cx, cy, card_w, card_h, REF(10), COL_DIVIDER);
+
+      grid_draw_steam_avatar(p_disp, userdata, width, height,
+            &grid_st.inv_tex[i - grid_st.inv_first * GRID_DL_COLS],
+            f->avatar, f->name, cx + cpad,
+            floorf(mid - ad / 2.0f + 0.5f), ad);
+
+      grid_fit_text(true, f->name, tw, height, ts, line, sizeof(line));
+      grid_draw_text_bold(line, tx, grid_text_y(mid - REF(7), height, ts),
+            width, height, off ? COL_TEXT_DIM : COL_TEXT, TEXT_ALIGN_LEFT, ts);
+      grid_fit_text(false, detail, tw, height, ss, line, sizeof(line));
+      grid_draw_text(line, tx, grid_text_y(mid + REF(8), height, ss),
+            width, height, dcol, TEXT_ALIGN_LEFT, ss);
    }
 }
 
@@ -11028,7 +11247,8 @@ bool grid_home_frame(video_frame_info_t *video_info)
                                  && grid_st.panel != PANEL_ART
                                  && grid_st.panel != PANEL_ICONS
                                  && grid_st.panel != PANEL_UPDATES
-                                 && grid_st.panel != PANEL_SETUP;
+                                 && grid_st.panel != PANEL_SETUP
+                                 && grid_st.panel != PANEL_INVITE;
 
    /* What the mouse can point at is recorded afresh as it's drawn. */
    grid_hits_next.count = 0;
@@ -11234,6 +11454,8 @@ bool grid_home_frame(video_frame_info_t *video_info)
          grid_draw_picker_screen(p_disp, userdata, width, height);
       else if (grid_st.panel == PANEL_SETUP)
          grid_draw_setup_screen(p_disp, userdata, width, height);
+      else if (grid_st.panel == PANEL_INVITE)
+         grid_draw_invite_screen(p_disp, userdata, width, height);
       else
          grid_draw_downloads_screen(p_disp, userdata, width, height);
    }
@@ -11532,6 +11754,11 @@ void grid_home_context_reset(bool is_threaded)
       fill_pathname_join_special(path, icons, "crown.png", sizeof(path));
       grid_icon_load(&grid_st.icon_crown, path);
       grid_icon_rotate(&grid_st.icon_crown, 12.0f);
+      fill_pathname_join_special(path, icons, "invite.png", sizeof(path));
+      grid_icon_load(&grid_st.icon_invite, path);
+      /* Centred on the person (under its head at x 215 of 512), not on
+       * person and "+". */
+      grid_st.icon_invite.btn_shift = 0.5f - 215.0f / 512.0f;
    }
 }
 
@@ -11560,6 +11787,7 @@ void grid_home_context_destroy(void)
    grid_icon_free(&grid_st.icon_backspace);
    grid_icon_free(&grid_st.icon_shift);
    grid_icon_free(&grid_st.icon_crown);
+   grid_icon_free(&grid_st.icon_invite);
    grid_free_mp_textures();
 
    if (grid_st.disc)

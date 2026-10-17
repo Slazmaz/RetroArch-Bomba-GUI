@@ -15,6 +15,7 @@
 
 #include "bomba_steamnet.h"
 #include "../runloop.h"
+#include "../tasks/tasks_internal.h"
 #include "../verbosity.h"
 
 #ifndef SIO_UDP_CONNRESET
@@ -37,6 +38,13 @@ typedef struct { steam_id_t lobby; steam_id_t member; uint8_t success; } lobby_d
 typedef struct { steam_id_t lobby; steam_id_t changed; steam_id_t by; uint32_t state; } lobby_chat_t;
 typedef struct { steam_id_t lobby; steam_id_t friend_id; } join_requested_t;
 typedef struct { steam_id_t friend_id; char connect[256]; } rp_join_requested_t;
+typedef struct
+{
+   uint64_t game;
+   uint32_t ip;
+   uint16_t port, query_port;
+   steam_id_t lobby;
+} friend_game_t;
 typedef struct
 {
    int32_t type;
@@ -105,6 +113,11 @@ static struct
    const char* (*GetPersonaName)(void*);
    int      (*GetLargeFriendAvatar)(void*, steam_id_t);
    int      (*GetMediumFriendAvatar)(void*, steam_id_t);
+   int      (*GetFriendCount)(void*, int);
+   steam_id_t (*GetFriendByIndex)(void*, int, int);
+   int      (*GetFriendPersonaState)(void*, steam_id_t);
+   bool     (*GetFriendGamePlayed)(void*, steam_id_t, friend_game_t*);
+   bool     (*InviteUserToLobby)(void*, steam_id_t, steam_id_t);
 
    void*    (*SteamUtils)(void);
    bool     (*GetImageSize)(void*, int, uint32_t*, uint32_t*);
@@ -170,6 +183,13 @@ static struct
    unsigned nplayers;
    bool players_known;
    int64_t players_at;
+
+   /* Friends who can be invited (online), and those invited to this
+    * session. */
+   bomba_steamnet_friend_t friends_list[BOMBA_STEAMNET_MAX_FRIENDS];
+   unsigned nfriends;
+   steam_id_t invited[BOMBA_STEAMNET_MAX_FRIENDS];
+   unsigned ninvited;
 
    /* Host: players kicked who haven't left the lobby yet (read by the
     * tunnel too). */
@@ -450,6 +470,7 @@ static void sn_end(void)
    sn.nplayers       = 0;
    sn.players_known  = false;
    sn.nkicked        = 0;
+   sn.ninvited       = 0;
 }
 
 /* This player's own session (see bomba_steamnet_poll). */
@@ -740,6 +761,11 @@ void bomba_steamnet_init(void)
    SN_SYM(GetPersonaName,        "SteamAPI_ISteamFriends_GetPersonaName");
    SN_SYM(GetLargeFriendAvatar,  "SteamAPI_ISteamFriends_GetLargeFriendAvatar");
    SN_SYM(GetMediumFriendAvatar, "SteamAPI_ISteamFriends_GetMediumFriendAvatar");
+   SN_SYM(GetFriendCount,        "SteamAPI_ISteamFriends_GetFriendCount");
+   SN_SYM(GetFriendByIndex,      "SteamAPI_ISteamFriends_GetFriendByIndex");
+   SN_SYM(GetFriendPersonaState, "SteamAPI_ISteamFriends_GetFriendPersonaState");
+   SN_SYM(GetFriendGamePlayed,   "SteamAPI_ISteamFriends_GetFriendGamePlayed");
+   SN_SYM(InviteUserToLobby,     "SteamAPI_ISteamMatchmaking_InviteUserToLobby");
    SN_SYM(SteamUtils,            "SteamAPI_SteamUtils_v010");
    SN_SYM(GetImageSize,          "SteamAPI_ISteamUtils_GetImageSize");
    SN_SYM(GetImageRGBA,          "SteamAPI_ISteamUtils_GetImageRGBA");
@@ -1069,6 +1095,210 @@ void bomba_steamnet_kick(uint64_t id)
       sn.nplayers--;
    }
    sn_message(msg);
+}
+
+bool bomba_steamnet_can_invite(void)
+{
+   return sn.ok && sn.lobby && (sn.state == BOMBA_STEAMNET_HOSTING
+         || sn.state == BOMBA_STEAMNET_JOINED);
+}
+
+static bool sn_was_invited(steam_id_t id)
+{
+   unsigned i;
+   for (i = 0; i < sn.ninvited; i++)
+      if (sn.invited[i] == id)
+         return true;
+   return false;
+}
+
+/* Names of the Steam games friends play, from the Steam store (the
+ * Steamworks API has none), fetched once each. */
+#define SN_MAX_APPS 64
+#define SN_APP_URL  "https://store.steampowered.com/api/appdetails?filters=basic&appids="
+
+static struct
+{
+   uint32_t appid;
+   bool done;          /* fetched (name may still be empty: unknown) */
+   char name[96];
+} sn_apps[SN_MAX_APPS];
+static unsigned sn_napps;
+
+/* JSON string at s (after its opening quote) into out, as UTF-8. */
+static void sn_json_str(const char *s, char *out, size_t len)
+{
+   size_t o = 0;
+   while (*s && *s != '"' && o + 4 < len)
+   {
+      if (*s != '\\')
+      {
+         out[o++] = *s++;
+         continue;
+      }
+      s++;
+      if (*s == 'u')
+      {
+         char hex[5] = { 0 };
+         unsigned c, k;
+         for (k = 0; k < 4 && s[1 + k]; k++)
+            hex[k] = s[1 + k];
+         c  = (unsigned)strtoul(hex, NULL, 16);
+         s += 1 + k;
+         if (c < 0x80)
+            out[o++] = (char)c;
+         else if (c < 0x800)
+         {
+            out[o++] = (char)(0xc0 | (c >> 6));
+            out[o++] = (char)(0x80 | (c & 0x3f));
+         }
+         else
+         {
+            out[o++] = (char)(0xe0 | (c >> 12));
+            out[o++] = (char)(0x80 | ((c >> 6) & 0x3f));
+            out[o++] = (char)(0x80 | (c & 0x3f));
+         }
+         continue;
+      }
+      if (*s)
+         out[o++] = *s == 'n' ? ' ' : *s == 't' ? ' ' : *s;
+      if (*s)
+         s++;
+   }
+   out[o] = '\0';
+}
+
+static void sn_app_cb(retro_task_t *task, void *task_data, void *user_data,
+      const char *error)
+{
+   http_transfer_data_t *data = (http_transfer_data_t*)task_data;
+   unsigned i                 = (unsigned)(uintptr_t)user_data;
+   char *body, *name;
+
+   if (i >= sn_napps)
+      return;
+   sn_apps[i].done = true;
+   if (!data || data->status != 200 || !data->data || !data->len)
+      return;
+   if (!(body = (char*)malloc(data->len + 1)))
+      return;
+   memcpy(body, data->data, data->len);
+   body[data->len] = '\0';
+   if ((name = strstr(body, "\"name\":\"")))
+      sn_json_str(name + 8, sn_apps[i].name, sizeof(sn_apps[i].name));
+   free(body);
+}
+
+/* The game's name, or "" while it's being fetched (or unknown). */
+static const char *sn_app_name(uint32_t appid)
+{
+   char url[160];
+   unsigned i;
+
+   for (i = 0; i < sn_napps; i++)
+      if (sn_apps[i].appid == appid)
+         return sn_apps[i].name;
+   if (sn_napps >= SN_MAX_APPS)
+      return "";
+   i = sn_napps++;
+   sn_apps[i].appid   = appid;
+   sn_apps[i].done    = false;
+   sn_apps[i].name[0] = '\0';
+   snprintf(url, sizeof(url), SN_APP_URL "%u", appid);
+   task_push_http_transfer(url, true, "GET", sn_app_cb,
+         (void*)(uintptr_t)i);
+   return "";
+}
+
+static int sn_friend_cmp(const void *pa, const void *pb)
+{
+   const bomba_steamnet_friend_t *a = (const bomba_steamnet_friend_t*)pa;
+   const bomba_steamnet_friend_t *b = (const bomba_steamnet_friend_t*)pb;
+   if (a->status != b->status)
+      return a->status > b->status ? -1 : 1;
+   return _stricmp(a->name, b->name);
+}
+
+/* Steam's "immediate" friends: the friends list proper. */
+#define FRIEND_FLAG_IMMEDIATE 4
+/* A CGameID's type (bits 24-31): 2 is a non-Steam shortcut. */
+#define GAME_TYPE_SHORTCUT    2
+
+unsigned bomba_steamnet_friends(const bomba_steamnet_friend_t **list)
+{
+   int i, count;
+   unsigned n = 0;
+
+   *list = sn.friends_list;
+   if (!bomba_steamnet_can_invite())
+      return sn.nfriends = 0;
+
+   /* Friends not in the session already: playing Bomba (RetroArch), in
+    * another game, online, offline; by name within each. */
+   count = api.GetFriendCount(sn.friends, FRIEND_FLAG_IMMEDIATE);
+   for (i = 0; i < count && n < BOMBA_STEAMNET_MAX_FRIENDS; i++)
+   {
+      steam_id_t id = api.GetFriendByIndex(sn.friends, i,
+            FRIEND_FLAG_IMMEDIATE);
+      bomba_steamnet_friend_t *f = &sn.friends_list[n];
+      friend_game_t game;
+      const char *name;
+      int a;
+
+      if (!id || sn_is_member(id))
+         continue;
+      memset(f, 0, sizeof(*f));
+      f->id = id;
+      name  = api.GetFriendPersonaName(sn.friends, id);
+      strlcpy(f->name, name ? name : "", sizeof(f->name));
+      memset(&game, 0, sizeof(game));
+      if (api.GetFriendPersonaState(sn.friends, id) == 0)
+         f->status = BOMBA_FRIEND_OFFLINE;
+      else if (!api.GetFriendGamePlayed(sn.friends, id, &game) || !game.game)
+         f->status = BOMBA_FRIEND_ONLINE;
+      else if ((uint32_t)(game.game & 0xffffff) == STEAM_APPID)
+         f->status = BOMBA_FRIEND_PLAYING;
+      else
+      {
+         f->status = BOMBA_FRIEND_IN_GAME;
+         if (((game.game >> 24) & 0xff) == GAME_TYPE_SHORTCUT)
+            strlcpy(f->game, "a non-Steam game", sizeof(f->game));
+         else
+            strlcpy(f->game, sn_app_name((uint32_t)(game.game & 0xffffff)),
+                  sizeof(f->game));
+      }
+      f->invited = sn_was_invited(id);
+      a = api.GetMediumFriendAvatar(sn.friends, id);
+      f->avatar  = a > 0 ? a : 0;
+      n++;
+   }
+   qsort(sn.friends_list, n, sizeof(sn.friends_list[0]), sn_friend_cmp);
+   return sn.nfriends = n;
+}
+
+bool bomba_steamnet_invite(uint64_t id)
+{
+   unsigned i;
+   char msg[128];
+
+   if (!bomba_steamnet_can_invite() || !api.InviteUserToLobby(sn.mm, sn.lobby, id))
+   {
+      sn_message("Multiplayer: couldn't send the invite.");
+      return false;
+   }
+   if (!sn_was_invited(id) && sn.ninvited < BOMBA_STEAMNET_MAX_FRIENDS)
+      sn.invited[sn.ninvited++] = id;
+   for (i = 0; i < sn.nfriends; i++)
+      if (sn.friends_list[i].id == id)
+      {
+         sn.friends_list[i].invited = true;
+         snprintf(msg, sizeof(msg), "Multiplayer: invited %s.",
+               sn.friends_list[i].name);
+         sn_message(msg);
+         break;
+      }
+   RARCH_LOG("[Bomba] Invited %llu.\n", (unsigned long long)id);
+   return true;
 }
 
 void bomba_steamnet_leave(void)
