@@ -1184,18 +1184,42 @@ static void grid_update_recent(void)
       }
    }
 
-   for (j = 0; j < n; j++)
+   /* History keeps resolved paths ("<top>\roms\..."), the grid the content
+    * folder as configured ("<app>\..\roms\..."): compare both resolved. */
+   if (n)
    {
-      const struct playlist_entry *entry = NULL;
+      char (*hist)[PATH_MAX_LENGTH] = (char(*)[PATH_MAX_LENGTH])
+         calloc(n, PATH_MAX_LENGTH);
+      char game_path[PATH_MAX_LENGTH];
 
-      playlist_get_index(history, j, &entry);
-      if (!entry || string_is_empty(entry->path))
-         continue;
+      if (!hist)
+         return;
+
+      for (j = 0; j < n; j++)
+      {
+         const struct playlist_entry *entry = NULL;
+
+         playlist_get_index(history, j, &entry);
+         if (!entry || string_is_empty(entry->path))
+            continue;
+         strlcpy(hist[j], entry->path, PATH_MAX_LENGTH);
+         path_resolve_realpath(hist[j], PATH_MAX_LENGTH, false);
+      }
 
       for (i = 0; i < grid_st.count; i++)
-         if (     grid_st.games[i].recent == UINT_MAX
-               && string_is_equal(grid_st.games[i].path, entry->path))
-            grid_st.games[i].recent = (unsigned)j;
+      {
+         strlcpy(game_path, grid_st.games[i].path, sizeof(game_path));
+         path_resolve_realpath(game_path, sizeof(game_path), false);
+
+         for (j = 0; j < n; j++)
+            if (string_is_equal_noncase(hist[j], game_path))
+            {
+               grid_st.games[i].recent = (unsigned)j;
+               break;
+            }
+      }
+
+      free(hist);
    }
 }
 
@@ -3444,6 +3468,15 @@ static void grid_input_mode_poll(void);
 
 void grid_home_iterate(void)
 {
+   static bool was_running = false;
+   bool running            = grid_content_running();
+
+   /* A game closed from the menu over it: its play time and history
+    * were written as it closed, after the menu opened. */
+   if (was_running && !running)
+      grid_update_recent();
+   was_running = running;
+
    /* The loading screen is up: start its game. */
    if (grid_st.loading == LOADING_START)
    {
