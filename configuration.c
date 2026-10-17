@@ -3465,11 +3465,109 @@ void config_set_defaults(void *data)
  * Loads a config file and reads all the values into memory.
  *
  */
+#ifdef HAVE_CONFIGFILE
+/* Bomba: the current settings (called right after config_set_defaults:
+ * the defaults), as config text, minus paths (install-specific). */
+static config_file_t *bomba_defaults_snapshot(settings_t *settings)
+{
+   unsigned i;
+   int bool_size  = sizeof(settings->bools)  / sizeof(settings->bools.placeholder);
+   int float_size = sizeof(settings->floats) / sizeof(settings->floats.placeholder);
+   int int_size   = sizeof(settings->ints)   / sizeof(settings->ints.placeholder);
+   int uint_size  = sizeof(settings->uints)  / sizeof(settings->uints.placeholder);
+   int size_size  = sizeof(settings->sizes)  / sizeof(settings->sizes.placeholder);
+   int array_size = sizeof(settings->arrays) / sizeof(settings->arrays.placeholder);
+   struct config_bool_setting  *bools  = populate_settings_bool  (settings, &bool_size);
+   struct config_float_setting *floats = populate_settings_float (settings, &float_size);
+   struct config_int_setting   *ints   = populate_settings_int   (settings, &int_size);
+   struct config_uint_setting  *uints  = populate_settings_uint  (settings, &uint_size);
+   struct config_size_setting  *sizes  = populate_settings_size  (settings, &size_size);
+   struct config_array_setting *arrays = populate_settings_array (settings, &array_size);
+   config_file_t *conf                 = config_file_new_alloc();
+
+   if (conf)
+   {
+      for (i = 0; bools && i < (unsigned)bool_size; i++)
+         config_set_string(conf, bools[i].ident, *bools[i].ptr ? "true" : "false");
+      for (i = 0; floats && i < (unsigned)float_size; i++)
+         config_set_float(conf, floats[i].ident, *floats[i].ptr);
+      for (i = 0; ints && i < (unsigned)int_size; i++)
+         config_set_int(conf, ints[i].ident, *ints[i].ptr);
+      for (i = 0; uints && i < (unsigned)uint_size; i++)
+         config_set_int(conf, uints[i].ident, *uints[i].ptr);
+      for (i = 0; sizes && i < (unsigned)size_size; i++)
+         config_set_int(conf, sizes[i].ident, (int)*sizes[i].ptr);
+      for (i = 0; arrays && i < (unsigned)array_size; i++)
+         config_set_string(conf, arrays[i].ident, arrays[i].ptr);
+   }
+
+   free(bools);
+   free(floats);
+   free(ints);
+   free(uints);
+   free(sizes);
+   free(arrays);
+   return conf;
+}
+
+/* Bomba: a setting left at its default follows the default when an update
+ * changes it. bomba-defaults.cfg, next to the config, holds the defaults
+ * of the build that last ran; each setting the config still has at that
+ * old default gets this build's. Run after config_set_defaults, before
+ * the config is read. */
+static void bomba_follow_defaults(settings_t *settings)
+{
+   char dir[PATH_MAX_LENGTH];
+   char snap_path[PATH_MAX_LENGTH];
+   const char *config_path = path_get(RARCH_PATH_CONFIG);
+   config_file_t *cur, *prev, *conf;
+   struct config_entry_list *e;
+   unsigned changed        = 0;
+
+   if (string_is_empty(config_path) || !path_is_valid(config_path))
+      return;
+   fill_pathname_basedir(dir, config_path, sizeof(dir));
+   fill_pathname_join_special(snap_path, dir, "bomba-defaults.cfg", sizeof(snap_path));
+
+   if (!(cur = bomba_defaults_snapshot(settings)))
+      return;
+
+   if (     (prev = config_file_new_from_path_to_string(snap_path))
+         && (conf = config_file_new_from_path_to_string(config_path)))
+   {
+      for (e = cur->entries; e; e = e->next)
+      {
+         struct config_entry_list *old  = config_get_entry(prev, e->key);
+         struct config_entry_list *mine = config_get_entry(conf, e->key);
+
+         if (     old && mine
+               && string_is_equal(mine->value, old->value)
+               && !string_is_equal(old->value, e->value))
+         {
+            RARCH_LOG("[Config] \"%s\" follows its new default: \"%s\" -> \"%s\".\n",
+                  e->key, old->value, e->value);
+            config_set_string(conf, e->key, e->value);
+            changed++;
+         }
+      }
+      if (changed)
+         config_file_write(conf, config_path, true);
+      config_file_free(conf);
+   }
+   if (prev)
+      config_file_free(prev);
+
+   config_file_write(cur, snap_path, true);
+   config_file_free(cur);
+}
+#endif
+
 void config_load(void *data)
 {
    global_t *global = (global_t*)data;
    config_set_defaults(global);
 #ifdef HAVE_CONFIGFILE
+   bomba_follow_defaults(config_st);
    config_parse_file(global);
 #endif
 }
