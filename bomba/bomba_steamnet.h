@@ -13,9 +13,10 @@ RETRO_BEGIN_DECLS
  *
  * A session is a private (invite-only) Steam lobby owned by the host. Every
  * player hosts their own from the start, so friends can be invited at any
- * time from Steam's overlay; accepting an invite moves into the friend's
- * session instead, and back to one's own when it ends (or the host kicks). The emulator's own room traffic (UDP) goes through a tunnel over
- * Steam's relays (SteamNetworkingMessages):
+ * time (bomba_steamnet_invite: Steam's invite dialog); accepting an invite
+ * moves into the friend's session instead, and back to one's own when it
+ * ends (or the host kicks). The emulator's own room traffic (UDP) goes
+ * through a tunnel over Steam's relays (SteamNetworkingMessages):
  *   host:  the launcher core runs the room on 127.0.0.1:BOMBA_STEAMNET_ROOM_PORT
  *          as usual; each guest's packets reach it from a socket of their own.
  *   guest: a socket on 127.0.0.1 (bomba_steamnet_local_port) stands in for
@@ -72,6 +73,30 @@ unsigned bomba_steamnet_players(const bomba_steamnet_player_t **players);
 uint8_t *bomba_steamnet_avatar_rgba(int avatar, unsigned *w, unsigned *h);
 /* Host: sends a player out of the session. */
 void bomba_steamnet_kick(uint64_t id);
+/* Inviting friends into the session (the only way in: sessions are
+ * private). bomba_steamnet_friends looks again at the friends not in it
+ * yet: playing Bomba, in another game, online, then offline. */
+#define BOMBA_STEAMNET_MAX_FRIENDS 256
+enum bomba_friend_status
+{
+   BOMBA_FRIEND_OFFLINE = 0,
+   BOMBA_FRIEND_ONLINE,
+   BOMBA_FRIEND_IN_GAME, /* another game: game */
+   BOMBA_FRIEND_PLAYING  /* Bomba (RetroArch) */
+};
+typedef struct
+{
+   uint64_t id;
+   char name[64];
+   char game[96]; /* IN_GAME: its name ("" until known) */
+   int avatar;    /* as bomba_steamnet_player_t's */
+   enum bomba_friend_status status;
+   bool invited;  /* to this session already */
+} bomba_steamnet_friend_t;
+
+bool bomba_steamnet_can_invite(void);
+unsigned bomba_steamnet_friends(const bomba_steamnet_friend_t **list);
+bool bomba_steamnet_invite(uint64_t id);
 /* Guest: leaves the host's session (back to one's own). */
 void bomba_steamnet_leave(void);
 

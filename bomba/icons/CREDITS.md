@@ -11,6 +11,7 @@ used under the Flaticon license (free with attribution). Some are recoloured.
 | `friends.png` | [Friend](https://www.flaticon.com/free-icon/friend_8138760) | Anggara |
 | `globe.png` | [Website](https://www.flaticon.com/free-icon/website_12888095) | Khoirul Anwar |
 | `host.png` | [Cloud computing](https://www.flaticon.com/free-icon/cloud-computing_9476990) | Magnific |
+| `invite.png` | [Add user](https://www.flaticon.com/free-icon/add-user_17123206) | Assetwave |
 | `join.png` | [Joystick](https://www.flaticon.com/free-icon/joystick_8569569) | Magnific |
 | `power.png` | [Power](https://www.flaticon.com/free-icon/power_9343774) | Creatype |
 | `search.png` | [Magnifying glass](https://www.flaticon.com/free-icon/magnifying-glass_13984009) | riajulislam |
