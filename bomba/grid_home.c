@@ -97,7 +97,7 @@
 
 #define GRID_MAX_GAMES 1024
 #define GRID_MAX_TABS  24
-#define GRID_ROWS_DEFAULT 2 /* rows per column; Select (Zoom) cycles 1-4 */
+#define GRID_ROWS_DEFAULT grid_rows_default() /* rows per column; Y (Zoom) cycles 1-4 */
 #define GRID_ZOOM_USEC 250000 /* zoom animation length */
 #define GRID_OPEN_USEC  260000 /* the menu fading in over a game */
 #define GRID_CLOSE_USEC 200000 /* ...and out when it closes */
@@ -133,13 +133,65 @@
                                       backgrounds: lightly brighten what is
                                       behind */
 #define COL_CURSOR      0x00c3e3ff /* download progress */
-#define COL_SELECT      0x0099ffff /* selection outline (vivid blue), pulsing to... */
-#define COL_SELECT_HI   0x40b8ffff /* ...this */
+#define COL_SELECT      grid_select_color(false) /* selection outline, pulsing to... */
+#define COL_SELECT_HI   grid_select_color(true)  /* ...this */
 #define COL_LIME        0x7ed321ff /* running-game badge */
 #define COL_CHEEVO      0x7ce400ff /* achievement progress (lime) */
 #define COL_DANGER      0xff5c52ff /* Quit game: its label, white when... */
 #define COL_DANGER_BG   0xd93a30ff /* ...its row is selected, on this */
 #define COL_CROWN       0xf5c330ff /* multiplayer host's crown */
+
+/* Selection colour (Settings > Interface, its colour picker), and the
+ * lighter shade it pulses to: a quarter of the way to white. */
+#define GRID_SELECT_RGB_DEFAULT  0x0099ff /* vivid blue */
+#define GRID_SELECT_RGB2_DEFAULT 0x00e5ff /* second colour: cyan */
+
+/* Selection cursor's pattern (Settings > Interface). */
+enum grid_select_style
+{
+   STYLE_SINGLE = 0, /* the first colour */
+   STYLE_GRADIENT,   /* the two colours, turning slowly round the ring */
+   STYLE_STRIPES,    /* diagonal stripes of the two */
+   STYLE_PULSE,      /* the whole ring pulsing from one to the other */
+   STYLE_RAINBOW,    /* every hue, turning (the colours aren't used) */
+   STYLE_COUNT
+};
+#define GRID_SELECT_STYLE_DEFAULT STYLE_GRADIENT
+
+static const char *grid_select_style_label[STYLE_COUNT] = {
+   "Primary Color", "Gradient", "Stripes", "Pulsing", "Rainbow"
+};
+
+static unsigned grid_select_style(void)
+{
+   unsigned s = config_get_ptr()->uints.bomba_select_style;
+   return s < STYLE_COUNT ? s : GRID_SELECT_STYLE_DEFAULT;
+}
+
+static uint32_t grid_select_color2(void)
+{
+   return ((config_get_ptr()->uints.bomba_select_rgb2 & 0xffffff) << 8) | 0xff;
+}
+static uint32_t grid_select_color(bool hi)
+{
+   uint32_t rgb = config_get_ptr()->uints.bomba_select_rgb & 0xffffff;
+   if (hi)
+   {
+      uint32_t r = (rgb >> 16) & 0xff, g = (rgb >> 8) & 0xff, b = rgb & 0xff;
+      r += (255 - r) / 4;
+      g += (255 - g) / 4;
+      b += (255 - b) / 4;
+      rgb = (r << 16) | (g << 8) | b;
+   }
+   return (rgb << 8) | 0xff;
+}
+
+/* Rows the grid starts with (Settings > Interface), 1-4. */
+static unsigned grid_rows_default(void)
+{
+   unsigned r = config_get_ptr()->uints.bomba_grid_rows;
+   return r >= 1 && r <= 4 ? r : 2;
+}
 
 typedef struct
 {
@@ -302,10 +354,15 @@ static const char *grid_game_menu_label[GAME_MENU_COUNT] = {
  * Consoles page for the category (GRID_CC_LABEL). Lists end with
  * MSG_UNKNOWN and no label. */
 #define GRID_CC_LABEL "bomba_consoles"
+#define GRID_SELCOL_LABEL  "bomba_select_color"
+#define GRID_SELCOL2_LABEL "bomba_select_color2"
+#define GRID_STYLE_LABEL   "bomba_select_style"
+#define GRID_ROWS_LABEL   "bomba_grid_rows"
 typedef struct
 {
    enum msg_hash_enums entry;
    const char *label;
+   const char *own; /* with MSG_UNKNOWN: the grid's own entry; NULL Consoles */
 } grid_simple_setting_t;
 
 /* Players' controls listed: just the first, as "Controller" (one place
@@ -365,6 +422,10 @@ static const grid_simple_setting_t grid_simple_cheevos[] = {
 
 static const grid_simple_setting_t grid_simple_interface[] = {
    { MENU_ENUM_LABEL_USER_LANGUAGE,     "Language" },
+   { MSG_UNKNOWN, "Selection Primary Color",   GRID_SELCOL_LABEL },
+   { MSG_UNKNOWN, "Selection Secondary Color", GRID_SELCOL2_LABEL },
+   { MSG_UNKNOWN, "Selection Pattern",         GRID_STYLE_LABEL },
+   { MSG_UNKNOWN,                       "Default zoom",    GRID_ROWS_LABEL },
    { MENU_ENUM_LABEL_PAUSE_LIBRETRO,    "Pause the game in the menu" },
    { MENU_ENUM_LABEL_PAUSE_NONACTIVE,   "Pause when in the background" },
    { MENU_ENUM_LABEL_VIDEO_FONT_ENABLE, "On-screen messages" },
@@ -418,7 +479,9 @@ typedef struct
 } grid_settings_cat_t;
 
 static const grid_settings_cat_t grid_settings_cats[] = {
-   { "Graphics",      MENU_ENUM_LABEL_SETTINGS_TAB, MENU_SETTINGS_TAB,
+   { "Interface",     MENU_ENUM_LABEL_SETTINGS_TAB, MENU_SETTINGS_TAB,
+      MENU_ENUM_LABEL_USER_INTERFACE_SETTINGS,     grid_simple_interface, false },
+   { "Graphics",     MENU_ENUM_LABEL_SETTINGS_TAB, MENU_SETTINGS_TAB,
       MENU_ENUM_LABEL_VIDEO_SETTINGS,              grid_simple_graphics,  false },
    { "Audio",         MENU_ENUM_LABEL_SETTINGS_TAB, MENU_SETTINGS_TAB,
       MENU_ENUM_LABEL_AUDIO_SETTINGS,              grid_simple_audio,     false },
@@ -430,9 +493,7 @@ static const grid_settings_cat_t grid_settings_cats[] = {
    { "Achievements",  MENU_ENUM_LABEL_SETTINGS_TAB, MENU_SETTINGS_TAB,
       MENU_ENUM_LABEL_RETRO_ACHIEVEMENTS_SETTINGS, grid_simple_cheevos,   false },
 #endif
-   { "Interface",     MENU_ENUM_LABEL_SETTINGS_TAB, MENU_SETTINGS_TAB,
-      MENU_ENUM_LABEL_USER_INTERFACE_SETTINGS,     grid_simple_interface, false },
-   { "System",       MENU_ENUM_LABEL_MAIN_MENU,    MENU_SETTINGS,
+   { "System",      MENU_ENUM_LABEL_MAIN_MENU,    MENU_SETTINGS,
       MSG_UNKNOWN,                                 grid_simple_system,    false },
    { "Miscellaneous", MENU_ENUM_LABEL_SETTINGS_TAB, MENU_SETTINGS_TAB,
       MSG_UNKNOWN,                                 NULL,                  true  }
@@ -537,6 +598,33 @@ static struct
 } grid_text;
 
 static void grid_text_finish(const char *text);
+
+/* Pop-up over the Settings screen for the selection's look: a colour
+ * picker (the two colour rows: a saturation / brightness square and a hue
+ * bar beside it), or the patterns' previews to choose from (the pattern
+ * row). What is picked applies at once; Back puts the old one back. */
+#define GRID_CP_STEP 0.05f       /* square: D-pad step */
+#define GRID_CP_HUE_STEP (1.0f / 72.0f) /* hue bar: D-pad step (5 degrees) */
+enum grid_cp_target
+{
+   CP_COLOR = 0,  /* the first colour */
+   CP_COLOR2,     /* the second */
+   CP_STYLE       /* the pattern */
+};
+static struct
+{
+   bool open;
+   enum grid_cp_target target;
+   bool on_hue;            /* the D-pad is on the hue bar, not the square */
+   int drag;               /* mouse held on: 0 nothing, 1 square, 2 hue bar */
+   float h, s, v;          /* 0 .. 1 */
+   unsigned orig;          /* value when opened: colour 0xRRGGBB, pattern */
+   unsigned style;         /* the pattern chosen (CP_STYLE) */
+   float chip_x, chip_y, chip_w, chip_h, chip_step; /* its previews */
+   float sq_x, sq_y, sq_d; /* where the square was drawn (screen pixels) */
+   float hue_x, hue_w;     /* ...the hue bar (as tall as the square) */
+   float pan_x, pan_y, pan_w, pan_h; /* ...the panel */
+} grid_cp;
 
 static struct
 {
@@ -2403,7 +2491,8 @@ int grid_home_settings_build(void *list, bool main_menu)
       {
          /* The grid's own Consoles page for this category (opened by the
           * Settings screen itself). */
-         if (menu_entries_append((file_list_t*)list, s->label, GRID_CC_LABEL,
+         if (menu_entries_append((file_list_t*)list, s->label,
+                  s->own ? s->own : GRID_CC_LABEL,
                   MSG_UNKNOWN, 0, 0, 0, NULL))
             count++;
       }
@@ -3168,12 +3257,289 @@ static void grid_settings_forward(enum menu_action action)
    grid_st.forwarding = false;
 }
 
+/* ---- Colour picker ---------------------------------------------------- */
+
+static unsigned grid_hsv_rgb(float h, float s, float v)
+{
+   float f, p, q, t, r, g, b;
+   int i;
+
+   h = (h - floorf(h)) * 6.0f;
+   i = (int)h;
+   f = h - i;
+   p = v * (1.0f - s);
+   q = v * (1.0f - s * f);
+   t = v * (1.0f - s * (1.0f - f));
+   switch (i % 6)
+   {
+      case 0:  r = v; g = t; b = p; break;
+      case 1:  r = q; g = v; b = p; break;
+      case 2:  r = p; g = v; b = t; break;
+      case 3:  r = p; g = q; b = v; break;
+      case 4:  r = t; g = p; b = v; break;
+      default: r = v; g = p; b = q; break;
+   }
+   return ((unsigned)(r * 255.0f + 0.5f) << 16)
+        | ((unsigned)(g * 255.0f + 0.5f) << 8)
+        |  (unsigned)(b * 255.0f + 0.5f);
+}
+
+static void grid_rgb_hsv(unsigned rgb, float *h, float *s, float *v)
+{
+   float r   = ((rgb >> 16) & 0xff) / 255.0f;
+   float g   = ((rgb >> 8) & 0xff) / 255.0f;
+   float b   = (rgb & 0xff) / 255.0f;
+   float max = MAX(r, MAX(g, b));
+   float min = MIN(r, MIN(g, b));
+   float d   = max - min;
+
+   *v = max;
+   *s = max > 0.0f ? d / max : 0.0f;
+   if (d <= 0.0f)
+      return; /* grey: keep the hue it had */
+   if (max == r)
+      *h = (g - b) / d;
+   else if (max == g)
+      *h = 2.0f + (b - r) / d;
+   else
+      *h = 4.0f + (r - g) / d;
+   *h /= 6.0f;
+   if (*h < 0.0f)
+      *h += 1.0f;
+}
+
+static float grid_clamp01(float v)
+{
+   return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
+}
+
+/* The setting the pop-up changes. */
+static unsigned *grid_cp_setting(enum grid_cp_target target)
+{
+   settings_t *settings = config_get_ptr();
+   switch (target)
+   {
+      case CP_COLOR2: return &settings->uints.bomba_select_rgb2;
+      case CP_STYLE:  return &settings->uints.bomba_select_style;
+      default:        return &settings->uints.bomba_select_rgb;
+   }
+}
+
+/* What is picked, applied (everything drawn with it follows at once). */
+static void grid_cp_apply(void)
+{
+   *grid_cp_setting(grid_cp.target) = grid_cp.target == CP_STYLE
+      ? grid_cp.style : grid_hsv_rgb(grid_cp.h, grid_cp.s, grid_cp.v);
+   config_get_ptr()->flags |= SETTINGS_FLG_MODIFIED;
+}
+
+static void grid_cp_open(enum grid_cp_target target)
+{
+   grid_cp.target = target;
+   grid_cp.orig   = *grid_cp_setting(target);
+   grid_cp.style  = grid_select_style();
+   grid_cp.h      = 0.0f;
+   if (target != CP_STYLE)
+   {
+      grid_cp.orig &= 0xffffff;
+      grid_rgb_hsv(grid_cp.orig, &grid_cp.h, &grid_cp.s, &grid_cp.v);
+   }
+   grid_cp.on_hue = false;
+   grid_cp.drag   = 0;
+   grid_cp.open   = true;
+}
+
+/* Closes the pop-up: keeping what was picked, or putting the old back. */
+static void grid_cp_close(bool keep)
+{
+   if (!keep)
+      *grid_cp_setting(grid_cp.target) = grid_cp.orig;
+   grid_cp.open = false;
+   grid_cp.drag = 0;
+}
+
+/* Patterns page: up / down through the patterns (the cursor drawn in the
+ * one it is on), A chooses it, B leaves it as it was. */
+static void grid_cp_style_action(enum menu_action action)
+{
+   switch (action)
+   {
+      case MENU_ACTION_UP:
+         if (grid_cp.style > 0)
+            grid_cp.style--;
+         break;
+      case MENU_ACTION_DOWN:
+         if (grid_cp.style + 1 < STYLE_COUNT)
+            grid_cp.style++;
+         break;
+      case MENU_ACTION_OK:
+         grid_cp_apply();
+         grid_cp_close(true);
+         break;
+      case MENU_ACTION_CANCEL:
+         grid_cp_close(false);
+         break;
+      default:
+         break;
+   }
+}
+
+/* Colours: D-pad on the square, or (right off its edge) on the hue bar;
+ * A keeps the colour, B puts the old one back, X picks the default. */
+static void grid_cp_action(enum menu_action action)
+{
+   if (grid_cp.target == CP_STYLE)
+   {
+      grid_cp_style_action(action);
+      return;
+   }
+
+   switch (action)
+   {
+      case MENU_ACTION_LEFT:
+         if (grid_cp.on_hue)
+            grid_cp.on_hue = false;
+         else
+            grid_cp.s = grid_clamp01(grid_cp.s - GRID_CP_STEP);
+         break;
+      case MENU_ACTION_RIGHT:
+         if (!grid_cp.on_hue && grid_cp.s >= 1.0f)
+            grid_cp.on_hue = true;
+         else if (!grid_cp.on_hue)
+            grid_cp.s = grid_clamp01(grid_cp.s + GRID_CP_STEP);
+         break;
+      case MENU_ACTION_UP:
+      case MENU_ACTION_DOWN:
+      {
+         float dir = action == MENU_ACTION_UP ? -1.0f : 1.0f;
+         if (grid_cp.on_hue)
+         {
+            grid_cp.h += dir * GRID_CP_HUE_STEP;
+            grid_cp.h -= floorf(grid_cp.h);
+         }
+         else
+            grid_cp.v = grid_clamp01(grid_cp.v - dir * GRID_CP_STEP);
+         break;
+      }
+      case MENU_ACTION_SCROLL_UP:   /* L / R: hue from anywhere */
+      case MENU_ACTION_SCROLL_DOWN:
+         grid_cp.h += (action == MENU_ACTION_SCROLL_UP ? -1.0f : 1.0f)
+            * GRID_CP_HUE_STEP;
+         grid_cp.h -= floorf(grid_cp.h);
+         break;
+      case MENU_ACTION_SCAN:
+         grid_rgb_hsv(grid_cp.target == CP_COLOR2 ? GRID_SELECT_RGB2_DEFAULT
+               : GRID_SELECT_RGB_DEFAULT, &grid_cp.h, &grid_cp.s, &grid_cp.v);
+         break;
+      case MENU_ACTION_OK:
+         grid_cp_close(true);
+         return;
+      case MENU_ACTION_CANCEL:
+         grid_cp_close(false);
+         return;
+      default:
+         return;
+   }
+   grid_cp_apply();
+}
+
+/* The mouse at (x, y) on the square or hue bar being dragged. */
+static void grid_cp_drag_to(int x, int y)
+{
+   float fy = grid_cp.sq_d > 0.0f ? (y - grid_cp.sq_y) / grid_cp.sq_d : 0.0f;
+
+   if (grid_cp.drag == 1)
+   {
+      grid_cp.s = grid_clamp01((x - grid_cp.sq_x) / grid_cp.sq_d);
+      grid_cp.v = 1.0f - grid_clamp01(fy);
+   }
+   else if (grid_cp.drag == 2)
+      grid_cp.h = grid_clamp01(fy) * 0.999f;
+   grid_cp_apply();
+}
+
+/* Mouse over the picker: press on the square or hue bar and drag; a click
+ * elsewhere in the panel does nothing, outside it keeps the colour; right
+ * click puts the old one back. False: leave it to the hints bar's hits. */
+static bool grid_cp_mouse(int x, int y, bool left, bool press, bool rpress,
+      int wheel)
+{
+   bool in_y   = y >= grid_cp.sq_y && y < grid_cp.sq_y + grid_cp.sq_d;
+   bool in_pan = x >= grid_cp.pan_x && x < grid_cp.pan_x + grid_cp.pan_w
+              && y >= grid_cp.pan_y && y < grid_cp.pan_y + grid_cp.pan_h;
+
+   if (rpress)
+   {
+      grid_cp_close(false);
+      return true;
+   }
+   if (grid_cp.target == CP_STYLE)
+   {
+      /* Patterns page: pointing at a row moves the cursor there, a click
+       * chooses it; a click elsewhere goes to the hints bar. */
+      bool on_row = false;
+      if (wheel)
+         grid_cp_style_action(wheel > 0 ? MENU_ACTION_DOWN : MENU_ACTION_UP);
+      else if (     grid_cp.chip_step > 0.0f && y >= grid_cp.chip_y
+               && x >= grid_cp.chip_x && x < grid_cp.chip_x + grid_cp.chip_w)
+      {
+         unsigned k = (unsigned)((y - grid_cp.chip_y) / grid_cp.chip_step);
+         if (     k < STYLE_COUNT
+               && y < grid_cp.chip_y + k * grid_cp.chip_step + grid_cp.chip_h)
+         {
+            on_row = true;
+            grid_cp.style = k;
+            if (press)
+               grid_cp_style_action(MENU_ACTION_OK);
+         }
+      }
+      return on_row || wheel || !press;
+   }
+   if (wheel)
+   {
+      grid_cp_action(wheel > 0 ? MENU_ACTION_SCROLL_DOWN
+            : MENU_ACTION_SCROLL_UP);
+      return true;
+   }
+   if (press && in_y && x >= grid_cp.sq_x && x < grid_cp.sq_x + grid_cp.sq_d)
+   {
+      grid_cp.drag   = 1;
+      grid_cp.on_hue = false;
+   }
+   else if (press && in_y && x >= grid_cp.hue_x
+         && x < grid_cp.hue_x + grid_cp.hue_w)
+   {
+      grid_cp.drag   = 2;
+      grid_cp.on_hue = true;
+   }
+   else if (press && !in_pan)
+      return false;
+   if (!left)
+      grid_cp.drag = 0;
+   else if (grid_cp.drag)
+      grid_cp_drag_to(x, y);
+   return true;
+}
+
 /* Input on the Settings screen. Below its top list everything is
  * RetroArch's (false: not consumed); at the top, Back leaves and L / R
  * switch category. */
 static bool grid_settings_action(enum menu_action action)
 {
    size_t depth = grid_menu_depth();
+
+   /* The colour picker takes all input (the menu toggle keeps its colour
+    * and still closes the menu). */
+   if (grid_cp.open)
+   {
+      if (action == MENU_ACTION_TOGGLE)
+      {
+         grid_cp_close(true);
+         return false;
+      }
+      grid_cp_action(action);
+      return true;
+   }
 
    /* The grid's own Consoles page takes all input (the menu toggle still
     * closes the menu; Back at its top returns to the category). A game's
@@ -3200,6 +3566,66 @@ static bool grid_settings_action(enum menu_action action)
       }
       grid_cc_action(action);
       return true;
+   }
+
+   /* The grid's own settings: X back to the default; Default zoom steps
+    * forward on OK and right, back on left. */
+   if (     action == MENU_ACTION_OK   || action == MENU_ACTION_LEFT
+         || action == MENU_ACTION_RIGHT || action == MENU_ACTION_SCAN)
+   {
+      struct menu_state *menu_st = menu_state_get_ptr();
+      file_list_t *list = MENU_LIST_GET_SELECTION(menu_st->entries.list, 0);
+      size_t sel        = menu_st->selection_ptr;
+      settings_t *settings = config_get_ptr();
+      const char *own   = list && sel < list->size
+         ? list->list[sel].label : NULL;
+      bool back         = action == MENU_ACTION_LEFT;
+
+      if (     own && (string_is_equal(own, GRID_SELCOL_LABEL)
+               || string_is_equal(own, GRID_SELCOL2_LABEL)))
+      {
+         /* OK opens the picker, X back to the default; left / right
+          * nothing (the row isn't a list of values). */
+         bool second = string_is_equal(own, GRID_SELCOL2_LABEL);
+         if (action == MENU_ACTION_OK)
+            grid_cp_open(second ? CP_COLOR2 : CP_COLOR);
+         else if (action == MENU_ACTION_SCAN)
+         {
+            *grid_cp_setting(second ? CP_COLOR2 : CP_COLOR) = second
+               ? GRID_SELECT_RGB2_DEFAULT : GRID_SELECT_RGB_DEFAULT;
+            settings->flags |= SETTINGS_FLG_MODIFIED;
+         }
+         return true;
+      }
+      if (own && string_is_equal(own, GRID_STYLE_LABEL))
+      {
+         /* OK opens the previews to choose from; left / right step
+          * through them in place. */
+         unsigned st = grid_select_style();
+         if (action == MENU_ACTION_OK)
+            grid_cp_open(CP_STYLE);
+         else
+         {
+            settings->uints.bomba_select_style =
+                 action == MENU_ACTION_SCAN ? GRID_SELECT_STYLE_DEFAULT
+               : (st + (back ? STYLE_COUNT - 1 : 1)) % STYLE_COUNT;
+            settings->flags |= SETTINGS_FLG_MODIFIED;
+         }
+         return true;
+      }
+      if (own && string_is_equal(own, GRID_ROWS_LABEL))
+      {
+         unsigned r = grid_rows_default();
+         r = action == MENU_ACTION_SCAN ? 2 : (r + (back ? 2 : 0)) % 4 + 1;
+         settings->uints.bomba_grid_rows = r;
+         settings->flags |= SETTINGS_FLG_MODIFIED;
+         /* The grid behind takes it now too. */
+         grid_st.rows      = r;
+         grid_st.first_col = grid_st.selection / r;
+         grid_st.zoom_from = 0;
+         grid_st.zoomed    = true;
+         return true;
+      }
    }
 
    /* The grid's own entries: a category's Consoles, the RetroPad page's
@@ -4152,6 +4578,9 @@ bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth)
    /* Left / right on a Consoles row change its value, not the cursor. */
    bool value   = (action == MENU_ACTION_LEFT || action == MENU_ACTION_RIGHT)
                && grid_st.settings && grid_st.cc_level >= 2;
+   /* ...and every move in the colour picker changes the colour. */
+   if (move && grid_cp.open)
+      value = true;
    /* A hold (Exit, removing an install) already under way: the button's
     * repeats are no new press. */
    bool holding = (action == MENU_ACTION_OK   && grid_st.exit_hold_start)
@@ -4855,6 +5284,22 @@ bool grid_home_mouse(int x, int y, unsigned flags)
       }
    }
 
+   /* The colour picker: its own dragging; a click outside its panel keeps
+    * the colour (the hints bar's buttons still work). */
+   if (grid_cp.open && grid_settings_shown())
+   {
+      if (grid_cp_mouse(x, y, left, press, rpress, wheel))
+         return true;
+      if (!hit || hit->kind != HIT_NONE)
+      {
+         grid_cp_close(true);
+         return true;
+      }
+      if (press)
+         grid_hit_activate(hit);
+      return true;
+   }
+
    /* Typing: a click in the field places the caret and dragging selects;
     * a click elsewhere is done typing (as Enter). */
    if (menu_input_dialog_get_display_kb())
@@ -5545,13 +5990,15 @@ static void grid_draw_scrollbar(gfx_display_t *p_disp, void *userdata,
 /* Outline rings rasterised at their exact pixel size, so they are smooth
  * at any size (scaling a shape texture makes curves jagged). Kept in a
  * small cache: only a few sizes are on screen at once. */
-#define GRID_RING_CACHE 16
+#define GRID_RING_CACHE 40 /* room for the Stripes pattern's phases too */
+#define GRID_STRIPE_PHASES 8 /* Stripes: steps of their scroll, each cached */
 
 static struct
 {
    uintptr_t tex;
    int w, h, r, gap, thick;   /* shape, whole pixels */
    float nx, ny, nr;          /* notch (see grid_ring_texture) */
+   int stripe, phase;         /* stripes' width (0: none) and offset */
    unsigned tw, th;           /* texture size */
    unsigned last_used;
 } grid_ring_cache[GRID_RING_CACHE];
@@ -5595,9 +6042,13 @@ static void grid_free_rings(void)
  * pixels, then thick pixels of ring, anti-aliased from the rounded
  * rectangle's signed distance. The texture is the rect grown by
  * gap + thick + 1 on each side. A notch of radius nr (0: none) centred on
- * (nx, ny), from the rect's top-left, is cut out (for a badge). */
-static uintptr_t *grid_ring_texture_notch(int w, int h, int r, int gap,
-      int thick, float nx, float ny, float nr, unsigned *tw, unsigned *th)
+ * (nx, ny), from the rect's top-left, is cut out (for a badge). stripe > 0
+ * keeps only every other diagonal stripe that many pixels wide, shifted
+ * phase pixels along (the selection's Stripes pattern, drawn over a plain
+ * ring). */
+static uintptr_t *grid_ring_texture_ex(int w, int h, int r, int gap,
+      int thick, float nx, float ny, float nr, int stripe, int phase,
+      unsigned *tw, unsigned *th)
 {
    unsigned i, x, y, slot = 0;
    struct texture_image ti;
@@ -5612,7 +6063,9 @@ static uintptr_t *grid_ring_texture_notch(int w, int h, int r, int gap,
             && grid_ring_cache[i].gap == gap
             && grid_ring_cache[i].thick == thick
             && grid_ring_cache[i].nx == nx && grid_ring_cache[i].ny == ny
-            && grid_ring_cache[i].nr == nr)
+            && grid_ring_cache[i].nr == nr
+            && grid_ring_cache[i].stripe == stripe
+            && grid_ring_cache[i].phase == phase)
       {
          grid_ring_cache[i].last_used = ++grid_ring_clock;
          *tw = grid_ring_cache[i].tw;
@@ -5667,6 +6120,8 @@ static uintptr_t *grid_ring_texture_notch(int w, int h, int r, int gap,
             if (keep > 1.0f) keep = 1.0f;
             a *= keep;
          }
+         if (stripe > 0 && ((x + y + phase) / (unsigned)stripe) % 2)
+            a = 0.0f;
 
          ti.pixels[y * ti.width + x] = ((uint32_t)(a * 255.0f + 0.5f) << 24)
             | 0x00ffffff;
@@ -5684,12 +6139,20 @@ static uintptr_t *grid_ring_texture_notch(int w, int h, int r, int gap,
    grid_ring_cache[slot].nx        = nx;
    grid_ring_cache[slot].ny        = ny;
    grid_ring_cache[slot].nr        = nr;
+   grid_ring_cache[slot].stripe    = stripe;
+   grid_ring_cache[slot].phase     = phase;
    grid_ring_cache[slot].tw        = ti.width;
    grid_ring_cache[slot].th        = ti.height;
    grid_ring_cache[slot].last_used = ++grid_ring_clock;
    *tw = ti.width;
    *th = ti.height;
    return &grid_ring_cache[slot].tex;
+}
+
+static uintptr_t *grid_ring_texture_notch(int w, int h, int r, int gap,
+      int thick, float nx, float ny, float nr, unsigned *tw, unsigned *th)
+{
+   return grid_ring_texture_ex(w, h, r, gap, thick, nx, ny, nr, 0, 0, tw, th);
 }
 
 static uintptr_t *grid_ring_texture(int w, int h, int r, int gap, int thick,
@@ -5726,22 +6189,62 @@ static void grid_draw_shape(gfx_display_t *p_disp, void *userdata,
          ix - 1, iy - 1, tw, th, width, height, color, tex);
 }
 
-/* The selection cursor's colour now: light blue, gently pulsing. */
-static uint32_t grid_cursor_color(void)
+/* The selection pattern's colours at the ring's four corners now, in the
+ * quad's vertex order (bottom-left, bottom-right, top-left, top-right). */
+static void grid_style_corners(unsigned style, uint32_t out[4])
 {
+   /* Corner directions from the centre (y up), radians. */
+   static const float ang[4] = { 3.927f, 5.498f, 2.356f, 0.785f };
    float t     = cpu_features_get_time_usec() / 1000000.0f;
-   float pulse = 0.5f + 0.5f * sinf(t * 3.0f);
-   return grid_mix(COL_SELECT, COL_SELECT_HI, pulse);
+   float pulse = 0.5f + 0.5f * sinf(t * 5.0f);
+   uint32_t a  = COL_SELECT, b = grid_select_color2();
+   unsigned k;
+
+   for (k = 0; k < 4; k++)
+   {
+      switch (style)
+      {
+         case STYLE_GRADIENT:
+         {
+            /* Turning once every 2 s; eased so each corner holds a colour
+             * a moment rather than sitting in the blend. */
+            float g = 0.5f + 0.5f * cosf(t * 3.14159f - ang[k]);
+            out[k] = grid_mix(a, b, g * g * (3.0f - 2.0f * g));
+            break;
+         }
+         case STYLE_PULSE:
+            out[k] = grid_mix(a, b, pulse);
+            break;
+         case STYLE_RAINBOW:
+            out[k] = (grid_hsv_rgb(t * 0.4f + ang[k] / 6.2832f, 1.0f,
+                     1.0f) << 8) | 0xff;
+            break;
+         default: /* single colour; stripes' first colour */
+            out[k] = a;
+            break;
+      }
+   }
 }
 
-/* The selection cursor's ring in the given colour, around an item of the
- * given rect and corner radius, with a small gap between them. */
-static void grid_draw_cursor_ring_notch(gfx_display_t *p_disp,
-      void *userdata, unsigned width, unsigned height,
-      float x, float y, float w, float h, float r, uint32_t rgba,
-      float nx, float ny, float nr)
+/* The selection cursor's colour now, as one colour (what a ring blends
+ * from, a badge in it). */
+static uint32_t grid_cursor_color(void)
 {
-   float color[16];
+   uint32_t c[4];
+   grid_style_corners(grid_select_style(), c);
+   return c[3];
+}
+
+/* The selection cursor's ring in the given corner colours (vertex order),
+ * around an item of the given rect and corner radius, with a small gap
+ * between them; stripe > 0: only its stripes (see grid_ring_texture_ex). */
+static void grid_draw_ring_colors(gfx_display_t *p_disp,
+      void *userdata, unsigned width, unsigned height,
+      float x, float y, float w, float h, float r, const uint32_t rgba[4],
+      float nx, float ny, float nr, int stripe, int phase)
+{
+   float color[16], c[16];
+   unsigned k;
    /* Whole pixels, so the texture maps 1:1 onto the screen. */
    int ix       = (int)floorf(x + 0.5f);
    int iy       = (int)floorf(y + 0.5f);
@@ -5758,13 +6261,29 @@ static void grid_draw_cursor_ring_notch(gfx_display_t *p_disp,
    m = gap + thick + 1;
 
    /* The ring follows the item's corners, rounded out by the gap. */
-   if (!(tex = grid_ring_texture_notch(iw, ih, (int)floorf(r + 0.5f), gap,
-               thick, nx, ny, nr, &tw, &th)) || !*tex)
+   if (!(tex = grid_ring_texture_ex(iw, ih, (int)floorf(r + 0.5f), gap,
+               thick, nx, ny, nr, stripe, phase, &tw, &th)) || !*tex)
       return;
 
-   grid_set_color(color, rgba);
+   for (k = 0; k < 4; k++)
+   {
+      grid_set_color(c, rgba[k]);
+      memcpy(color + 4 * k, c, 4 * sizeof(float));
+   }
    gfx_display_draw_quad(p_disp, userdata, width, height,
          ix - m, iy - m, tw, th, width, height, color, tex);
+}
+
+/* The ring in one colour. */
+static void grid_draw_cursor_ring_notch(gfx_display_t *p_disp,
+      void *userdata, unsigned width, unsigned height,
+      float x, float y, float w, float h, float r, uint32_t rgba,
+      float nx, float ny, float nr)
+{
+   uint32_t c[4];
+   c[0] = c[1] = c[2] = c[3] = rgba;
+   grid_draw_ring_colors(p_disp, userdata, width, height, x, y, w, h, r, c,
+         nx, ny, nr, 0, 0);
 }
 
 static void grid_draw_cursor_ring(gfx_display_t *p_disp, void *userdata,
@@ -5775,13 +6294,40 @@ static void grid_draw_cursor_ring(gfx_display_t *p_disp, void *userdata,
          x, y, w, h, r, rgba, 0.0f, 0.0f, 0.0f);
 }
 
-/* Selection cursor: a light blue ring, gently pulsing. */
+/* The ring in a selection pattern: its corner colours, and for Stripes the
+ * second colour's stripes over the first. */
+static void grid_draw_style_ring(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height,
+      float x, float y, float w, float h, float r, unsigned style,
+      float nx, float ny, float nr)
+{
+   uint32_t c[4];
+
+   grid_style_corners(style, c);
+   grid_draw_ring_colors(p_disp, userdata, width, height, x, y, w, h, r, c,
+         nx, ny, nr, 0, 0);
+   if (style == STYLE_STRIPES)
+   {
+      /* Scrolling along, one period every 0.6 s, in GRID_STRIPE_PHASES
+       * steps (each a cached texture). */
+      int sw    = (int)floorf(REF(4) + 0.5f);
+      float t   = cpu_features_get_time_usec() / 1000000.0f;
+      int step  = (int)(t / 0.6f * GRID_STRIPE_PHASES) % GRID_STRIPE_PHASES;
+      if (sw < 2)
+         sw = 2;
+      c[0] = c[1] = c[2] = c[3] = grid_select_color2();
+      grid_draw_ring_colors(p_disp, userdata, width, height, x, y, w, h, r,
+            c, nx, ny, nr, sw, step * 2 * sw / GRID_STRIPE_PHASES);
+   }
+}
+
+/* Selection cursor: a ring in the selection pattern. */
 static void grid_draw_cursor(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height,
       float x, float y, float w, float h, float r)
 {
-   grid_draw_cursor_ring(p_disp, userdata, width, height, x, y, w, h, r,
-         grid_cursor_color());
+   grid_draw_style_ring(p_disp, userdata, width, height, x, y, w, h, r,
+         grid_select_style(), 0.0f, 0.0f, 0.0f);
 }
 
 /* Same, with a notch cut out of it for a badge (see
@@ -5791,8 +6337,17 @@ static void grid_draw_cursor_notch(gfx_display_t *p_disp, void *userdata,
       float x, float y, float w, float h, float r,
       float nx, float ny, float nr)
 {
-   grid_draw_cursor_ring_notch(p_disp, userdata, width, height, x, y, w, h,
-         r, grid_cursor_color(), nx, ny, nr);
+   grid_draw_style_ring(p_disp, userdata, width, height, x, y, w, h, r,
+         grid_select_style(), nx, ny, nr);
+}
+
+/* A selection pattern's preview: its ring round a d-wide square. */
+static void grid_draw_style_chip(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, float x, float y, float d,
+      unsigned style)
+{
+   grid_draw_style_ring(p_disp, userdata, width, height, x, y, d, d, REF(3),
+         style, 0.0f, 0.0f, 0.0f);
 }
 
 #define GRID_ARC_STEPS 240 /* progress steps the arc is redrawn at */
@@ -8606,7 +9161,18 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
       glyphs[n] = "Y"; labels[n++] = "Zoom";
    }
 
-   if (grid_settings_shown() && grid_st.cc_level == 1)
+   if (grid_settings_shown() && grid_cp.open && grid_cp.target == CP_STYLE)
+   {
+      glyphs[n] = "A"; labels[n++] = "Select";
+      glyphs[n] = "B"; labels[n++] = "Back";
+   }
+   else if (grid_settings_shown() && grid_cp.open)
+   {
+      glyphs[n] = "X"; labels[n++] = "Default";
+      glyphs[n] = "A"; labels[n++] = "Choose";
+      glyphs[n] = "B"; labels[n++] = "Back";
+   }
+   else if (grid_settings_shown() && grid_st.cc_level == 1)
    {
       glyphs[n] = "A"; labels[n++] = "Select";
       glyphs[n] = "B"; labels[n++] = "Back";
@@ -9016,11 +9582,6 @@ static void grid_draw_icon_rect(gfx_display_t *p_disp, void *userdata,
 #define GRID_MENU_TEXT_X     REF(14) /* label inset from the highlight */
 #define GRID_MENU_OPEN_USEC  260000
 #define GRID_MENU_CLOSE_USEC 160000
-
-static float grid_clamp01(float v)
-{
-   return v < 0.0f ? 0.0f : v > 1.0f ? 1.0f : v;
-}
 
 /* rgba with its alpha scaled by a (0..1). */
 static uint32_t grid_fade(uint32_t rgba, float a)
@@ -11251,6 +11812,169 @@ static void grid_draw_cc_screen(gfx_display_t *p_disp, void *userdata,
  * switches as toggles, the chosen entry of a choice list with a lime dot.
  * The selected row also shows what it does underneath. RetroArch moves
  * the selection and changes values; this only draws. */
+/* Quad with a colour at each corner, blended across it. */
+static void grid_draw_gradient4(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height, float x, float y, float w, float h,
+      uint32_t tl, uint32_t tr, uint32_t bl, uint32_t br)
+{
+   float color[16], c[16];
+
+   /* Vertices go bottom-left, bottom-right, top-left, top-right (the
+    * display driver's y axis points up). */
+   grid_set_color(c, bl); memcpy(color,      c, 4 * sizeof(float));
+   grid_set_color(c, br); memcpy(color + 4,  c, 4 * sizeof(float));
+   grid_set_color(c, tl); memcpy(color + 8,  c, 4 * sizeof(float));
+   grid_set_color(c, tr); memcpy(color + 12, c, 4 * sizeof(float));
+   gfx_display_draw_quad(p_disp, userdata, width, height,
+         (int)x, (int)y, (unsigned)w, (unsigned)h,
+         width, height, color, NULL);
+}
+
+/* The colour picker, centred over the dimmed screen: the square
+ * (saturation left to right, brightness bottom to top, at the hue) and the
+ * hue bar right of it, each with a marker where the colour is; the cursor
+ * round the one the D-pad is on. */
+static void grid_draw_color_picker(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height)
+{
+   float pad   = REF(16);
+   float gap   = REF(14);
+   float sq_d  = floorf(REF(160) + 0.5f);
+   float hue_w = floorf(REF(18) + 0.5f);
+   float pan_w = 2.0f * pad + sq_d + gap + hue_w;
+   float pan_h = 2.0f * pad + sq_d;
+   float px    = floorf((width - pan_w) / 2.0f + 0.5f);
+   float py    = floorf((height - pan_h) / 2.0f + 0.5f);
+   float sx    = px + pad, sy = py + pad;
+   float hx    = sx + sq_d + gap;
+   uint32_t hue = (grid_hsv_rgb(grid_cp.h, 1.0f, 1.0f) << 8) | 0xff;
+   uint32_t cur = (grid_hsv_rgb(grid_cp.h, grid_cp.s, grid_cp.v) << 8) | 0xff;
+   float d, m;
+   unsigned k;
+
+   /* (Patterns are a page of the Settings screen: grid_draw_style_page.) */
+   if (grid_cp.target == CP_STYLE)
+      return;
+
+   grid_cp.pan_x = px;    grid_cp.pan_y = py;
+   grid_cp.pan_w = pan_w; grid_cp.pan_h = pan_h;
+   grid_cp.sq_x  = sx;    grid_cp.sq_y  = sy;    grid_cp.sq_d = sq_d;
+   grid_cp.hue_x = hx;    grid_cp.hue_w = hue_w;
+
+   grid_draw_rect(p_disp, userdata, width, height, 0, 0, width, height,
+         0x00000090);
+   grid_draw_rounded(p_disp, userdata, width, height,
+         px, py, pan_w, pan_h, REF(12), 0x1c1c1ef0);
+
+   /* Square: white to the hue, then black up from the bottom over it. */
+   grid_draw_gradient4(p_disp, userdata, width, height, sx, sy, sq_d, sq_d,
+         0xffffffff, hue, 0xffffffff, hue);
+   grid_draw_vgradient(p_disp, userdata, width, height, sx, sy, sq_d, sq_d,
+         0x00000000, 0x000000ff);
+
+   /* Hue bar: red, yellow, green, cyan, blue, magenta, red. */
+   for (k = 0; k < 6; k++)
+   {
+      float y0 = floorf(sy + sq_d * k / 6.0f + 0.5f);
+      float y1 = floorf(sy + sq_d * (k + 1) / 6.0f + 0.5f);
+      grid_draw_vgradient(p_disp, userdata, width, height, hx, y0, hue_w,
+            y1 - y0, (grid_hsv_rgb(k / 6.0f, 1.0f, 1.0f) << 8) | 0xff,
+            (grid_hsv_rgb((k + 1) / 6.0f, 1.0f, 1.0f) << 8) | 0xff);
+   }
+
+   if (grid_cp.on_hue)
+      grid_draw_cursor(p_disp, userdata, width, height, hx, sy, hue_w, sq_d,
+            REF(3));
+   else
+      grid_draw_cursor(p_disp, userdata, width, height, sx, sy, sq_d, sq_d,
+            REF(3));
+
+   /* Square's marker: the colour in a white ring, outlined dark. */
+   d = floorf(REF(14) + 0.5f);
+   m = floorf(REF(2) + 0.5f);
+   {
+      float cx = floorf(sx + grid_cp.s * sq_d + 0.5f);
+      float cy = floorf(sy + (1.0f - grid_cp.v) * sq_d + 0.5f);
+      grid_draw_rounded(p_disp, userdata, width, height, cx - d / 2.0f - 1.0f,
+            cy - d / 2.0f - 1.0f, d + 2.0f, d + 2.0f, d / 2.0f + 1.0f,
+            0x00000080);
+      grid_draw_rounded(p_disp, userdata, width, height, cx - d / 2.0f,
+            cy - d / 2.0f, d, d, d / 2.0f, 0xffffffff);
+      grid_draw_rounded(p_disp, userdata, width, height,
+            cx - d / 2.0f + m, cy - d / 2.0f + m, d - 2.0f * m, d - 2.0f * m,
+            d / 2.0f - m, cur);
+   }
+
+   /* Hue bar's marker: a white bar across it, outlined dark. */
+   {
+      float my = floorf(sy + grid_cp.h * sq_d + 0.5f);
+      float mh = 2.0f * m + 2.0f;
+      grid_draw_rounded(p_disp, userdata, width, height, hx - m - 1.0f,
+            my - mh / 2.0f - 1.0f, hue_w + 2.0f * m + 2.0f, mh + 2.0f,
+            mh / 2.0f + 1.0f, 0x00000080);
+      grid_draw_rounded(p_disp, userdata, width, height, hx - m,
+            my - mh / 2.0f, hue_w + 2.0f * m, mh, mh / 2.0f, 0xffffffff);
+   }
+}
+
+/* Selection Pattern's page, like RetroArch's lists of values: a row per
+ * pattern, its name left and its preview right, the chosen one with the
+ * lime dot before the preview; the cursor round the row drawn in that
+ * row's pattern. */
+static void grid_draw_style_page(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height)
+{
+   float left   = REF(35);
+   float top    = REF(88);
+   float row_h  = REF(28);
+   float inset  = REF(3);
+   float pad    = REF(12);
+   float list_w = width - 2.0f * left;
+   float rh     = floorf(row_h - 2.0f * inset + 0.5f);
+   float pd     = floorf(REF(12) + 0.5f); /* preview square */
+   float ring   = floorf(REF(5) + 0.5f);  /* room for its ring */
+   float dd     = floorf(REF(8) + 0.5f);  /* lime dot */
+   float ts     = CAP(GRID_TEXT_CAP);
+   float vx     = left + list_w - pad;    /* values' right edge */
+   const char *parts[2];
+   unsigned k;
+
+   parts[0] = grid_settings_cats[grid_st.settings_cat
+      < GRID_SETTINGS_CAT_COUNT ? grid_st.settings_cat : 0].name;
+   parts[1] = "Selection Pattern";
+   grid_draw_screen_heading(p_disp, userdata, width, height, parts, 2);
+
+   grid_cp.chip_x    = left;
+   grid_cp.chip_w    = list_w;
+   grid_cp.chip_y    = floorf(top + inset + 0.5f);
+   grid_cp.chip_h    = rh;
+   grid_cp.chip_step = row_h;
+
+   for (k = 0; k < STYLE_COUNT; k++)
+   {
+      float ry  = floorf(top + k * row_h + inset + 0.5f);
+      float mid = ry + rh / 2.0f;
+
+      if (k == grid_cp.style)
+      {
+         grid_draw_style_ring(p_disp, userdata, width, height,
+               left, ry, list_w, rh, REF(7), k, 0.0f, 0.0f, 0.0f);
+         grid_draw_shape(p_disp, userdata, width, height,
+               left, ry, list_w, rh, REF(7), COL_DIVIDER);
+      }
+      grid_draw_text(grid_select_style_label[k], left + pad,
+            grid_text_y(mid, height, ts), width, height, COL_TEXT,
+            TEXT_ALIGN_LEFT, ts);
+      grid_draw_style_chip(p_disp, userdata, width, height,
+            floorf(vx - ring - pd + 0.5f), floorf(mid - pd / 2.0f + 0.5f),
+            pd, k);
+      if (k == grid_select_style())
+         grid_draw_rounded(p_disp, userdata, width, height,
+               floorf(vx - 2.0f * ring - pd - REF(8) - dd + 0.5f),
+               floorf(mid - dd / 2.0f + 0.5f), dd, dd, dd / 2.0f, COL_LIME);
+   }
+}
+
 static void grid_draw_settings_screen(gfx_display_t *p_disp, void *userdata,
       unsigned width, unsigned height)
 {
@@ -11288,6 +12012,11 @@ static void grid_draw_settings_screen(gfx_display_t *p_disp, void *userdata,
    if (grid_st.cc_level)
    {
       grid_draw_cc_screen(p_disp, userdata, width, height);
+      return;
+   }
+   if (grid_cp.open && grid_cp.target == CP_STYLE)
+   {
+      grid_draw_style_page(p_disp, userdata, width, height);
       return;
    }
 
@@ -11450,6 +12179,10 @@ static void grid_draw_settings_screen(gfx_display_t *p_disp, void *userdata,
             && (  string_is_equal(list->list[i].label, GRID_BINDS_LABEL)
                || string_is_equal(list->list[i].label, GRID_CC_LABEL)))
          strlcpy(entry.value, "...", sizeof(entry.value));
+      else if (list->list[i].label
+            && string_is_equal(list->list[i].label, GRID_ROWS_LABEL))
+         snprintf(entry.value, sizeof(entry.value), "%u %s",
+               grid_rows_default(), grid_rows_default() == 1 ? "row" : "rows");
 
       if (i == sel)
       {
@@ -11467,7 +12200,45 @@ static void grid_draw_settings_screen(gfx_display_t *p_disp, void *userdata,
                   width, height, COL_TEXT_SOFT, TEXT_ALIGN_LEFT, ds);
       }
 
-      if (kb)
+      if (     list->list[i].label
+            && (  string_is_equal(list->list[i].label, GRID_SELCOL_LABEL)
+               || string_is_equal(list->list[i].label, GRID_SELCOL2_LABEL)))
+      {
+         /* A selection colour: a square swatch of it in a dark frame,
+          * its top-left corner folded over (a dark stepped triangle). */
+         float sd = floorf(REF(18) + 0.5f);
+         float b  = floorf(REF(1.5f) + 0.5f);
+         float tx = floorf(vx - sd + 0.5f);
+         float tyo = floorf(mid - sd / 2.0f + 0.5f);
+         int fold = (int)floorf(REF(5) + 0.5f), j;
+
+         if (b < 1.0f)
+            b = 1.0f;
+         grid_draw_rect(p_disp, userdata, width, height, tx, tyo, sd, sd,
+               0x101010ff);
+         grid_draw_rect(p_disp, userdata, width, height, tx + b, tyo + b,
+               sd - 2.0f * b, sd - 2.0f * b,
+               string_is_equal(list->list[i].label, GRID_SELCOL2_LABEL)
+               ? grid_select_color2() : COL_SELECT);
+         for (j = 0; j < fold; j++)
+            grid_draw_rect(p_disp, userdata, width, height, tx + b,
+                  tyo + b + j, (float)(fold - j), 1.0f, 0x101010ff);
+         value_w = sd;
+      }
+      else if (list->list[i].label
+            && string_is_equal(list->list[i].label, GRID_STYLE_LABEL))
+      {
+         /* The pattern: its preview, not its name. */
+         float pd = floorf(REF(12) + 0.5f);
+         float m  = floorf(REF(5) + 0.5f); /* room for the ring */
+         float tx = floorf(vx - m - pd + 0.5f);
+         float tyo = floorf(mid - pd / 2.0f + 0.5f);
+
+         grid_draw_style_chip(p_disp, userdata, width, height, tx, tyo, pd,
+               grid_select_style());
+         value_w = pd + m;
+      }
+      else if (kb)
       {
          /* A control: its controller button and keyboard key in their
           * columns (set by hand bright, from the controller's profile
@@ -12046,6 +12817,13 @@ bool grid_home_frame(video_frame_info_t *video_info)
     * is drawn with its tile.) */
    grid_draw_top_bar(p_disp, userdata, width, height);
    grid_flush_text(width, height);
+
+   /* The colour picker over the Settings screen (its hints in the bottom
+    * bar, over it). Settings gone some other way: the colour is kept. */
+   if (grid_cp.open && !in_settings)
+      grid_cp_close(true);
+   if (grid_cp.open && grid_cp.target != CP_STYLE)
+      grid_draw_color_picker(p_disp, userdata, width, height);
 
    grid_draw_bottom_bar(p_disp, userdata, width, height);
 
