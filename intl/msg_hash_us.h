@@ -2409,7 +2409,7 @@ MSG_HASH(
    )
 MSG_HASH(
    MENU_ENUM_SUBLABEL_VIDEO_DISPLAY_MODE,
-   "Windowed, borderless fullscreen or exclusive fullscreen."
+   "Windowed, Fullscreen (Borderless Windowed) or Exclusive Fullscreen."
    )
 MSG_HASH(
    MENU_ENUM_LABEL_VALUE_VIDEO_FULLSCREEN_X,

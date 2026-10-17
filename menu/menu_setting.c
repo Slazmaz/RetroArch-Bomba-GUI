@@ -9092,7 +9092,8 @@ static size_t setting_get_string_representation_display_mode(
       rarch_setting_t *setting, char *s, size_t len)
 {
    static const char *names[] = {
-      "Windowed", "Borderless fullscreen", "Fullscreen" };
+      "Windowed", "Fullscreen (Borderless Windowed)",
+      "Exclusive Fullscreen" };
    unsigned mode = *setting->value.target.unsigned_integer;
 
    if (mode <= DISPLAY_MODE_FULLSCREEN)
