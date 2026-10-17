@@ -197,16 +197,14 @@ bool grid_switch_rmtree(const char *path)
 HWND win32_get_window(void);
 #endif
 
-bool grid_switch_browse(int kind, const char *running_core)
-{
 #ifdef _WIN32
+char *grid_switch_open_dialog(const wchar_t *title, const wchar_t *filter)
+{
    static wchar_t last_dir[MAX_PATH];
    wchar_t file[MAX_PATH] = { 0 };
    wchar_t start[MAX_PATH];
    const wchar_t *home = _wgetenv(L"USERPROFILE");
    OPENFILENAMEW ofn;
-   char *path;
-   bool ok;
 
    memset(&ofn, 0, sizeof(ofn));
    ofn.lStructSize = sizeof(ofn);
@@ -214,19 +212,8 @@ bool grid_switch_browse(int kind, const char *running_core)
    ofn.lpstrFile   = file;
    ofn.nMaxFile    = MAX_PATH;
    ofn.Flags       = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
-   if (kind == 1)
-   {
-      ofn.lpstrTitle  = L"Choose your Switch keys (prod.keys)";
-      ofn.lpstrFilter = L"Switch keys (*.keys)\0*.keys\0All files\0*.*\0";
-   }
-   else
-   {
-      /* A firmware folder of loose .nca files: pick any one of them. */
-      ofn.lpstrTitle  = L"Choose Switch firmware (a .zip, or any .nca "
-                        L"file in a firmware folder)";
-      ofn.lpstrFilter = L"Switch firmware (*.zip, *.nca)\0*.zip;*.nca\0"
-                        L"All files\0*.*\0";
-   }
+   ofn.lpstrTitle  = title;
+   ofn.lpstrFilter = filter;
    /* Where it was last, else Downloads. */
    if (last_dir[0])
       ofn.lpstrInitialDir = last_dir;
@@ -259,14 +246,33 @@ bool grid_switch_browse(int kind, const char *running_core)
          ClipCursor(&clip);
 
       if (!picked)
-         return false; /* cancelled */
+         return NULL; /* cancelled */
    }
 
    wcsncpy(last_dir, file, MAX_PATH - 1);
    if (ofn.nFileOffset > 0 && ofn.nFileOffset < MAX_PATH)
       last_dir[ofn.nFileOffset - 1] = 0;
 
-   if (!(path = utf16_to_utf8_string_alloc(file)))
+   return utf16_to_utf8_string_alloc(file);
+}
+#endif
+
+bool grid_switch_browse(int kind, const char *running_core)
+{
+#ifdef _WIN32
+   char *path;
+   bool ok;
+
+   if (kind == 1)
+      path = grid_switch_open_dialog(L"Choose your Switch keys (prod.keys)",
+            L"Switch keys (*.keys)\0*.keys\0All files\0*.*\0");
+   else
+      /* A firmware folder of loose .nca files: pick any one of them. */
+      path = grid_switch_open_dialog(L"Choose Switch firmware (a .zip, or "
+            L"any .nca file in a firmware folder)",
+            L"Switch firmware (*.zip, *.nca)\0*.zip;*.nca\0"
+            L"All files\0*.*\0");
+   if (!path)
       return false;
    if (kind == 1)
       ok = grid_switch_install_keys(path);

@@ -54,6 +54,15 @@ bool grid_home_key_event(bool down, unsigned code, uint32_t character,
  * of another system...). Saves are kept in a folder per console. */
 bool grid_home_console_for_file(const char *path, char *s, size_t len);
 
+/* A core asks for text (RETRO_ENVIRONMENT_BOMBA_TEXT_INPUT, see
+ * bomba_text_input.h). False if a request is open already. */
+struct bomba_text_input;
+bool grid_home_text_input(const struct bomba_text_input *req);
+
+/* Each main loop iteration: opens and closes the menu for a core's text
+ * request. */
+void grid_home_text_input_poll(void);
+
 /* Call when the menu opens or closes. */
 void grid_home_toggle(bool menu_on);
 

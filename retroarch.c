@@ -110,6 +110,7 @@
 
 #include "bomba/bomba_notify.h"
 #include "bomba/bomba_crash.h"
+#include "bomba/grid_home.h"
 
 #include "config.def.h"
 
@@ -6064,6 +6065,7 @@ int rarch_main(int argc, char *argv[], void *data)
 #endif
 
       bomba_notify_poll();
+      grid_home_text_input_poll();
 
 #ifdef HAVE_QT
       app_exit = ui_companion_qt.application->exiting;

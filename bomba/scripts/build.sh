@@ -46,6 +46,7 @@ mkdir -p "$APP/cores" "$APP/info"
 gcc -O2 -Wall -shared -static-libgcc -I"$ROOT/libretro-common/include" \
    -o "$APP/cores/eden_libretro.dll" bomba/cores/eden/eden_libretro.c -ldwmapi -lgdi32 -lole32
 gcc -O2 -Wall -static-libgcc -o "$APP/cores/eden_padinfo.exe" bomba/cores/eden/eden_padinfo.c
+gcc -O2 -Wall -shared -static-libgcc -o "$APP/cores/eden_kbd.dll" bomba/cores/eden/eden_kbd.c
 cp bomba/cores/eden/eden_libretro.info "$APP/info/"
 
 # bomba.exe (started by hand or by Steam's launch option) runs launch.ps1;
