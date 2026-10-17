@@ -89,6 +89,9 @@
 #include "../gfx/gfx_display.h"
 #include "../gfx/video_driver.h"
 #include "../gfx/font_driver.h"
+#ifdef HAVE_NETWORKING
+#include "../network/netplay/netplay.h"
+#endif
 
 #define GRID_MAX_GAMES 1024
 #define GRID_MAX_TABS  24
@@ -1392,6 +1395,35 @@ __declspec(dllimport) int __stdcall SetEnvironmentVariableA(
       const char *name, const char *value);
 #endif
 
+#ifdef HAVE_NETWORKING
+/* A guest starting the host's game joins the host's netplay through the
+ * Steam tunnel, with cores that can do netplay (a launcher core joins the
+ * host's room itself). Any other start plays alone. */
+static void grid_mp_netplay(const grid_game_t *game)
+{
+   core_info_t *info = NULL;
+   char host[64];
+
+   /* (Left from a start that failed.) */
+   if (     netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_ENABLED, NULL)
+         && !netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_DATA_INITED, NULL))
+      netplay_driver_ctl(RARCH_NETPLAY_CTL_DISABLE, NULL);
+
+   if (     bomba_steamnet_state() != BOMBA_STEAMNET_JOINED
+         || !bomba_steamnet_netplay_port()
+         || !string_is_equal(game->system, bomba_steamnet_host_system())
+         || !string_is_equal_case_insensitive(game->title,
+            bomba_steamnet_host_title())
+         || !core_info_find(game->core_path, &info) || !info
+         || info->savestate_support_level < CORE_INFO_SAVESTATE_DETERMINISTIC)
+      return;
+
+   snprintf(host, sizeof(host), "127.0.0.1|%u", bomba_steamnet_netplay_port());
+   netplay_driver_ctl(RARCH_NETPLAY_CTL_ENABLE_CLIENT, NULL);
+   command_event(CMD_EVENT_NETPLAY_INIT_DIRECT_DEFERRED, host);
+}
+#endif
+
 static void grid_launch_now(void)
 {
    const grid_game_t *game = &grid_st.loading_game;
@@ -1415,6 +1447,9 @@ static void grid_launch_now(void)
    grid_controls_apply(game->system, game->core_path, game->path);
    /* A multiplayer host's guests start it too, once it runs. */
    bomba_steamnet_set_game(game->system, game->title);
+#ifdef HAVE_NETWORKING
+   grid_mp_netplay(game);
+#endif
 #ifdef HAVE_MIST
    /* Steam shows friends this name, not the file's. */
    steam_set_game_title(game->path, game->title);
