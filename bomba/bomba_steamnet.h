@@ -15,12 +15,18 @@ RETRO_BEGIN_DECLS
  * player hosts their own from the start, so friends can be invited at any
  * time (bomba_steamnet_invite: Steam's invite dialog); accepting an invite
  * moves into the friend's session instead, and back to one's own when it
- * ends (or the host kicks). The emulator's own room traffic (UDP) goes
- * through a tunnel over Steam's relays (SteamNetworkingMessages):
- *   host:  the launcher core runs the room on 127.0.0.1:BOMBA_STEAMNET_ROOM_PORT
- *          as usual; each guest's packets reach it from a socket of their own.
- *   guest: a socket on 127.0.0.1 (bomba_steamnet_local_port) stands in for
- *          the room; the core joins it like any room.
+ * ends (or the host kicks). The game's own traffic goes through a tunnel
+ * over Steam's relays (SteamNetworkingMessages), two kinds side by side:
+ *   - a launcher core's room (UDP):
+ *     host:  the core runs the room on 127.0.0.1:BOMBA_STEAMNET_ROOM_PORT as
+ *            usual; each guest's packets reach it from a socket of their own.
+ *     guest: a socket on 127.0.0.1 (bomba_steamnet_local_port) stands in for
+ *            the room; the core joins it like any room.
+ *   - RetroArch's netplay (TCP), for cores that can do it:
+ *     host:  netplay hosts on 127.0.0.1:BOMBA_STEAMNET_NETPLAY_PORT while
+ *            guests are in the session (started here, on the running game);
+ *            each guest's connection is passed on to it.
+ *     guest: netplay connects to 127.0.0.1:bomba_steamnet_netplay_port.
  * The host's lobby also carries the game the host is playing, which guests
  * start too (see grid_home.c).
  *
@@ -28,6 +34,8 @@ RETRO_BEGIN_DECLS
 
 /* Eden's default room port; the host's room runs there. */
 #define BOMBA_STEAMNET_ROOM_PORT 24872
+/* RetroArch's default netplay port; the host's netplay runs there. */
+#define BOMBA_STEAMNET_NETPLAY_PORT 55435
 /* Players in a session, the host included. */
 #define BOMBA_STEAMNET_MAX_PLAYERS 8
 
@@ -46,6 +54,11 @@ void bomba_steamnet_deinit(void);
 
 enum bomba_steamnet_state bomba_steamnet_state(void);
 unsigned bomba_steamnet_local_port(void);
+/* Guest: where netplay connects to reach the host's. */
+unsigned bomba_steamnet_netplay_port(void);
+/* Whether netplay now is the Steam session's (hosting or joined): then it
+ * is hosted on 127.0.0.1 only and never announced (netplay_frontend.c). */
+bool bomba_steamnet_netplay(void);
 /* This player's Steam name. */
 const char *bomba_steamnet_my_name(void);
 

@@ -14,9 +14,16 @@
 #include <rthreads/rthreads.h>
 
 #include "bomba_steamnet.h"
+#include "../command.h"
+#include "../core_info.h"
+#include "../paths.h"
+#include "../runahead.h"
 #include "../runloop.h"
 #include "../tasks/tasks_internal.h"
 #include "../verbosity.h"
+#ifdef HAVE_NETWORKING
+#include "../network/netplay/netplay.h"
+#endif
 
 #ifndef SIO_UDP_CONNRESET
 #define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
@@ -79,9 +86,24 @@ enum
 #define RESULT_OK                1
 #define ENTER_SUCCESS            1
 #define CHAT_LEFT_MASK           (2 | 4 | 8 | 16)
+#define RESULT_LIMIT_EXCEEDED    25
 /* Unreliable, no Nagle (the emulator's protocol does its own
  * reliability), and reopen a session that broke. */
 #define SEND_FLAGS               (1 | 32)
+/* Netplay's connections (TCP) as a stream of messages: reliable and in
+ * order, no Nagle, reopening. */
+#define SEND_STREAM_FLAGS        (8 | 1 | 32)
+
+/* Channels: a launcher core's room, netplay's connections. Each netplay
+ * message is a byte saying what, the connection's number (the guest
+ * counts them: what's left of one before isn't taken for the next), then
+ * the data. */
+#define CH_ROOM                  0
+#define CH_NETPLAY               1
+#define STREAM_OPEN              'O'
+#define STREAM_DATA              'D'
+#define STREAM_CLOSE             'C'
+#define STREAM_HEADER            2
 
 static struct
 {
@@ -142,6 +164,13 @@ static struct
 #define SN_RETRY_USEC  (30 * 1000000LL)
 /* How often the session's players are looked at. */
 #define SN_PLAYERS_USEC (250000LL)
+/* Host: how long a guest's netplay connection waits for netplay to start
+ * (the guest's game may start first), trying this often. */
+#define STREAM_CONNECT_USEC (20 * 1000000LL)
+#define STREAM_RETRY_USEC   (250000LL)
+/* Host: a guest's connection outlives the guest in the lobby this long at
+ * most (it may arrive before the lobby shows the guest). */
+#define STREAM_GRACE_USEC   (5 * 1000000LL)
 
 typedef struct
 {
@@ -149,6 +178,23 @@ typedef struct
    SOCKET s;
    int64_t last;
 } peer_t;
+
+/* A netplay connection through the tunnel. */
+typedef struct
+{
+   steam_id_t id;      /* the other end: host, a guest; guest, the host */
+   SOCKET s;           /* INVALID_SOCKET: none (host: maybe trying again) */
+   uint8_t num;
+   bool live;          /* host: wanted, connected or not */
+   bool connecting;    /* host: connect() under way */
+   int64_t opened, retry_at;
+   /* From Steam, not taken by netplay yet. */
+   char *out;
+   size_t out_len, out_cap;
+   /* For Steam, which had no room for it yet: a whole message. */
+   char *held;
+   uint32_t held_len;
+} stream_t;
 
 static struct
 {
@@ -171,9 +217,21 @@ static struct
    /* Guest: the host's game. */
    char host_system[40], host_title[256];
 
-   /* Guest: the room's stand-in. */
+   /* Guest: the room's stand-in, and netplay's (listening). */
    SOCKET local;
    unsigned local_port;
+   SOCKET listen;
+   unsigned netplay_port;
+
+   /* Host: netplay for the running game (sn_host_netplay): which game it
+    * was tried for, and whether it runs for the session. */
+   char np_content[MAX_PATH];
+   bool np_tried, np_started;
+
+   /* Host: who is in the lobby, for the tunnel (under members_cs). */
+   CRITICAL_SECTION members_cs;
+   steam_id_t members[BOMBA_STEAMNET_MAX_PLAYERS];
+   unsigned nmembers;
 
    /* The others in the session, as last looked at (players_known: once
     * looked at, so who is there on arrival isn't news). avatar_of: whose
@@ -293,11 +351,297 @@ static peer_t *sn_peer(peer_t *peers, size_t *count, steam_id_t id)
    return &peers[(*count)++];
 }
 
+/* Netplay's connections ------------------------------------------------- */
+
+static SOCKET sn_tcp_socket(void)
+{
+   u_long nonblock = 1;
+   BOOL nodelay    = TRUE;
+   SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+   if (s == INVALID_SOCKET)
+      return s;
+   ioctlsocket(s, FIONBIO, &nonblock);
+   setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay,
+         sizeof(nodelay));
+   return s;
+}
+
+static SOCKET sn_tcp_listener(void)
+{
+   struct sockaddr_in addr;
+   SOCKET s = sn_tcp_socket();
+   if (s == INVALID_SOCKET)
+      return s;
+   memset(&addr, 0, sizeof(addr));
+   addr.sin_family      = AF_INET;
+   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+   if (     bind(s, (struct sockaddr*)&addr, sizeof(addr)) != 0
+         || listen(s, 1) != 0)
+   {
+      closesocket(s);
+      return INVALID_SOCKET;
+   }
+   return s;
+}
+
+static bool sn_is_member_now(steam_id_t id)
+{
+   unsigned i;
+   bool found = false;
+   EnterCriticalSection(&sn.members_cs);
+   for (i = 0; i < sn.nmembers && !found; i++)
+      found = sn.members[i] == id;
+   LeaveCriticalSection(&sn.members_cs);
+   return found;
+}
+
+/* A message of the stream's: what, its number, data. RESULT_LIMIT_EXCEEDED:
+ * Steam has no room for it now. */
+static int sn_stream_send(stream_t *st, char what, char *msg, uint32_t len)
+{
+   net_identity_t id;
+   msg[0] = what;
+   msg[1] = (char)st->num;
+   sn_identity(&id, st->id);
+   return api.SendMessageToUser(sn.msgs, &id, msg, STREAM_HEADER + len,
+         SEND_STREAM_FLAGS, CH_NETPLAY);
+}
+
+static void sn_stream_tell(stream_t *st, char what)
+{
+   char msg[STREAM_HEADER];
+   sn_stream_send(st, what, msg, 0);
+}
+
+/* Ends the connection (tell: the other end hears of it). */
+static void sn_stream_close(stream_t *st, bool tell)
+{
+   if (st->s != INVALID_SOCKET)
+      closesocket(st->s);
+   if (tell && st->live)
+      sn_stream_tell(st, STREAM_CLOSE);
+   st->s          = INVALID_SOCKET;
+   st->live       = false;
+   st->connecting = false;
+   st->out_len    = 0;
+   st->held_len   = 0;
+}
+
+static void sn_stream_free(stream_t *st)
+{
+   free(st->out);
+   free(st->held);
+   st->out     = st->held = NULL;
+   st->out_cap = 0;
+}
+
+static void sn_stream_take(stream_t *st, const char *data, size_t len)
+{
+   if (st->out_len + len > st->out_cap)
+   {
+      size_t cap = st->out_cap ? st->out_cap : 65536;
+      char *out;
+      while (cap < st->out_len + len)
+         cap *= 2;
+      if (!(out = (char*)realloc(st->out, cap)))
+         return;
+      st->out     = out;
+      st->out_cap = cap;
+   }
+   memcpy(st->out + st->out_len, data, len);
+   st->out_len += len;
+}
+
+/* Host: (again) to the host's netplay. */
+static void sn_stream_connect(stream_t *st)
+{
+   struct sockaddr_in addr;
+
+   if ((st->s = sn_tcp_socket()) == INVALID_SOCKET)
+      return;
+   memset(&addr, 0, sizeof(addr));
+   addr.sin_family      = AF_INET;
+   addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+   addr.sin_port        = htons(BOMBA_STEAMNET_NETPLAY_PORT);
+   st->connecting = true;
+   if (     connect(st->s, (struct sockaddr*)&addr, sizeof(addr)) == 0)
+      st->connecting = false;
+   else if (WSAGetLastError() != WSAEWOULDBLOCK)
+   {
+      closesocket(st->s);
+      st->s = INVALID_SOCKET;
+   }
+}
+
+/* Host: a connect() under way, done yet? */
+static void sn_stream_check_connect(stream_t *st, int64_t now)
+{
+   fd_set w, e;
+   struct timeval tv = { 0, 0 };
+
+   if (st->s != INVALID_SOCKET)
+   {
+      FD_ZERO(&w);
+      FD_ZERO(&e);
+      FD_SET(st->s, &w);
+      FD_SET(st->s, &e);
+      if (select(0, NULL, &w, &e, &tv) <= 0)
+         return;
+      if (FD_ISSET(st->s, &w) && !FD_ISSET(st->s, &e))
+      {
+         st->connecting = false;
+         RARCH_LOG("[Bomba] Guest %llu reached netplay.\n",
+               (unsigned long long)st->id);
+         return;
+      }
+      /* (Netplay not started yet.) */
+      closesocket(st->s);
+      st->s        = INVALID_SOCKET;
+      st->retry_at = now + STREAM_RETRY_USEC;
+   }
+   if (now - st->opened > STREAM_CONNECT_USEC)
+   {
+      RARCH_WARN("[Bomba] No netplay for guest %llu.\n",
+            (unsigned long long)st->id);
+      sn_stream_close(st, true);
+   }
+   else if (now >= st->retry_at)
+      sn_stream_connect(st);
+}
+
+/* Hands netplay what came from Steam, as much as it takes; false: the
+ * connection broke. */
+static bool sn_stream_flush(stream_t *st)
+{
+   while (st->out_len)
+   {
+      int r = send(st->s, st->out, (int)st->out_len, 0);
+      if (r <= 0)
+         return WSAGetLastError() == WSAEWOULDBLOCK;
+      memmove(st->out, st->out + r, st->out_len - r);
+      st->out_len -= r;
+   }
+   return true;
+}
+
+/* Moves what there is between netplay and Steam. */
+static void sn_stream_pump(stream_t *st, char *buf, size_t size)
+{
+   int r;
+
+   if (!st->live || st->connecting || st->s == INVALID_SOCKET)
+      return;
+
+   if (!sn_stream_flush(st))
+   {
+      sn_stream_close(st, true);
+      return;
+   }
+
+   /* Steam takes in order: nothing new until the held one went. */
+   if (st->held_len)
+   {
+      if (sn_stream_send(st, STREAM_DATA, st->held,
+            st->held_len - STREAM_HEADER) == RESULT_LIMIT_EXCEEDED)
+         return;
+      st->held_len = 0;
+   }
+
+   while ((r = recv(st->s, buf + STREAM_HEADER,
+         (int)(size - STREAM_HEADER), 0)) > 0)
+   {
+      if (sn_stream_send(st, STREAM_DATA, buf, (uint32_t)r)
+            == RESULT_LIMIT_EXCEEDED)
+      {
+         if (!st->held)
+            st->held = (char*)malloc(size);
+         if (st->held)
+         {
+            memcpy(st->held, buf, STREAM_HEADER + r);
+            st->held_len = STREAM_HEADER + r;
+         }
+         return;
+      }
+   }
+   if (r == 0 || WSAGetLastError() != WSAEWOULDBLOCK)
+      sn_stream_close(st, true);
+}
+
+/* Host: the guest's connection, made if new. */
+static stream_t *sn_stream_of(stream_t *streams, size_t *count, steam_id_t id)
+{
+   size_t i;
+   for (i = 0; i < *count; i++)
+      if (streams[i].id == id)
+         return &streams[i];
+   if (*count >= MAX_PEERS)
+      return NULL;
+   memset(&streams[*count], 0, sizeof(streams[0]));
+   streams[*count].id = id;
+   streams[*count].s  = INVALID_SOCKET;
+   return &streams[(*count)++];
+}
+
+/* A netplay message from the other end. */
+static void sn_stream_message(stream_t *streams, size_t *count, bool host,
+      steam_id_t from, const char *data, int size)
+{
+   stream_t *st;
+   char what;
+   uint8_t num;
+
+   if (size < STREAM_HEADER)
+      return;
+   what = data[0];
+   num  = (uint8_t)data[1];
+
+   if (!host)
+   {
+      st = &streams[0];
+      if (from != st->id || num != st->num || !st->live)
+         return;
+      if (what == STREAM_DATA)
+         sn_stream_take(st, data + STREAM_HEADER, size - STREAM_HEADER);
+      else if (what == STREAM_CLOSE)
+      {
+         sn_stream_flush(st);
+         sn_stream_close(st, false);
+      }
+      return;
+   }
+
+   if (!(st = sn_stream_of(streams, count, from)))
+      return;
+   if (what == STREAM_OPEN)
+   {
+      sn_stream_close(st, false);
+      st->num      = num;
+      st->live     = true;
+      st->opened   = sn_now();
+      st->retry_at = 0;
+      sn_stream_connect(st);
+      RARCH_LOG("[Bomba] Guest %llu opened a netplay connection.\n",
+            (unsigned long long)from);
+   }
+   else if (num != st->num || !st->live)
+      ; /* (an earlier connection's) */
+   else if (what == STREAM_DATA)
+      sn_stream_take(st, data + STREAM_HEADER, size - STREAM_HEADER);
+   else if (what == STREAM_CLOSE)
+   {
+      if (!st->connecting && st->s != INVALID_SOCKET)
+         sn_stream_flush(st);
+      sn_stream_close(st, false);
+   }
+}
+
 static void sn_tunnel(void *data)
 {
    static char buf[65536];
    peer_t peers[MAX_PEERS];
-   size_t npeers = 0, i;
+   /* Netplay's connections: host, one per guest; guest, [0] (the host). */
+   stream_t streams[MAX_PEERS];
+   size_t npeers = 0, nstreams = 0, i;
    bool host     = sn.state == BOMBA_STEAMNET_HOSTING;
    steam_id_t to = sn.host;
    net_identity_t host_id;
@@ -307,6 +651,13 @@ static void sn_tunnel(void *data)
    int last_res    = RESULT_OK;
 
    sn_identity(&host_id, to);
+   if (!host)
+   {
+      memset(&streams[0], 0, sizeof(streams[0]));
+      streams[0].id = to;
+      streams[0].s  = INVALID_SOCKET;
+      nstreams      = 1;
+   }
 
    while (sn.run)
    {
@@ -323,7 +674,15 @@ static void sn_tunnel(void *data)
          for (i = 0; i < npeers; i++)
             FD_SET(peers[i].s, &set);
       else
+      {
          FD_SET(sn.local, &set);
+         if (sn.listen != INVALID_SOCKET)
+            FD_SET(sn.listen, &set);
+      }
+      for (i = 0; i < nstreams; i++)
+         if (     streams[i].live && !streams[i].connecting
+               && streams[i].s != INVALID_SOCKET)
+            FD_SET(streams[i].s, &set);
       tv.tv_sec  = 0;
       tv.tv_usec = 1000;
       if (set.fd_count)
@@ -331,8 +690,62 @@ static void sn_tunnel(void *data)
       else
          Sleep(1);
 
+      /* Steam -> netplay */
+      n = api.ReceiveMessages(sn.msgs, CH_NETPLAY, msgs, 32);
+      for (k = 0; k < n; k++)
+      {
+         net_msg_t *m    = msgs[k];
+         steam_id_t from = m->peer.type == IDENTITY_STEAMID
+            ? m->peer.u.steam_id : 0;
+         if (from && !(host && sn_is_kicked(from)))
+            sn_stream_message(streams, &nstreams, host, from,
+                  (const char*)m->data, m->size);
+         api.ReleaseMessage(m);
+      }
+
+      /* Netplay's connections: new (guest), started, pumped, ended. */
+      if (!host && sn.listen != INVALID_SOCKET)
+      {
+         SOCKET s = accept(sn.listen, NULL, NULL);
+         if (s != INVALID_SOCKET)
+         {
+            u_long nonblock = 1;
+            BOOL nodelay    = TRUE;
+            stream_t *st    = &streams[0];
+            ioctlsocket(s, FIONBIO, &nonblock);
+            setsockopt(s, IPPROTO_TCP, TCP_NODELAY, (const char*)&nodelay,
+                  sizeof(nodelay));
+            sn_stream_close(st, true);
+            st->num++;
+            st->s    = s;
+            st->live = true;
+            sn_stream_tell(st, STREAM_OPEN);
+            RARCH_LOG("[Bomba] Netplay connecting to the host.\n");
+         }
+      }
+      now = sn_now();
+      for (i = 0; i < nstreams; i++)
+      {
+         stream_t *st = &streams[i];
+         if (!st->live)
+            continue;
+         /* Kicked, or gone from the lobby. */
+         if (host && (sn_is_kicked(st->id)
+               || (now - st->opened > STREAM_GRACE_USEC
+                  && !sn_is_member_now(st->id))))
+         {
+            RARCH_LOG("[Bomba] Guest %llu's netplay connection ended.\n",
+                  (unsigned long long)st->id);
+            sn_stream_close(st, true);
+            continue;
+         }
+         if (st->connecting)
+            sn_stream_check_connect(st, now);
+         sn_stream_pump(st, buf, sizeof(buf));
+      }
+
       /* Steam -> emulator */
-      n = api.ReceiveMessages(sn.msgs, 0, msgs, 32);
+      n = api.ReceiveMessages(sn.msgs, CH_ROOM, msgs, 32);
       for (k = 0; k < n; k++)
       {
          net_msg_t *m    = msgs[k];
@@ -417,11 +830,23 @@ static void sn_tunnel(void *data)
       }
    }
 
+   for (i = 0; i < nstreams; i++)
+   {
+      sn_stream_close(&streams[i], true);
+      sn_stream_free(&streams[i]);
+   }
    for (i = 0; i < npeers; i++)
    {
       net_identity_t id;
       closesocket(peers[i].s);
       sn_identity(&id, peers[i].id);
+      api.CloseSession(sn.msgs, &id);
+   }
+   /* (A guest's netplay connection but no room.) */
+   for (i = 0; host && i < nstreams; i++)
+   {
+      net_identity_t id;
+      sn_identity(&id, streams[i].id);
       api.CloseSession(sn.msgs, &id);
    }
    if (!host)
@@ -447,15 +872,28 @@ static void sn_tunnel_stop(void)
       closesocket(sn.local);
       sn.local = INVALID_SOCKET;
    }
-   sn.local_port = 0;
+   if (sn.listen != INVALID_SOCKET)
+   {
+      closesocket(sn.listen);
+      sn.listen = INVALID_SOCKET;
+   }
+   sn.local_port   = 0;
+   sn.netplay_port = 0;
 }
 
 /* ---------------------------------------------------------------------- */
 /* Session                                                                */
 /* ---------------------------------------------------------------------- */
 
+#ifdef HAVE_NETWORKING
+static void sn_stop_netplay(void);
+#endif
+
 static void sn_end(void)
 {
+#ifdef HAVE_NETWORKING
+   sn_stop_netplay();
+#endif
    sn_tunnel_stop();
    if (sn.lobby)
       api.LeaveLobby(sn.mm, sn.lobby);
@@ -469,6 +907,7 @@ static void sn_end(void)
    sn.host_title[0]  = '\0';
    sn.nplayers       = 0;
    sn.players_known  = false;
+   sn.nmembers       = 0;
    sn.nkicked        = 0;
    sn.ninvited       = 0;
 }
@@ -567,7 +1006,8 @@ static void sn_on_lobby_enter(const lobby_enter_t *e)
    strlcpy(sn.host_name, name ? name : "", sizeof(sn.host_name));
    sn_read_host_game();
 
-   if ((sn.local = sn_udp_socket()) == INVALID_SOCKET)
+   if (     (sn.local  = sn_udp_socket())   == INVALID_SOCKET
+         || (sn.listen = sn_tcp_listener()) == INVALID_SOCKET)
    {
       sn_message("Multiplayer: couldn't open the session's local port.");
       sn_back_home(0);
@@ -578,12 +1018,15 @@ static void sn_on_lobby_enter(const lobby_enter_t *e)
       int len = sizeof(addr);
       getsockname(sn.local, (struct sockaddr*)&addr, &len);
       sn.local_port = ntohs(addr.sin_port);
+      len = sizeof(addr);
+      getsockname(sn.listen, (struct sockaddr*)&addr, &len);
+      sn.netplay_port = ntohs(addr.sin_port);
    }
    sn.state = BOMBA_STEAMNET_JOINED;
    sn_tunnel_start();
-   RARCH_LOG("[Bomba] Joined Steam lobby %llu (host %llu), local port %u.\n",
-         (unsigned long long)sn.lobby, (unsigned long long)sn.host,
-         sn.local_port);
+   RARCH_LOG("[Bomba] Joined Steam lobby %llu (host %llu), local ports %u "
+         "(room), %u (netplay).\n", (unsigned long long)sn.lobby,
+         (unsigned long long)sn.host, sn.local_port, sn.netplay_port);
    {
       char msg[128];
       snprintf(msg, sizeof(msg), "Multiplayer: joined %s's session.",
@@ -709,7 +1152,9 @@ void bomba_steamnet_init(void)
    char lobby_env[32];
    const char *name;
 
-   sn.local = INVALID_SOCKET;
+   sn.local  = INVALID_SOCKET;
+   sn.listen = INVALID_SOCKET;
+   InitializeCriticalSection(&sn.members_cs);
 
    /* Only when Steam started RetroArch (as for its overlay). */
    if (!GetEnvironmentVariableA("SteamAppId", path, sizeof(path)))
@@ -961,7 +1406,84 @@ static void sn_refresh_players(void)
    memcpy(sn.avatar_of, avatar_of, n * sizeof(avatar_of[0]));
    sn.nplayers      = n;
    sn.players_known = true;
+
+   EnterCriticalSection(&sn.members_cs);
+   for (i = 0; i < n; i++)
+      sn.members[i] = now[i].id;
+   sn.nmembers = n;
+   LeaveCriticalSection(&sn.members_cs);
 }
+
+#ifdef HAVE_NETWORKING
+/* Whether the running game's core can do netplay (launcher cores can't:
+ * theirs is the room), without netplay saying so on screen. */
+static bool sn_core_does_netplay(void)
+{
+   struct retro_core_t *core = &runloop_state_get_ptr()->current_core;
+   return   core_info_current_supports_netplay()
+         && core->retro_serialize_size
+         && core->retro_serialize_size() > 0
+         && !(core_serialization_quirks()
+            & (RETRO_SERIALIZATION_QUIRK_INCOMPLETE
+             | RETRO_SERIALIZATION_QUIRK_SINGLE_SESSION));
+}
+
+static void sn_stop_netplay(void)
+{
+   if (!sn.np_started)
+      return;
+   sn.np_started = false;
+   sn.np_tried   = false;
+   if (netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_DATA_INITED, NULL))
+      command_event(CMD_EVENT_NETPLAY_DISCONNECT, NULL);
+   RARCH_LOG("[Bomba] Netplay for the session stopped.\n");
+}
+
+/* Host: netplay for the running game while guests are in the session,
+ * started on it as it runs (once per game: a core that can't stays
+ * without), stopped when the last guest leaves. */
+static void sn_host_netplay(void)
+{
+   runloop_state_t *rs = runloop_state_get_ptr();
+   const char *content = path_get(RARCH_PATH_CONTENT);
+   bool running        = (rs->current_core.flags & RETRO_CORE_FLAG_GAME_LOADED)
+      ? true : false;
+   bool on             = netplay_driver_ctl(RARCH_NETPLAY_CTL_IS_DATA_INITED,
+         NULL);
+
+   if (!running)
+      content = "";
+   if (!string_is_equal(content, sn.np_content))
+   {
+      strlcpy(sn.np_content, content, sizeof(sn.np_content));
+      sn.np_tried = false;
+   }
+   /* (Ends with the game.) */
+   if (!on)
+      sn.np_started = false;
+
+   if (sn.nplayers && running && !on && !sn.np_tried)
+   {
+      sn.np_tried = true;
+      if (!sn_core_does_netplay())
+         return;
+      netplay_driver_ctl(RARCH_NETPLAY_CTL_ENABLE_SERVER, NULL);
+      if (command_event(CMD_EVENT_NETPLAY_INIT, NULL))
+      {
+         sn.np_started = true;
+#if HAVE_RUNAHEAD
+         /* (Not with netplay.) */
+         preempt_deinit(rs);
+#endif
+         RARCH_LOG("[Bomba] Netplay hosted for the session.\n");
+      }
+      else
+         RARCH_ERR("[Bomba] Netplay not hosted for the session.\n");
+   }
+   else if (!sn.nplayers && sn.np_started)
+      sn_stop_netplay();
+}
+#endif
 
 void bomba_steamnet_poll(void)
 {
@@ -1011,7 +1533,12 @@ void bomba_steamnet_poll(void)
    }
 
    if (sn.state == BOMBA_STEAMNET_HOSTING)
+   {
       sn_publish_game();
+#ifdef HAVE_NETWORKING
+      sn_host_netplay();
+#endif
+   }
    /* In no session: this player's own, so friends can be invited. */
    else if (sn.state == BOMBA_STEAMNET_OFF && sn_now() >= sn.host_at)
       sn_host();
@@ -1033,6 +1560,13 @@ void bomba_steamnet_deinit(void)
 
 enum bomba_steamnet_state bomba_steamnet_state(void) { return sn.state; }
 unsigned bomba_steamnet_local_port(void)     { return sn.local_port; }
+unsigned bomba_steamnet_netplay_port(void)   { return sn.netplay_port; }
+
+bool bomba_steamnet_netplay(void)
+{
+   return sn.state == BOMBA_STEAMNET_HOSTING
+       || sn.state == BOMBA_STEAMNET_JOINED;
+}
 const char *bomba_steamnet_my_name(void)     { return sn.my_name; }
 const char *bomba_steamnet_host_system(void) { return sn.host_system; }
 const char *bomba_steamnet_host_title(void)  { return sn.host_title; }

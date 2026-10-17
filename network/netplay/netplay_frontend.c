@@ -82,6 +82,15 @@
 
 #include "netplay_private.h"
 
+/* Bomba: netplay in a Steam session goes through the Steam tunnel only (see
+ * bomba_steamnet.h): hosted on 127.0.0.1, never announced or relayed. */
+#ifdef HAVE_MIST
+#include "../../bomba/bomba_steamnet.h"
+#define NETPLAY_STEAM() bomba_steamnet_netplay()
+#else
+#define NETPLAY_STEAM() false
+#endif
+
 #ifdef TCP_NODELAY
 #define SET_TCP_NODELAY(fd) \
    { \
@@ -6918,6 +6927,8 @@ static bool init_tcp_socket(netplay_t *netplay,
    struct addrinfo *addr = NULL;
    struct addrinfo hints = {0};
    bool is_mitm          = !server && mitm;
+   /* Bomba: a Steam session's host, reached by the tunnel alone. */
+   bool loopback         = !server && !is_mitm && NETPLAY_STEAM();
    int fd                = -1;
 
    if (!network_init())
@@ -6925,7 +6936,9 @@ static bool init_tcp_socket(netplay_t *netplay,
 
    if (!server)
    {
-      if (!is_mitm)
+      if (loopback)
+         hints.ai_family = AF_INET;
+      else if (!is_mitm)
       {
          hints.ai_flags  = AI_PASSIVE;
 #ifdef HAVE_INET6
@@ -6943,8 +6956,8 @@ static bool init_tcp_socket(netplay_t *netplay,
    snprintf(port_buf, sizeof(port_buf), "%hu", (unsigned short)port);
    hints.ai_flags |= AI_NUMERICSERV;
 
-   if (getaddrinfo_retro(is_mitm ? mitm : server, port_buf,
-      &hints, &addr))
+   if (getaddrinfo_retro(is_mitm ? mitm : loopback ? "127.0.0.1" : server,
+      port_buf, &hints, &addr))
    {
       if (!server && !is_mitm)
       {
@@ -8944,7 +8957,7 @@ static bool netplay_pre_frame(netplay_t *netplay)
 /* Vita can't bind to our discovery port;
    do not try to answer discovery queries there. */
 #if defined(HAVE_NETPLAYDISCOVERY) && !defined(VITA)
-      if (!netplay->mitm_handler)
+      if (!netplay->mitm_handler && !NETPLAY_STEAM())
       {
          net_driver_state_t *net_st = &networking_driver_st;
 
@@ -8955,7 +8968,7 @@ static bool netplay_pre_frame(netplay_t *netplay)
 #endif
 
       if (settings->bools.netplay_public_announce &&
-            netplay->next_announce != -1)
+            netplay->next_announce != -1 && !NETPLAY_STEAM())
       {
          if (cpu_features_get_time_usec() >= netplay->next_announce)
             netplay_announce(netplay);
@@ -9125,6 +9138,12 @@ bool init_netplay(const char *server, unsigned port, const char *mitm_session)
 
       server = NULL;
 
+#ifdef HAVE_MIST
+      /* Bomba: where the Steam tunnel delivers. */
+      if (NETPLAY_STEAM())
+         port = BOMBA_STEAMNET_NETPLAY_PORT;
+      else
+#endif
       if (settings->bools.netplay_use_mitm_server)
       {
          const char *mitm_handle = settings->arrays.netplay_mitm_server;
@@ -9162,7 +9181,11 @@ bool init_netplay(const char *server, unsigned port, const char *mitm_session)
       server, mitm, port, mitm_session,
       settings->ints.netplay_check_frames,
       &cbs,
-      settings->bools.netplay_nat_traversal,
+      settings->bools.netplay_nat_traversal && !NETPLAY_STEAM(),
+#ifdef HAVE_MIST
+      NETPLAY_STEAM() && !string_is_empty(bomba_steamnet_my_name())
+         ? bomba_steamnet_my_name() :
+#endif
 #ifdef HAVE_DISCORD
       !string_is_empty(discord_get_own_username()) ? discord_get_own_username()
       :
