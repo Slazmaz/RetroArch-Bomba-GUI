@@ -51,6 +51,14 @@ bool grid_switch_rmtree(const char *path);
  * couldn't. */
 bool grid_switch_browse(int kind, const char *running_core);
 
+#ifdef _WIN32
+#include <wchar.h>
+/* The system's Open dialog over RetroArch's window, starting where it was
+ * last (else Downloads). Returns the chosen file (UTF-8; free() it), NULL
+ * if cancelled. */
+char *grid_switch_open_dialog(const wchar_t *title, const wchar_t *filter);
+#endif
+
 RETRO_END_DECLS
 
 #endif

@@ -29,8 +29,9 @@
  *    Eden process is suspended, so the game pauses.
  * Otherwise Eden simply opens in its own window.
  *
- * Multiplayer (see "Multiplayer" below) runs the game in eden-cli.exe, which
- * comes with Eden, instead of eden.exe.
+ * The game runs in eden-cli.exe, which comes with Eden, rather than
+ * eden.exe: it can join multiplayer rooms (see "Multiplayer"), and its
+ * Switch keyboard is RetroArch's (see "Switch keyboard").
  */
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
@@ -46,6 +47,7 @@
 #include <string.h>
 
 #include <libretro.h>
+#include "../../bomba_text_input.h"
 
 /* The loading screen fades in from black, and out to black before Eden
  * shows, black that then fades off Eden (gl2.c, GL2_BOMBA_FADE_MS). */
@@ -86,6 +88,7 @@ static struct
    bool styled;        /* Eden's window taken over, see-through next */
    HWND ra;            /* RetroArch's window */
    HWND emu;           /* Eden's game window, once it appears */
+   HWND popup;         /* Eden's dialog over the game (Switch keyboard) */
    HANDLE emu_thread;  /* Eden's main thread, suspended until RetroArch's
                           window is on top (set by the launch thread) */
    DWORD loading_since;/* tick Eden was let run */
@@ -917,9 +920,9 @@ static void write_config(const wchar_t *exe, bool cli)
  * all launcher cores, on until set to Off) arrive as RetroArch's
  * environment variables BOMBA_MP_MODE (host / join), _ADDRESS, _PORT,
  * _PASSWORD, _MAX and _NAME (the player: the grid profile's name).
- * Joining needs eden-cli.exe (eden.exe can't join from its command line).
- * Hosting also starts eden.exe's dedicated room server, hidden, for as long
- * as the game runs, and joins it. */
+ * eden-cli.exe joins from its command line. Hosting also starts eden.exe's
+ * dedicated room server, hidden, for as long as the game runs, and joins
+ * it. */
 #define EDEN_ROOM_PORT 24872
 
 static struct
@@ -1241,20 +1244,284 @@ done:
    return found;
 }
 
-static uint32_t network_init_rva;
+static uint32_t network_init_rva; /* 0: not in multiplayer */
 
-/* Runs Network::Init in Eden once it runs (the overlay starts it
- * suspended): after its C runtime is up, well before the game loads. */
-static DWORD WINAPI network_init_main(LPVOID param)
+/* Runs Network::Init in Eden. */
+static void network_init(HANDLE process)
 {
    typedef LONG (WINAPI *query_t)(HANDLE, int, PVOID, ULONG, PULONG);
    struct { PVOID exit_status; uint8_t *peb; ULONG_PTR more[4]; } info;
-   HANDLE process = (HANDLE)param;
    query_t query  = (query_t)GetProcAddress(GetModuleHandleW(L"ntdll.dll"),
          "NtQueryInformationProcess");
    uint64_t base  = 0;
    HANDLE thread;
    DWORD code     = 0;
+
+   if (     !query || query(process, 0, &info, sizeof(info), NULL) != 0
+         || !ReadProcessMemory(process, info.peb + 0x10, &base, sizeof(base), NULL))
+   {
+      log_msg("multiplayer: Eden's image base not read (%lu)", (unsigned long)GetLastError());
+      return;
+   }
+   thread = CreateRemoteThread(process, NULL, 0,
+         (LPTHREAD_START_ROUTINE)(ULONG_PTR)(base + network_init_rva), NULL, 0, NULL);
+   if (!thread)
+   {
+      log_msg("multiplayer: Eden's network not started (%lu)", (unsigned long)GetLastError());
+      return;
+   }
+   WaitForSingleObject(thread, 10000);
+   GetExitCodeThread(thread, &code);
+   CloseHandle(thread);
+   log_msg("multiplayer: Eden's network started (%lu)", (unsigned long)(code & 0xff));
+}
+
+/* ---------------------------------------------------------------------- */
+/* Switch keyboard                                                        */
+/* ---------------------------------------------------------------------- */
+
+/* eden-cli has no keyboard of its own (it answers every one with "Eden"):
+ * eden_kbd.dll, next to this core, is loaded into it and sends each
+ * keyboard the game opens here, through a pipe named after Eden's process;
+ * RetroArch asks the player with its on-screen keyboard
+ * (bomba_text_input.h) and the answer goes back the same way. */
+#define KBD_TEXT_MAX 500 /* UTF-16 units, as eden_kbd.c */
+
+static struct
+{
+   HANDLE thread;
+   HANDLE answered;   /* event: RetroArch answered */
+   volatile LONG stop;
+   CRITICAL_SECTION lock;
+   bool lock_init;
+   bool pending;      /* asked, for retro_run to pass on to RetroArch */
+   char label[KBD_TEXT_MAX * 3 + 1];
+   char initial[KBD_TEXT_MAX * 3 + 1];
+   bool ok;           /* the answer: typed (else cancelled) */
+   wchar_t text[KBD_TEXT_MAX];
+   uint32_t text_len;
+} kbd;
+
+static void kbd_utf8(const wchar_t *w, uint32_t n, char *out, size_t out_len)
+{
+   int len = n ? WideCharToMultiByte(CP_UTF8, 0, w, (int)n, out,
+         (int)out_len - 1, NULL, NULL) : 0;
+   out[len > 0 ? len : 0] = '\0';
+}
+
+/* RetroArch's answer, on its main thread. */
+static void kbd_done(const char *text)
+{
+   int n = 0;
+
+   EnterCriticalSection(&kbd.lock);
+   kbd.ok = text != NULL;
+   if (text && *text)
+      n = MultiByteToWideChar(CP_UTF8, 0, text, -1, kbd.text, KBD_TEXT_MAX) - 1;
+   kbd.text_len = n > 0 ? (uint32_t)n : 0;
+   LeaveCriticalSection(&kbd.lock);
+   log_msg("keyboard: %s", text ? "typed" : "cancelled");
+   SetEvent(kbd.answered);
+}
+
+/* Each retro_run: a keyboard asked for goes to RetroArch. Without
+ * RetroArch's keyboard, the game gets the text it started from. */
+static void kbd_run(void)
+{
+   struct bomba_text_input req;
+   bool pending;
+
+   if (!kbd.lock_init)
+      return;
+   EnterCriticalSection(&kbd.lock);
+   pending     = kbd.pending;
+   kbd.pending = false;
+   LeaveCriticalSection(&kbd.lock);
+   if (!pending)
+      return;
+
+   req.label   = kbd.label;
+   req.initial = kbd.initial;
+   req.done    = kbd_done;
+   if (!env_cb(RETRO_ENVIRONMENT_BOMBA_TEXT_INPUT, &req))
+   {
+      log_msg("keyboard: RetroArch can't ask; the game's own text kept");
+      kbd_done(kbd.initial);
+   }
+}
+
+static bool kbd_io(HANDLE pipe, HANDLE ev, void *buf, DWORD len, bool write)
+{
+   while (len)
+   {
+      OVERLAPPED o;
+      DWORD done = 0;
+
+      memset(&o, 0, sizeof(o));
+      o.hEvent = ev;
+      if (     !(write ? WriteFile(pipe, buf, len, NULL, &o)
+                       : ReadFile(pipe, buf, len, NULL, &o))
+            && GetLastError() != ERROR_IO_PENDING)
+         return false;
+      while (WaitForSingleObject(ev, 100) == WAIT_TIMEOUT)
+         if (kbd.stop)
+         {
+            CancelIo(pipe);
+            return false;
+         }
+      if (!GetOverlappedResult(pipe, &o, &done, FALSE) || !done)
+         return false;
+      buf  = (uint8_t*)buf + done;
+      len -= done;
+   }
+   return true;
+}
+
+/* The pipe: one keyboard at a time, until the core unloads. */
+static DWORD WINAPI kbd_main(LPVOID param)
+{
+   DWORD pid = (DWORD)(uintptr_t)param;
+   HANDLE ev = CreateEventW(NULL, TRUE, FALSE, NULL);
+   wchar_t name[64], label[KBD_TEXT_MAX], initial[KBD_TEXT_MAX];
+   uint32_t head[4], reply[2];
+
+   _snwprintf(name, 64, L"\\\\.\\pipe\\bomba-eden-kbd-%lu", (unsigned long)pid);
+   name[63] = L'\0';
+   while (!kbd.stop && ev)
+   {
+      HANDLE pipe = CreateNamedPipeW(name, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+            PIPE_TYPE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, NULL);
+      OVERLAPPED o;
+      bool connected;
+
+      if (pipe == INVALID_HANDLE_VALUE)
+      {
+         log_msg("keyboard: pipe not made (%lu)", (unsigned long)GetLastError());
+         break;
+      }
+      memset(&o, 0, sizeof(o));
+      o.hEvent  = ev;
+      ResetEvent(ev);
+      connected = ConnectNamedPipe(pipe, &o) || GetLastError() == ERROR_PIPE_CONNECTED;
+      if (!connected && GetLastError() == ERROR_IO_PENDING)
+      {
+         DWORD unused;
+         while (WaitForSingleObject(ev, 100) == WAIT_TIMEOUT && !kbd.stop);
+         if (kbd.stop)
+            CancelIo(pipe);
+         connected = !kbd.stop && GetOverlappedResult(pipe, &o, &unused, FALSE);
+      }
+
+      if (     connected
+            && kbd_io(pipe, ev, head, sizeof(head), false)
+            && head[0] == 0x31424B42 /* "BKB1" */
+            && head[2] <= KBD_TEXT_MAX && head[3] <= KBD_TEXT_MAX
+            && kbd_io(pipe, ev, label, head[2] * 2, false)
+            && kbd_io(pipe, ev, initial, head[3] * 2, false))
+      {
+         log_msg("keyboard: the game asks (\"%.*ls\", up to %u characters)",
+               (int)head[2], label, head[1]);
+         EnterCriticalSection(&kbd.lock);
+         kbd_utf8(label, head[2], kbd.label, sizeof(kbd.label));
+         kbd_utf8(initial, head[3], kbd.initial, sizeof(kbd.initial));
+         ResetEvent(kbd.answered);
+         kbd.pending = true;
+         LeaveCriticalSection(&kbd.lock);
+
+         while (WaitForSingleObject(kbd.answered, 100) == WAIT_TIMEOUT && !kbd.stop);
+         if (!kbd.stop)
+         {
+            EnterCriticalSection(&kbd.lock);
+            reply[0] = kbd.ok;
+            reply[1] = kbd.text_len;
+            LeaveCriticalSection(&kbd.lock);
+            if (     kbd_io(pipe, ev, reply, sizeof(reply), true)
+                  && kbd_io(pipe, ev, kbd.text, reply[1] * 2, true))
+               FlushFileBuffers(pipe);
+         }
+      }
+      DisconnectNamedPipe(pipe);
+      CloseHandle(pipe);
+   }
+   if (ev)
+      CloseHandle(ev);
+   return 0;
+}
+
+static void kbd_start(DWORD pid)
+{
+   if (!kbd.lock_init)
+   {
+      InitializeCriticalSection(&kbd.lock);
+      kbd.lock_init = true;
+   }
+   kbd.pending = false;
+   kbd.stop    = 0;
+   if (!kbd.answered)
+      kbd.answered = CreateEventW(NULL, TRUE, FALSE, NULL);
+   if (kbd.answered && !kbd.thread)
+      kbd.thread = CreateThread(NULL, 0, kbd_main, (LPVOID)(uintptr_t)pid, 0, NULL);
+}
+
+static void kbd_stop(void)
+{
+   if (!kbd.thread)
+      return;
+   kbd.stop = 1;
+   if (WaitForSingleObject(kbd.thread, 3000) != WAIT_OBJECT_0)
+      log_msg("keyboard thread didn't stop in time");
+   CloseHandle(kbd.thread);
+   kbd.thread = NULL;
+}
+
+/* Loads eden_kbd.dll (next to this core) into Eden. */
+static void kbd_inject(HANDLE process)
+{
+   wchar_t path[MAX_PATH * 2], *slash;
+   HMODULE self = NULL;
+   size_t size;
+   void *remote;
+   HANDLE thread;
+   DWORD code = 0;
+
+   if (     !GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS
+               | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+               (LPCWSTR)(void*)kbd_inject, &self)
+         || !GetModuleFileNameW(self, path, MAX_PATH * 2)
+         || !(slash = wcsrchr(path, L'\\')))
+      return;
+   wcscpy(slash + 1, L"eden_kbd.dll");
+   if (!file_exists(path))
+   {
+      log_msg("keyboard: eden_kbd.dll not found");
+      return;
+   }
+
+   size = (wcslen(path) + 1) * sizeof(wchar_t);
+   if (!(remote = VirtualAllocEx(process, NULL, size, MEM_COMMIT | MEM_RESERVE,
+               PAGE_READWRITE)))
+      return;
+   if (     WriteProcessMemory(process, remote, path, size, NULL)
+         && (thread = CreateRemoteThread(process, NULL, 0,
+               (LPTHREAD_START_ROUTINE)(void*)GetProcAddress(
+                  GetModuleHandleW(L"kernel32.dll"), "LoadLibraryW"),
+               remote, 0, NULL)))
+   {
+      WaitForSingleObject(thread, 10000);
+      GetExitCodeThread(thread, &code);
+      CloseHandle(thread);
+   }
+   VirtualFreeEx(process, remote, 0, MEM_RELEASE);
+   log_msg(code ? "keyboard: hooked into Eden"
+                : "keyboard: Eden's keyboard not found; it answers \"Eden\"");
+}
+
+/* Once Eden runs (the overlay starts it suspended), after its C runtime
+ * is up and well before the game loads: its network (multiplayer), and
+ * the keyboard. */
+static DWORD WINAPI emu_started_main(LPVOID param)
+{
+   HANDLE process = (HANDLE)param;
    int i;
 
    for (i = 0; i < 1200; i++)
@@ -1268,35 +1535,21 @@ static DWORD WINAPI network_init_main(LPVOID param)
    }
    Sleep(200);
 
-   if (     !query || query(process, 0, &info, sizeof(info), NULL) != 0
-         || !ReadProcessMemory(process, info.peb + 0x10, &base, sizeof(base), NULL))
-   {
-      log_msg("multiplayer: Eden's image base not read (%lu)", (unsigned long)GetLastError());
-      goto out;
-   }
-   thread = CreateRemoteThread(process, NULL, 0,
-         (LPTHREAD_START_ROUTINE)(ULONG_PTR)(base + network_init_rva), NULL, 0, NULL);
-   if (!thread)
-   {
-      log_msg("multiplayer: Eden's network not started (%lu)", (unsigned long)GetLastError());
-      goto out;
-   }
-   WaitForSingleObject(thread, 10000);
-   GetExitCodeThread(thread, &code);
-   CloseHandle(thread);
-   log_msg("multiplayer: Eden's network started (%lu)", (unsigned long)(code & 0xff));
+   if (network_init_rva)
+      network_init(process);
+   kbd_inject(process);
 out:
    CloseHandle(process);
    return 0;
 }
 
-static void start_network_init(HANDLE process)
+static void start_emu_helpers(HANDLE process)
 {
    HANDLE dup, thread;
    if (!DuplicateHandle(GetCurrentProcess(), process, GetCurrentProcess(), &dup,
          0, FALSE, DUPLICATE_SAME_ACCESS))
       return;
-   if ((thread = CreateThread(NULL, 0, network_init_main, dup, 0, NULL)))
+   if ((thread = CreateThread(NULL, 0, emu_started_main, dup, 0, NULL)))
       CloseHandle(thread);
    else
       CloseHandle(dup);
@@ -1616,7 +1869,30 @@ static HWND current_emu_window(void)
    return s.best;
 }
 
-static bool try_foreground(void)
+/* A dialog Eden shows over the game (the Switch keyboard, an error): a
+ * visible window of its other than the game window, owned by one of its
+ * windows or always on top. */
+static BOOL CALLBACK find_emu_popup(HWND hwnd, LPARAM out)
+{
+   DWORD pid = 0;
+
+   GetWindowThreadProcessId(hwnd, &pid);
+   if (     pid != emu_pid || hwnd == ov.emu || !IsWindowVisible(hwnd)
+         || (     !GetWindow(hwnd, GW_OWNER)
+               && !(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)))
+      return TRUE;
+   *(HWND*)out = hwnd;
+   return FALSE;
+}
+
+static HWND current_emu_popup(void)
+{
+   HWND popup = NULL;
+   EnumWindows(find_emu_popup, (LPARAM)&popup);
+   return popup;
+}
+
+static bool try_foreground_window(HWND hwnd)
 {
    HWND fg       = GetForegroundWindow();
    DWORD fg_tid  = fg ? GetWindowThreadProcessId(fg, NULL) : 0;
@@ -1624,10 +1900,15 @@ static bool try_foreground(void)
 
    if (fg_tid && fg_tid != our_tid)
       AttachThreadInput(our_tid, fg_tid, TRUE);
-   SetForegroundWindow(ov.ra);
+   SetForegroundWindow(hwnd);
    if (fg_tid && fg_tid != our_tid)
       AttachThreadInput(our_tid, fg_tid, FALSE);
-   return GetForegroundWindow() == ov.ra;
+   return GetForegroundWindow() == hwnd;
+}
+
+static bool try_foreground(void)
+{
+   return try_foreground_window(ov.ra);
 }
 
 /* Brings RetroArch's window to the front with focus. Windows only lets a
@@ -2009,6 +2290,41 @@ static void arrange(void)
       place_emu(true);
    }
 
+   /* A dialog of Eden's (an error): over RetroArch, with focus, until it
+    * closes. */
+   if ((hwnd = current_emu_popup()))
+   {
+      if (hwnd != ov.popup)
+      {
+         ov.popup = hwnd;
+         SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
+               SWP_NOMOVE | SWP_NOSIZE | SWP_NOOWNERZORDER);
+         log_msg("Eden dialog %p shown: %s", (void*)hwnd,
+               GetForegroundWindow() == hwnd || try_foreground_window(hwnd)
+               ? "focused" : "focus refused");
+      }
+      else
+      {
+         /* Back over RetroArch's window if that came over it. */
+         HWND w;
+         for (w = GetWindow(hwnd, GW_HWNDPREV); w; w = GetWindow(w, GW_HWNDPREV))
+            if (w == ov.ra)
+            {
+               SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE
+                     | SWP_NOSIZE | SWP_NOOWNERZORDER | SWP_NOACTIVATE);
+               break;
+            }
+      }
+      return;
+   }
+   if (ov.popup)
+   {
+      ov.popup = NULL;
+      log_msg("Eden dialog closed");
+      focus_ra();
+      return;
+   }
+
    /* Eden got focus somehow: give it back to RetroArch. */
    if ((fg = GetForegroundWindow()))
       GetWindowThreadProcessId(fg, &fg_pid);
@@ -2185,7 +2501,9 @@ static DWORD WINAPI manager_main(LPVOID unused)
       }
       /* Not in multiplayer: a suspended Eden stops answering the room, and
        * the other players' games drop it (communication error). */
-      else if (stalled && ov.suspend && !mp.active)
+      /* Nor while a dialog of Eden's is up: RetroArch pauses as it loses
+       * focus to it, and the game waits on it. */
+      else if (stalled && ov.suspend && !mp.active && !ov.popup)
       {
          /* Minimized: hide Eden first, its window can't be handled while
           * suspended. */
@@ -2223,6 +2541,7 @@ static void overlay_start(void)
    ov.styled        = false;
    ov.ra            = NULL;
    ov.emu           = NULL;
+   ov.popup         = NULL;
    ov.emu_thread    = NULL;
    ov.loading_since = GetTickCount();
    ov.audio_seen    = 0;
@@ -2321,6 +2640,7 @@ static struct
    HANDLE thread;
    wchar_t exe[MAX_PATH * 2];
    wchar_t cli[MAX_PATH * 2];
+   bool use_cli;        /* eden-cli.exe plays, else eden.exe (no eden-cli) */
    wchar_t rom[MAX_PATH * 2];
    wchar_t workdir[MAX_PATH * 2];
    bool overlay;        /* hand Eden over suspended to the manager thread */
@@ -2366,23 +2686,122 @@ static const wchar_t *cli_game_path(const wchar_t *rom, wchar_t *alias, size_t a
 /* The grid profile's name (BOMBA_PROFILE), read at load. */
 static char profile_name[64];
 
-/* Names Eden's Switch user after the grid profile: the name games show,
- * other players too. Only the name changes, not the user's id, which
- * its saves are kept by. Its first user is the one Eden plays as; Eden
- * makes the file the first time it runs. */
+/* A Switch user id as Eden names its save folders: the id's two
+ * little-endian halves, high one first, in hex (32 digits). */
+static void user_id_folder(const unsigned char id[16], wchar_t out[33])
+{
+   int i;
+   for (i = 0; i < 16; i++)
+      _snwprintf(out + 2 * i, 3, L"%02X", id[15 - i]);
+   out[32] = L'\0';
+}
+
+/* The grid profile's own Switch user id, kept with its saves
+ * (<save dir>\eden-user.txt: the save folder name), so it follows them to
+ * other PCs (Steam Cloud) and every profile is a user of its own. The
+ * first time: the id Eden has saved under in this profile already (its
+ * save folder is there), unless that is Ryujinx's default (…0001, from a
+ * migrated Ryujinx), which is every Ryujinx player's and which games that
+ * tell players apart online refuse (Super Mario Odyssey Online); else a
+ * new one. The save folder of an old id is renamed to the new one. */
+static bool profile_user_id(const unsigned char *current, unsigned char id[16])
+{
+   static const unsigned char ryujinx[16] = { 1 };
+   wchar_t dir[MAX_PATH * 2], path[MAX_PATH * 2], from[MAX_PATH * 2];
+   wchar_t old_name[33], new_name[33];
+   char hex[40] = {0};
+   bool have = false;
+   FILE *f;
+   int i;
+
+   if (!save_dir_cache[0] || !to_wide(save_dir_cache, dir, MAX_PATH * 2))
+      return false;
+   _snwprintf(path, MAX_PATH * 2, L"%ls\\eden-user.txt", dir);
+   path[MAX_PATH * 2 - 1] = L'\0';
+
+   /* Saved: the folder name back into the id's bytes. */
+   if ((f = _wfopen(path, L"r")))
+   {
+      if (fgets(hex, sizeof(hex), f) && strlen(hex) >= 32)
+      {
+         have = true;
+         for (i = 0; i < 16 && have; i++)
+         {
+            unsigned v;
+            if (sscanf(hex + 2 * i, "%2x", &v) != 1)
+               have = false;
+            id[15 - i] = (unsigned char)v;
+         }
+      }
+      fclose(f);
+   }
+   if (have)
+      return true;
+
+   user_id_folder(current, old_name);
+   _snwprintf(from, MAX_PATH * 2, L"%ls\\save\\0000000000000000\\%ls", dir,
+         old_name);
+   from[MAX_PATH * 2 - 1] = L'\0';
+   if (     memcmp(current, ryujinx, 16)
+         && GetFileAttributesW(from) != INVALID_FILE_ATTRIBUTES)
+      memcpy(id, current, 16);
+   else
+   {
+      GUID g;
+      if (FAILED(CoCreateGuid(&g)))
+         return false;
+      memcpy(id, &g, 16);
+   }
+
+   /* The saves under the old id (Ryujinx's in this profile) move over. */
+   user_id_folder(id, new_name);
+   if (memcmp(id, current, 16))
+   {
+      wchar_t ry[33], to[MAX_PATH * 2];
+      user_id_folder(ryujinx, ry);
+      _snwprintf(from, MAX_PATH * 2, L"%ls\\save\\0000000000000000\\%ls", dir, ry);
+      from[MAX_PATH * 2 - 1] = L'\0';
+      _snwprintf(to, MAX_PATH * 2, L"%ls\\save\\0000000000000000\\%ls", dir,
+            new_name);
+      to[MAX_PATH * 2 - 1] = L'\0';
+      if (     GetFileAttributesW(from) != INVALID_FILE_ATTRIBUTES
+            && GetFileAttributesW(to) == INVALID_FILE_ATTRIBUTES)
+      {
+         if (MoveFileW(from, to))
+            log_msg("Switch saves moved to user %ls", new_name);
+         else
+         {
+            log_msg("couldn't move the Switch saves to user %ls (%lu)",
+                  new_name, (unsigned long)GetLastError());
+            return false;
+         }
+      }
+   }
+
+   if (!(f = _wfopen(path, L"w")))
+      return false;
+   fprintf(f, "%ls\n", new_name);
+   fclose(f);
+   log_msg("Switch user id %ls", new_name);
+   return true;
+}
+
+/* Sets Eden's Switch user up as the grid profile: its id (see
+ * profile_user_id) and its name, the one games show, other players too.
+ * Its first user is the one Eden plays as; Eden makes the file the first
+ * time it runs. */
 static void name_switch_user(const wchar_t *workdir)
 {
    /* yuzu's ProfileDataRaw: 0x10 bytes, then 8 users of 0xC8: id (0x10),
     * second id (0x10), timestamp (8), name (0x20, UTF-8, NUL-padded)... */
-   unsigned char data[0x650], name[0x20];
+   unsigned char data[0x650], name[0x20], id[16];
    unsigned char *user = NULL;
    wchar_t path[MAX_PATH * 2];
    const unsigned char *s;
    size_t i, n, chars;
+   bool changed = false;
    FILE *f;
 
-   if (!profile_name[0])
-      return;
    _snwprintf(path, MAX_PATH * 2, L"%ls\\user\\nand\\system\\save\\8000000000000010"
          L"\\su\\avators\\profiles.dat", workdir);
    path[MAX_PATH * 2 - 1] = L'\0';
@@ -2408,6 +2827,14 @@ static void name_switch_user(const wchar_t *workdir)
    if (!user)
       return;
 
+   /* Both ids are the user's. */
+   if (profile_user_id(user, id) && memcmp(user, id, 16))
+   {
+      memcpy(user, id, 16);
+      memcpy(user + 0x10, id, 16);
+      changed = true;
+   }
+
    /* At most 10 characters, as on a Switch, whole UTF-8 sequences only,
     * and a NUL after. */
    memset(name, 0, sizeof(name));
@@ -2421,14 +2848,18 @@ static void name_switch_user(const wchar_t *workdir)
       s += len;
       chars++;
    }
-   if (!n || !memcmp(user + 0x28, name, sizeof(name)))
+   if (n && memcmp(user + 0x28, name, sizeof(name)))
+   {
+      memcpy(user + 0x28, name, sizeof(name));
+      changed = true;
+   }
+   if (!changed)
       return;
 
-   memcpy(user + 0x28, name, sizeof(name));
    if ((f = _wfopen(path, L"wb")))
    {
       if (fwrite(data, 1, sizeof(data), f) == sizeof(data))
-         log_msg("Switch user named \"%s\"", (const char*)name);
+         log_msg("Switch user \"%s\" written", (const char*)(user + 0x28));
       fclose(f);
    }
 }
@@ -2443,7 +2874,9 @@ static DWORD WINAPI launch_main(LPVOID unused)
    BOOL ok;
 
    (void)unused;
-   if (mp.active && !(network_init_rva = find_network_init(launch.cli)))
+   network_init_rva = 0;
+   if (     mp.active && launch.use_cli
+         && !(network_init_rva = find_network_init(launch.cli)))
    {
       log_msg("multiplayer: Network::Init not found in eden-cli.exe; playing alone");
       launch.message = "Multiplayer doesn't work with this Eden version. Playing alone.";
@@ -2455,11 +2888,11 @@ static DWORD WINAPI launch_main(LPVOID unused)
       mp.active      = false;
    }
 
-   write_config(launch.exe, mp.active);
+   write_config(launch.exe, launch.use_cli);
    link_saves(launch.exe);
    name_switch_user(launch.workdir);
 
-   if (mp.active)
+   if (launch.use_cli && mp.active)
    {
       const wchar_t *game = cli_game_path(launch.rom, alias, MAX_PATH * 2);
       log_msg("multiplayer: joining %s:%u as \"%s\"%s", mp.address, mp.port, mp.nick,
@@ -2476,8 +2909,12 @@ static DWORD WINAPI launch_main(LPVOID unused)
    }
    else
    {
+      const wchar_t *game = launch.use_cli
+         ? cli_game_path(launch.rom, alias, MAX_PATH * 2) : launch.rom;
+      if (launch.use_cli)
+         exe = launch.cli;
       _snwprintf(cmdline, MAX_PATH * 6, L"\"%ls\" %ls-g \"%ls\"",
-            exe, launch.fullscreen ? L"-f " : L"", launch.rom);
+            exe, launch.fullscreen ? L"-f " : L"", game);
       log_msg("starting: %ls", cmdline);
    }
    cmdline[MAX_PATH * 6 - 1] = L'\0';
@@ -2510,8 +2947,11 @@ static DWORD WINAPI launch_main(LPVOID unused)
 
    emu_process = pi.hProcess;
    emu_pid     = pi.dwProcessId;
-   if (mp.active)
-      start_network_init(pi.hProcess);
+   if (launch.use_cli)
+   {
+      kbd_start(pi.dwProcessId);
+      start_emu_helpers(pi.hProcess);
+   }
    if (launch.overlay)
       InterlockedExchangePointer((PVOID volatile*)&ov.emu_thread, pi.hThread);
    else
@@ -2567,9 +3007,20 @@ RETRO_API void retro_deinit(void)
 {
    launch_join();
    overlay_stop();
+   kbd_stop();
    release_process();
    stop_room();
    loading_close();
+   if (kbd.lock_init)
+   {
+      DeleteCriticalSection(&kbd.lock);
+      kbd.lock_init = false;
+   }
+   if (kbd.answered)
+   {
+      CloseHandle(kbd.answered);
+      kbd.answered = NULL;
+   }
    if (config_lock_init)
    {
       DeleteCriticalSection(&config_lock);
@@ -2626,6 +3077,7 @@ RETRO_API void retro_run(void)
 
    if (ov.active)
       overlay_run();
+   kbd_run();
 
    /* The launch thread finished: what it had to say, and the end if Eden
     * didn't start. */
@@ -2725,16 +3177,18 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    }
 
    read_multiplayer_settings();
-   if (mp.active)
+   /* The game plays in eden-cli.exe, which comes with Eden: it joins rooms
+    * from its command line (see "Multiplayer"), and has the Switch
+    * keyboard through RetroArch (see "Switch keyboard"). */
+   _snwprintf(launch.cli, MAX_PATH * 2, L"%ls\\eden-cli.exe", launch.workdir);
+   launch.cli[MAX_PATH * 2 - 1] = L'\0';
+   launch.use_cli = file_exists(launch.cli);
+   if (!launch.use_cli)
    {
-      _snwprintf(launch.cli, MAX_PATH * 2, L"%ls\\eden-cli.exe", launch.workdir);
-      launch.cli[MAX_PATH * 2 - 1] = L'\0';
-      if (!file_exists(launch.cli))
-      {
-         log_msg("multiplayer: eden-cli.exe not found");
+      log_msg("eden-cli.exe not found: eden.exe plays, alone");
+      if (mp.active)
          show_message("Multiplayer needs eden-cli.exe, which comes with Eden. Playing alone.");
-         mp.active = false;
-      }
+      mp.active = false;
    }
 
    /* What the launch thread needs from RetroArch. */
@@ -2814,6 +3268,7 @@ RETRO_API void retro_unload_game(void)
     * normally rather than killing it, so it can flush saves. */
    if (emu_process && WaitForSingleObject(emu_process, 0) == WAIT_TIMEOUT)
       EnumWindows(close_window, (LPARAM)emu_pid);
+   kbd_stop();
    release_process();
    stop_room();
    loading_close();

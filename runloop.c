@@ -144,6 +144,7 @@
 #endif
 #ifdef HAVE_XMB
 #include "bomba/grid_home.h"
+#include "bomba/bomba_text_input.h"
 #include "bomba/bomba_multiplayer.h"
 #endif
 
@@ -1984,6 +1985,9 @@ bool runloop_environment_cb(unsigned cmd, void *data)
          RARCH_LOG("[Environ] GET_SAVE_DIRECTORY: \"%s\".\n",
                runloop_st->savefile_dir);
          break;
+
+      case RETRO_ENVIRONMENT_BOMBA_TEXT_INPUT:
+         return grid_home_text_input((const struct bomba_text_input*)data);
 
       case RETRO_ENVIRONMENT_GET_USERNAME:
          *(const char**)data = *settings->paths.username

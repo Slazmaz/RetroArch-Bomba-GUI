@@ -57,9 +57,11 @@
 #include "bomba_setup.h"
 #include "bomba_clipboard.h"
 #include "bomba_keymap.h"
+#include "bomba_text_input.h"
 #include "grid_updates.h"
 #include "bomba_version.h"
 #include "grid_switch.h"
+#include "grid_switch_addons.h"
 #include "grid_cheevos.h"
 #include "grid_controls.h"
 #include "grid_coreopts.h"
@@ -263,16 +265,20 @@ enum grid_panel
    PANEL_ART,      /* choosing the game's cover art or wallpaper */
    PANEL_UPDATES,  /* Installs: updates and things to install */
    PANEL_SETUP,    /* first start: SteamGridDB key, RetroAchievements login */
-   PANEL_INVITE    /* Steam friends to invite into the session */
+   PANEL_INVITE,   /* Steam friends to invite into the session */
+   PANEL_ADDONS    /* a Switch game's mods, or its updates and DLC */
 };
 
 /* Game menu entries, in order. Settings are its console's (its emulator's
- * settings, bindings, which emulator); Quit game shows only for the
- * running game, last and in red, set apart from the rest. */
+ * settings, bindings, which emulator); Mods and Updates and DLC show only
+ * for Switch games; Quit game shows only for the running game, last and in
+ * red, set apart from the rest. */
 enum grid_game_menu_item
 {
    GAME_MENU_SETTINGS = 0,
    GAME_MENU_CHEEVOS,
+   GAME_MENU_MODS,
+   GAME_MENU_UPDATES,
    GAME_MENU_COVER,
    GAME_MENU_WALLPAPER,
    GAME_MENU_QUIT,
@@ -282,6 +288,8 @@ enum grid_game_menu_item
 static const char *grid_game_menu_label[GAME_MENU_COUNT] = {
    "Settings",
    "Achievements",
+   "Mods",
+   "Updates and DLC",
    "Change cover art",
    "Change wallpaper",
    "Quit game"
@@ -511,8 +519,24 @@ enum grid_kb
    KB_PROFILE_NAME,
    KB_MENU,         /* RetroArch's own text entry, in the Settings screen */
    KB_DOWNLOADS,    /* the Installs screen's search */
-   KB_SETUP         /* a field on the Setup screen */
+   KB_SETUP,        /* a field on the Setup screen */
+   KB_GAME          /* a game's keyboard, through its core (grid_text) */
 };
+
+/* A core's request for text (bomba_text_input.h): the menu opens with only
+ * the on-screen keyboard over the game, and closes once answered. */
+static struct
+{
+   bool waiting;     /* the menu to open, then the keyboard */
+   bool typing;      /* its keyboard is up */
+   bool shown;       /* the menu is the keyboard only, until it closes */
+   bool close;       /* answered: the menu to close */
+   char label[128];
+   char initial[256];
+   void (*done)(const char *text);
+} grid_text;
+
+static void grid_text_finish(const char *text);
 
 static struct
 {
@@ -603,6 +627,9 @@ static struct
    retro_time_t dl_hold_full_at;
    size_t list_view[GRID_MAX_CHEEVOS];
    size_t list_count;
+   /* Add-ons screen: the game menu entry it was opened from (Mods or
+    * Updates and DLC); its first card adds one, the rest are the list. */
+   unsigned addons_item;
 
    /* Multiplayer guest: the game started for the host's
     * ("system\ttitle"), so it starts once. */
@@ -1705,6 +1732,18 @@ void grid_home_toggle(bool menu_on)
    grid_st.gm_open    = false;
    grid_st.gm_closing = false;
 
+   /* A game's keyboard (grid_text): the menu is only that until it
+    * closes; closed before it was answered, it's cancelled. */
+   if (menu_on)
+      grid_text.shown = grid_text.waiting;
+   else if (grid_text.typing)
+   {
+      input_keyboard_line_free(input_state_get_ptr());
+      menu_input_dialog_end();
+      grid_st.kb = KB_SEARCH;
+      grid_text_finish(NULL);
+   }
+
    /* Opening over a game: the menu fades in over it; closing back to it,
     * out. */
    grid_st.open_start  = (menu_on && grid_content_running())
@@ -2560,9 +2599,16 @@ static unsigned grid_game_menu_items(unsigned *items)
    unsigned i, n = 0;
    bool running  = grid_st.menu_game < grid_st.count
       && grid_is_running(&grid_st.games[grid_st.menu_game]);
+   /* Switch games (as an .nsp or .xci, which the add-ons read the title
+    * ID from). */
+   const char *ext = grid_st.menu_game < grid_st.count
+      ? path_get_extension(grid_st.games[grid_st.menu_game].path) : "";
+   bool sw       = string_is_equal_noncase(ext, "nsp")
+                || string_is_equal_noncase(ext, "xci");
 
    for (i = 0; i < GAME_MENU_COUNT; i++)
-      if (i != GAME_MENU_QUIT || running)
+      if (     (i != GAME_MENU_QUIT || running)
+            && ((i != GAME_MENU_MODS && i != GAME_MENU_UPDATES) || sw))
          items[n++] = i;
    return n;
 }
@@ -3298,6 +3344,13 @@ static void grid_open_game_screen(unsigned item)
       grid_cheevos_open(grid_meta_game_id(game->path));
       grid_st.panel = PANEL_CHEEVOS;
    }
+   else if (item == GAME_MENU_MODS || item == GAME_MENU_UPDATES)
+   {
+      grid_addons_open(game->path, item == GAME_MENU_MODS
+            ? GRID_ADDON_MODS : GRID_ADDON_UPDATES);
+      grid_st.addons_item = item;
+      grid_st.panel       = PANEL_ADDONS;
+   }
    else
    {
       grid_free_art();
@@ -3514,12 +3567,16 @@ static void grid_open_picker(unsigned profile)
  * or the selection or screen changing, first cancels). */
 static void grid_dl_hold_iterate(void)
 {
+   /* On the add-ons screen the item is the card (see PANEL_ADDONS). */
+   bool addons = grid_st.panel == PANEL_ADDONS;
+
    if (!grid_st.dl_hold_start)
       return;
 
-   if (     grid_st.panel != PANEL_UPDATES
-         || grid_st.panel_sel >= grid_st.list_count
-         || grid_st.list_view[grid_st.panel_sel] != grid_st.dl_hold_item
+   if (     (!addons && grid_st.panel != PANEL_UPDATES)
+         || (!addons && (grid_st.panel_sel >= grid_st.list_count
+            || grid_st.list_view[grid_st.panel_sel] != grid_st.dl_hold_item))
+         || (addons && grid_st.panel_sel != grid_st.dl_hold_item)
          || !(menu_driver_scan_held() || grid_st.mouse_left))
    {
       grid_st.dl_hold_start   = 0;
@@ -3534,7 +3591,14 @@ static void grid_dl_hold_iterate(void)
       grid_st.dl_hold_start   = 0;
       grid_st.dl_hold_full_at = 0;
       grid_st.dl_hold_blend   = 0.0f;
-      grid_updates_remove(grid_st.dl_hold_item, grid_running_core());
+      if (addons)
+      {
+         grid_addons_remove(grid_st.dl_hold_item - 1, grid_running_core());
+         if (grid_st.panel_sel > grid_addons_count())
+            grid_st.panel_sel = (unsigned)grid_addons_count();
+      }
+      else
+         grid_updates_remove(grid_st.dl_hold_item, grid_running_core());
    }
 }
 
@@ -3559,6 +3623,7 @@ void grid_home_iterate(void)
    }
 
    grid_input_mode_poll();
+   grid_addons_poll();
    grid_dl_hold_iterate();
    grid_mp_follow_host();
 
@@ -3708,6 +3773,41 @@ static void grid_panel_action(enum menu_action action)
          case MENU_ACTION_CANCEL:
             grid_st.panel = PANEL_NONE;
             break;
+         default:
+            sel = grid_move_in_grid(sel, n, GRID_DL_COLS, action);
+            break;
+      }
+   }
+   else if (grid_st.panel == PANEL_ADDONS)
+   {
+      /* Card 0 adds one; card i + 1 is entry i. */
+      char detail[128];
+      size_t n  = grid_addons_count() + 1;
+      bool busy = grid_addons_state(detail, sizeof(detail))
+         == GRID_ADDONS_WORKING;
+
+      switch (action)
+      {
+         case MENU_ACTION_OK:     /* A : add / turn a mod on or off */
+            if (busy)
+               return;
+            if (sel == 0)
+               grid_addons_browse(grid_running_core());
+            else if (grid_st.addons_item == GAME_MENU_MODS)
+               grid_addons_toggle(sel - 1, grid_running_core());
+            return;
+         case MENU_ACTION_SCAN:   /* X : remove, once held (as on Installs) */
+            if (sel == 0 || sel >= n || busy || grid_st.dl_hold_start)
+               return;
+            grid_st.dl_hold_item    = sel;
+            grid_st.dl_hold_start   = cpu_features_get_time_usec();
+            grid_st.dl_hold_full_at = 0;
+            return;
+         case MENU_ACTION_CANCEL:
+            grid_addons_close();
+            grid_st.panel     = PANEL_GAME_MENU;
+            grid_st.panel_sel = grid_game_menu_row(grid_st.addons_item);
+            return;
          default:
             sel = grid_move_in_grid(sel, n, GRID_DL_COLS, action);
             break;
@@ -4056,8 +4156,9 @@ bool grid_home_entry_action(enum menu_action action, unsigned xmb_depth)
     * repeats are no new press. */
    bool holding = (action == MENU_ACTION_OK   && grid_st.exit_hold_start)
                || (action == MENU_ACTION_SCAN && grid_st.dl_hold_start);
-   bool updates_scan = action == MENU_ACTION_SCAN
-               && grid_st.panel == PANEL_UPDATES && !grid_st.settings;
+   bool updates_scan = action == MENU_ACTION_SCAN && !grid_st.settings
+               && (grid_st.panel == PANEL_UPDATES
+                || grid_st.panel == PANEL_ADDONS);
    grid_cursor_t before, after;
    bool done;
 
@@ -4584,8 +4685,100 @@ static void grid_edit_cancel(void)
    input_keyboard_line_free(input_st);
    input_st->flags &= ~INP_FLAG_KB_MAPPING_BLOCKED;
    menu_input_dialog_end();
-   if (grid_st.kb != KB_MENU)
+   if (grid_st.kb == KB_GAME)
+   {
       grid_st.kb = KB_SEARCH;
+      grid_text_finish(NULL);
+   }
+   else if (grid_st.kb != KB_MENU)
+      grid_st.kb = KB_SEARCH;
+}
+
+/* The request answered (text NULL: cancelled): told to the core, and the
+ * menu closes (grid_home_text_input_poll). */
+static void grid_text_finish(const char *text)
+{
+   void (*done)(const char *text) = grid_text.done;
+
+   if (!grid_text.waiting && !grid_text.typing)
+      return;
+   grid_text.waiting = false;
+   grid_text.typing  = false;
+   grid_text.done    = NULL;
+   grid_text.close   = true;
+   if (done)
+      done(text);
+}
+
+static void grid_text_done(void *userdata, const char *line)
+{
+   char text[sizeof(grid_text.initial)];
+
+   strlcpy(text, line ? line : "", sizeof(text));
+   menu_input_dialog_end();
+   grid_st.kb = KB_SEARCH;
+   grid_text_finish(text);
+}
+
+bool grid_home_text_input(const struct bomba_text_input *req)
+{
+   if (!req || !req->done || grid_text.waiting || grid_text.typing)
+      return false;
+   strlcpy(grid_text.label, req->label ? req->label : "", sizeof(grid_text.label));
+   strlcpy(grid_text.initial, req->initial ? req->initial : "",
+         sizeof(grid_text.initial));
+   grid_text.done    = req->done;
+   grid_text.waiting = true;
+   grid_text.close   = false;
+   return true;
+}
+
+void grid_home_text_input_poll(void)
+{
+   bool alive = (menu_state_get_ptr()->flags & MENU_ST_FLAG_ALIVE) ? true : false;
+   menu_input_ctx_line_t line;
+
+   /* The game closed meanwhile: dropped, its core is gone. */
+   if ((grid_text.waiting || grid_text.typing) && !grid_content_running())
+   {
+      if (grid_text.typing && grid_st.kb == KB_GAME)
+      {
+         input_keyboard_line_free(input_state_get_ptr());
+         menu_input_dialog_end();
+         grid_st.kb = KB_SEARCH;
+      }
+      grid_text.waiting = false;
+      grid_text.typing  = false;
+      grid_text.done    = NULL;
+   }
+   if (grid_text.close)
+   {
+      grid_text.close = false;
+      if (alive && grid_content_running())
+         command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+      return;
+   }
+   if (!grid_text.waiting)
+      return;
+   if (!alive)
+   {
+      command_event(CMD_EVENT_MENU_TOGGLE, NULL);
+      return;
+   }
+
+   line.label         = grid_text.label;
+   line.label_setting = "";
+   line.type          = 0;
+   line.idx           = 0;
+   line.cb            = grid_text_done;
+
+   grid_text.waiting = false;
+   grid_text.typing  = true;
+   grid_st.kb        = KB_GAME;
+   menu_input_dialog_start(&line);
+   if (grid_text.initial[0])
+      input_keyboard_line_append(grid_edit_line(), grid_text.initial,
+            strlen(grid_text.initial));
 }
 
 /* The line's byte nearest the pointer, in the field as last drawn. */
@@ -7789,7 +7982,8 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
                      || grid_st.panel == PANEL_ICONS
                      || grid_st.panel == PANEL_UPDATES
                      || grid_st.panel == PANEL_SETUP
-                     || grid_st.panel == PANEL_INVITE;
+                     || grid_st.panel == PANEL_INVITE
+                     || grid_st.panel == PANEL_ADDONS;
 
    /* Icon bar: 27px circles, 9px apart. */
    if (!full_screen)
@@ -8321,6 +8515,7 @@ static void grid_draw_top_bar(gfx_display_t *p_disp, void *userdata,
          case PANEL_ICONS:
          case PANEL_SETUP:
          case PANEL_INVITE:
+         case PANEL_ADDONS:
             srt = con = NULL;
             break;
          default:
@@ -8472,6 +8667,32 @@ static void grid_draw_bottom_bar(gfx_display_t *p_disp, void *userdata,
    else if (grid_st.panel == PANEL_GAME_MENU)
    {
       glyphs[n] = "A"; labels[n++] = "Open";
+      glyphs[n] = "B"; labels[n++] = "Back";
+   }
+   else if (grid_st.panel == PANEL_ADDONS)
+   {
+      char detail[128];
+      enum grid_addons_state st = grid_addons_state(detail, sizeof(detail));
+      const grid_addon_t *a     = grid_st.panel_sel
+         ? grid_addons_get(grid_st.panel_sel - 1) : NULL;
+      bool mods                 = grid_st.addons_item == GAME_MENU_MODS;
+
+      if (st != GRID_ADDONS_NO_GAME && st != GRID_ADDONS_WORKING)
+      {
+         if (a)
+         {
+            glyphs[n] = "X"; labels[n++] = "Hold to remove";
+         }
+         if (!grid_st.panel_sel)
+         {
+            glyphs[n] = "A"; labels[n++] = mods ? "Add mod"
+               : "Add update or DLC";
+         }
+         else if (a && mods)
+         {
+            glyphs[n] = "A"; labels[n++] = a->on ? "Turn off" : "Turn on";
+         }
+      }
       glyphs[n] = "B"; labels[n++] = "Back";
    }
    else if (grid_st.panel == PANEL_INVITE)
@@ -9685,6 +9906,151 @@ static void grid_draw_invite_screen(gfx_display_t *p_disp, void *userdata,
       grid_fit_text(false, detail, tw, height, ss, line, sizeof(line));
       grid_draw_text(line, tx, grid_text_y(mid + REF(8), height, ss),
             width, height, dcol, TEXT_ALIGN_LEFT, ss);
+   }
+}
+
+/* Add-ons screen (a Switch game's Mods, or its Updates and DLC): cards as
+ * on Installs. The first adds one (the system's Open dialog), its second
+ * line how adding goes; then one per mod (on in green, off in grey) or per
+ * update / DLC. X held removes one (the red ring, as on Installs). */
+static void grid_draw_addons_screen(gfx_display_t *p_disp, void *userdata,
+      unsigned width, unsigned height)
+{
+   static size_t first_row = 0;
+   bool mods        = grid_st.addons_item == GAME_MENU_MODS;
+   const char *title = grid_st.menu_game < grid_st.count
+      ? grid_st.games[grid_st.menu_game].title : "";
+   float left       = REF(35);
+   float top        = REF(70);
+   float area_h     = REF(364) - top;
+   float cgap       = REF(10);
+   float card_w     = (width - 2.0f * left - (GRID_DL_COLS - 1) * cgap)
+                      / GRID_DL_COLS;
+   float card_h     = REF(46);
+   float cpad       = REF(12);
+   float ts         = CAP(GRID_TEXT_CAP);
+   float ss         = CAP(GRID_TEXT_CAP - 2);
+   char detail[128];
+   enum grid_addons_state st = grid_addons_state(detail, sizeof(detail));
+   size_t i, n      = grid_addons_count() + 1, rows, sel_row;
+   const char *parts[2];
+
+   parts[0] = mods ? "Mods" : "Updates and DLC";
+   parts[1] = title;
+   grid_draw_screen_heading(p_disp, userdata, width, height, parts, 2);
+
+   if (st == GRID_ADDONS_NO_GAME)
+   {
+      grid_draw_text(detail, width / 2.0f,
+            grid_text_y(top + area_h / 2.0f, height, ts), width, height,
+            COL_TEXT_SOFT, TEXT_ALIGN_CENTER, ts);
+      return;
+   }
+   if (grid_st.panel_sel >= n)
+      grid_st.panel_sel = (unsigned)n - 1;
+
+   /* Keep the selected row visible. */
+   rows = (size_t)((area_h + cgap) / (card_h + cgap));
+   if (rows < 1)
+      rows = 1;
+   sel_row = grid_st.panel_sel / GRID_DL_COLS;
+   if (sel_row < first_row)
+      first_row = sel_row;
+   else if (sel_row >= first_row + rows)
+      first_row = sel_row - rows + 1;
+   grid_draw_scrollbar(p_disp, userdata, width, height, top, area_h,
+         first_row, rows, (n + GRID_DL_COLS - 1) / GRID_DL_COLS);
+
+   for (i = first_row * GRID_DL_COLS;
+         i < n && i < (first_row + rows) * GRID_DL_COLS; i++)
+   {
+      const grid_addon_t *a = i ? grid_addons_get(i - 1) : NULL;
+      size_t col    = i % GRID_DL_COLS;
+      size_t row    = i / GRID_DL_COLS - first_row;
+      float cx      = floorf(left + col * (card_w + cgap) + 0.5f);
+      float cy      = floorf(top + row * (card_h + cgap) + 0.5f);
+      float mid     = cy + card_h / 2.0f;
+      float tx      = cx + cpad;
+      float tw      = card_w - 2.0f * cpad;
+      const char *name, *line2;
+      uint32_t dcol = COL_TEXT_SOFT;
+      char line[320];
+
+      if (i && !a)
+         break;
+
+      grid_hit_add(cx, cy, card_w, card_h, HIT_PANEL, (unsigned)i,
+            MENU_ACTION_OK);
+      if (i == grid_st.panel_sel)
+      {
+         bool holding = grid_st.dl_hold_start && grid_st.dl_hold_item == i;
+         float target = holding ? 1.0f : 0.0f;
+
+         if (grid_st.dl_hold_item != i)
+            grid_st.dl_hold_blend = 0.0f; /* moved off it */
+         grid_st.dl_hold_blend += (target - grid_st.dl_hold_blend) * 0.08f;
+         if (fabsf(target - grid_st.dl_hold_blend) < 0.01f)
+            grid_st.dl_hold_blend = target;
+         if (holding)
+         {
+            grid_st.dl_hold_t = (cpu_features_get_time_usec()
+                  - grid_st.dl_hold_start) / (float)GRID_DL_HOLD;
+            if (grid_st.dl_hold_t >= 1.0f && !grid_st.dl_hold_full_at)
+               grid_st.dl_hold_full_at = cpu_features_get_time_usec();
+         }
+
+         if (grid_st.dl_hold_blend > 0.0f)
+            grid_draw_hold_rect(p_disp, userdata, width, height,
+                  cx, cy, card_w, card_h, REF(10), grid_st.dl_hold_t,
+                  grid_st.dl_hold_blend);
+         else
+            grid_draw_cursor(p_disp, userdata, width, height,
+                  cx, cy, card_w, card_h, REF(10));
+      }
+      grid_draw_shape(p_disp, userdata, width, height,
+            cx, cy, card_w, card_h, REF(10), COL_DIVIDER);
+
+      if (!a)
+      {
+         name  = mods ? "Add mod" : "Add update or DLC";
+         line2 = detail;
+         if (st == GRID_ADDONS_WORKING)
+            dcol = COL_CURSOR;
+         else if (st == GRID_ADDONS_FAILED)
+            dcol = COL_DANGER;
+      }
+      else
+      {
+         name = a->name;
+         if (mods)
+         {
+            line2 = a->on ? "On" : "Off";
+            dcol  = a->on ? COL_LIME : COL_TEXT_DIM;
+         }
+         else
+            line2 = a->dlc ? "DLC" : "Update";
+      }
+
+      /* Alone (Add with nothing under it): centred on the card. */
+      {
+         float ny = string_is_empty(line2) ? mid : mid - REF(7);
+         if (i == grid_st.panel_sel)
+            grid_draw_marquee(p_disp, userdata, true, name,
+                  tx, grid_text_y(ny, height, ts), tw,
+                  width, height, COL_TEXT, ts, TEXT_ALIGN_LEFT, name);
+         else
+         {
+            grid_fit_text(true, name, tw, height, ts, line, sizeof(line));
+            grid_draw_text_bold(line, tx, grid_text_y(ny, height, ts),
+                  width, height, COL_TEXT, TEXT_ALIGN_LEFT, ts);
+         }
+      }
+      if (!string_is_empty(line2))
+      {
+         grid_fit_text(false, line2, tw, height, ss, line, sizeof(line));
+         grid_draw_text(line, tx, grid_text_y(mid + REF(8), height, ss),
+               width, height, dcol, TEXT_ALIGN_LEFT, ss);
+      }
    }
 }
 
@@ -11283,7 +11649,8 @@ bool grid_home_frame(video_frame_info_t *video_info)
                                  && grid_st.panel != PANEL_ICONS
                                  && grid_st.panel != PANEL_UPDATES
                                  && grid_st.panel != PANEL_SETUP
-                                 && grid_st.panel != PANEL_INVITE;
+                                 && grid_st.panel != PANEL_INVITE
+                                 && grid_st.panel != PANEL_ADDONS;
 
    /* What the mouse can point at is recorded afresh as it's drawn. */
    grid_hits_next.count = 0;
@@ -11315,6 +11682,34 @@ bool grid_home_frame(video_frame_info_t *video_info)
          video_st->current_video->set_viewport(
                video_st->data, width, height, true, false);
       grid_draw_loading(p_disp, userdata, width, height, 1.0f);
+      grid_hits  = grid_hits_next;
+      grid_alpha = 1.0f;
+      return true;
+   }
+
+   /* A game's keyboard (grid_text): only it, over the game. */
+   if (grid_text.shown)
+   {
+      bool typing = menu_input_dialog_get_display_kb() && grid_st.kb == KB_GAME;
+      if (video_st->current_video && video_st->current_video->set_viewport)
+         video_st->current_video->set_viewport(
+               video_st->data, width, height, true, false);
+      if (typing && grid_st.kbm)
+      {
+         const char *buf = menu_input_dialog_get_buffer();
+         grid_draw_rect(p_disp, userdata, width, height,
+               0, 0, width, height, 0x00000090);
+         grid_draw_text_prompt(p_disp, userdata, width, height,
+               menu_state_get_ptr()->input_dialog_kb_label,
+               buf ? buf : "", height * 0.5f);
+      }
+      {
+         bool osk_on = typing && !grid_st.kbm;
+         float shown = grid_osk_anim(osk_on);
+         if (shown > 0.0f)
+            grid_draw_keyboard(p_disp, userdata, width, height, shown, osk_on);
+      }
+      grid_flush_text(width, height);
       grid_hits  = grid_hits_next;
       grid_alpha = 1.0f;
       return true;
@@ -11491,6 +11886,8 @@ bool grid_home_frame(video_frame_info_t *video_info)
          grid_draw_setup_screen(p_disp, userdata, width, height);
       else if (grid_st.panel == PANEL_INVITE)
          grid_draw_invite_screen(p_disp, userdata, width, height);
+      else if (grid_st.panel == PANEL_ADDONS)
+         grid_draw_addons_screen(p_disp, userdata, width, height);
       else
          grid_draw_downloads_screen(p_disp, userdata, width, height);
    }

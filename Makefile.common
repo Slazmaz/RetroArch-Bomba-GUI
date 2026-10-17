@@ -2724,8 +2724,13 @@ ifeq ($(HAVE_XMB), 1)
           bomba/grid_cores.o bomba/grid_profile.o \
           bomba/grid_cheevos.o bomba/grid_controls.o \
           bomba/grid_coreopts.o bomba/grid_updates.o \
-          bomba/grid_switch.o bomba/bomba_multiplayer.o \
+          bomba/grid_switch.o bomba/grid_switch_addons.o \
+          bomba/bomba_multiplayer.o \
           bomba/bomba_setup.o bomba/bomba_clipboard.o bomba/bomba_keymap.o
+   # The Switch add-ons' NCA headers: mbedtls' AES (built in for SSL).
+   ifeq ($(HAVE_BUILTINMBEDTLS), 1)
+      DEFINES += -DBOMBA_HAVE_AES
+   endif
 endif
 ifeq ($(HAVE_MIST), 1)
    OBJ += bomba/bomba_steamnet.o
