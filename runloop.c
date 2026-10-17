@@ -3939,31 +3939,25 @@ static retro_time_t runloop_core_runtime_tick(
    retro_time_t frame_time              =
       (1.0 / video_st->av_info.timing.fps) * 1000000;
    bool runloop_slowmotion              = (runloop_st->flags & RUNLOOP_FLAG_SLOWMOTION) ? true : false;
-   bool runloop_fastmotion              = (runloop_st->flags & RUNLOOP_FLAG_FASTMOTION) ? true : false;
+   /* Bomba: the real time since the last frame, at most two frames (so
+    * time in the menu or a stall doesn't count). A launcher core (Eden)
+    * reports 60 fps but its retro_run isn't paced by its frames, so
+    * RetroArch can run it far faster than that (seen: 70 hours counted
+    * for a 2-hour session); a fixed frame_time per run counted each
+    * one as a 60th of a second. Fast forward is real time this way too. */
+   retro_time_t elapsed                 = current_time
+      - runloop_st->core_runtime_last;
+   runloop_st->core_runtime_last        = current_time;
 
    /* Account for slow motion */
    if (runloop_slowmotion)
       return (retro_time_t)((double)frame_time * slowmotion_ratio);
 
-   /* Account for fast forward */
-   if (runloop_fastmotion)
-   {
-      /* Doing it this way means we miss the first frame after
-       * turning fast forward on, but it saves the overhead of
-       * having to do:
-       *    retro_time_t current_usec = cpu_features_get_time_usec();
-       *    core_runtime_last         = current_usec;
-       * every frame when fast forward is off. */
-      retro_time_t current_usec              = current_time;
-      retro_time_t potential_frame_time      = current_usec -
-         runloop_st->core_runtime_last;
-      runloop_st->core_runtime_last          = current_usec;
-
-      if (potential_frame_time < frame_time)
-         return potential_frame_time;
-   }
-
-   return frame_time;
+   if (elapsed < 0)
+      return 0;
+   if (elapsed > 2 * frame_time)
+      return 2 * frame_time;
+   return elapsed;
 }
 
 static bool core_unload_game(void)
