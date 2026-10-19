@@ -110,7 +110,7 @@ typedef struct
    char game[96]; /* IN_GAME: its name ("" until known) */
    int avatar;    /* as bomba_steamnet_player_t's */
    enum bomba_friend_status status;
-   bool invited;  /* to this session already */
+   unsigned invited; /* invited just now: seconds until again (0 = can be) */
 } bomba_steamnet_friend_t;
 
 bool bomba_steamnet_can_invite(void);

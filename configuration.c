@@ -3540,8 +3540,17 @@ static void bomba_follow_defaults(settings_t *settings)
 
    if (!(cur = bomba_defaults_snapshot(settings)))
       return;
+   config_set_int(cur, "bomba_defaults_rev", 1);
 
-   if (     (prev = config_file_new_from_path_to_string(snap_path))
+   /* Builds before 0.1.8 kept no snapshot, and 0.1.8-0.1.10 snapshots
+    * were first written by a build that already had the new defaults:
+    * either way the config may still hold the pre-0.1.8 ones. */
+   if (!(prev = config_file_new_from_path_to_string(snap_path)))
+      prev = config_file_new_alloc();
+   if (prev && !config_get_entry(prev, "bomba_defaults_rev"))
+      config_set_string(prev, "ui_menubar_enable", "true");
+
+   if (     prev
          && (conf = config_file_new_from_path_to_string(config_path)))
    {
       for (e = cur->entries; e; e = e->next)

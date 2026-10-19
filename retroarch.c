@@ -109,6 +109,7 @@
 #endif
 
 #include "bomba/bomba_notify.h"
+#include "bomba/bomba_autosave.h"
 #include "bomba/bomba_crash.h"
 #include "bomba/grid_home.h"
 
@@ -6065,6 +6066,7 @@ int rarch_main(int argc, char *argv[], void *data)
 #endif
 
       bomba_notify_poll();
+      bomba_autosave_poll();
       grid_home_text_input_poll();
 
 #ifdef HAVE_QT

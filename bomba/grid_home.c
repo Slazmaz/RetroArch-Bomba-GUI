@@ -735,6 +735,7 @@ static struct
    unsigned inv_first;
    retro_time_t inv_open_start;
    retro_time_t inv_refresh_at;
+   uint64_t inv_again;  /* invited, then picked again: shows the wait */
    grid_avatar_tex_t inv_tex[GRID_INVITE_SLOTS];
 
    /* Profile pictures (circle-clipped), reloaded when the path changes. */
@@ -4194,7 +4195,13 @@ static void grid_panel_action(enum menu_action action)
       {
          case MENU_ACTION_OK:
             if (sel < n && grid_inv_can_invite(&grid_st.inv_list[sel]))
+            {
                bomba_steamnet_invite(grid_st.inv_list[sel].id);
+               grid_st.inv_again      = 0;
+               grid_st.inv_refresh_at = 0;
+            }
+            else if (sel < n && grid_st.inv_list[sel].invited)
+               grid_st.inv_again = grid_st.inv_list[sel].id;
             return;
          case MENU_ACTION_CANCEL:
             grid_st.panel = PANEL_NONE;
@@ -10365,11 +10372,18 @@ static void grid_draw_invite_screen(gfx_display_t *p_disp, void *userdata,
    char online[32];
    size_t i, n, rows, sel_row, on = 0;
 
-   /* Who's online changes: looked at again every second. */
+   /* Who's online changes: looked at again every second (more often
+    * while an invite counts down). */
    if (now >= grid_st.inv_refresh_at)
    {
       grid_st.inv_count      = bomba_steamnet_friends(&grid_st.inv_list);
       grid_st.inv_refresh_at = now + 1000000;
+      for (i = 0; i < grid_st.inv_count; i++)
+         if (grid_st.inv_list[i].invited)
+         {
+            grid_st.inv_refresh_at = now + 100000;
+            break;
+         }
    }
    n = grid_st.inv_count;
    if (grid_st.panel_sel >= n)
@@ -10444,7 +10458,10 @@ static void grid_draw_invite_screen(gfx_display_t *p_disp, void *userdata,
       }
       if (f->invited)
       {
-         strlcpy(detail, "Invited", sizeof(detail));
+         if (f->id == grid_st.inv_again)
+            snprintf(detail, sizeof(detail), "Invited (%us)", f->invited);
+         else
+            strlcpy(detail, "Invited", sizeof(detail));
          dcol = COL_TEXT_DIM;
       }
 

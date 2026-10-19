@@ -259,10 +259,11 @@ static struct
    int64_t players_at;
 
    /* Friends who can be invited (online), and those invited to this
-    * session. */
+    * session lately (until when they show as such). */
    bomba_steamnet_friend_t friends_list[BOMBA_STEAMNET_MAX_FRIENDS];
    unsigned nfriends;
    steam_id_t invited[BOMBA_STEAMNET_MAX_FRIENDS];
+   int64_t invited_until[BOMBA_STEAMNET_MAX_FRIENDS];
    unsigned ninvited;
 
    /* Host: players kicked who haven't left the lobby yet (read by the
@@ -1905,13 +1906,29 @@ bool bomba_steamnet_can_invite(void)
          || sn.state == BOMBA_STEAMNET_JOINED);
 }
 
-static bool sn_was_invited(steam_id_t id)
+/* An invite shows as such for a few seconds, then the friend can be
+ * invited again (missed it, declined, or joined and left). */
+#define SN_INVITED_USEC (3 * 1000000LL)
+
+/* Seconds until the friend can be invited again, rounded up; 0 = now. */
+static unsigned sn_was_invited(steam_id_t id)
 {
    unsigned i;
-   for (i = 0; i < sn.ninvited; i++)
+   int64_t now = sn_now();
+   for (i = 0; i < sn.ninvited; )
+   {
+      if (now >= sn.invited_until[i])
+      {
+         sn.ninvited--;
+         sn.invited[i]       = sn.invited[sn.ninvited];
+         sn.invited_until[i] = sn.invited_until[sn.ninvited];
+         continue;
+      }
       if (sn.invited[i] == id)
-         return true;
-   return false;
+         return (unsigned)((sn.invited_until[i] - now + 999999) / 1000000);
+      i++;
+   }
+   return 0;
 }
 
 /* Names of the Steam games friends play, from the Steam store (the
@@ -2089,11 +2106,14 @@ bool bomba_steamnet_invite(uint64_t id)
       return false;
    }
    if (!sn_was_invited(id) && sn.ninvited < BOMBA_STEAMNET_MAX_FRIENDS)
-      sn.invited[sn.ninvited++] = id;
+   {
+      sn.invited[sn.ninvited]         = id;
+      sn.invited_until[sn.ninvited++] = sn_now() + SN_INVITED_USEC;
+   }
    for (i = 0; i < sn.nfriends; i++)
       if (sn.friends_list[i].id == id)
       {
-         sn.friends_list[i].invited = true;
+         sn.friends_list[i].invited = SN_INVITED_USEC / 1000000;
          snprintf(msg, sizeof(msg), "Multiplayer: invited %s.",
                sn.friends_list[i].name);
          sn_message(msg);
