@@ -54,6 +54,10 @@
 
 #include "xinput_joypad.h"
 
+#if defined(HAVE_MIST) && !defined(__WINRT__)
+#include "../../steam/steam.h"
+#endif
+
 /* Due to 360 pads showing up under both XInput and DirectInput,
  * and since we are going to have to pass through unhandled
  * joypad numbers to DirectInput, a slightly ugly
@@ -84,6 +88,8 @@ static bool g_xinput_guide_button_supported = false;
 static unsigned g_xinput_num_buttons        = 0;
 static XInputSetState_t g_XInputSetState;
 static XInputGetStateEx_t g_XInputGetStateEx;
+/* Plain XInputGetState, for pads only it sees; see xinput_get_state */
+static XInputGetStateEx_t g_XInputGetState;
 #ifdef _XBOX1
 static XINPUT_FEEDBACK     g_xinput_rumble_states[4];
 #else
@@ -118,6 +124,21 @@ static const uint16_t button_index_to_bitmap_code[] =  {
 
 #include "dinput_joypad_inl.h"
 #include "xinput_joypad_inl.h"
+
+/* Steam Input (through the Steam overlay) hides the pads it takes over,
+ * e.g. Switch pads, and hands out virtual ones only through its detour of
+ * XInputGetState. steam_keep_guide_button undoes its detour of
+ * XInputGetStateEx, so for a user that one has nothing on, ask the plain
+ * one too. Steam keeps the guide button of those pads for itself. */
+static uint32_t xinput_get_state(uint32_t user, XINPUT_STATE *state)
+{
+   uint32_t ret = g_XInputGetStateEx(user, state);
+   if (     ret == ERROR_DEVICE_NOT_CONNECTED
+         && g_XInputGetState
+         && g_XInputGetState != g_XInputGetStateEx)
+      ret = g_XInputGetState(user, state);
+   return ret;
+}
 
 /* Based on SDL2's implementation. */
 static bool guid_is_xinput_device(const GUID* product_guid)
@@ -357,6 +378,10 @@ static void *xinput_joypad_init(void *data)
    int i, j;
    XINPUT_STATE dummy_state;
 
+#if defined(HAVE_MIST) && !defined(__WINRT__)
+   steam_keep_guide_button();
+#endif
+
 #if defined(HAVE_DYLIB) && !defined(__WINRT__)
    if (!g_xinput_dll)
       if (!load_xinput_dll())
@@ -401,6 +426,13 @@ static void *xinput_joypad_init(void *data)
    }
 
 #if defined(HAVE_DYLIB) && !defined(__WINRT__)
+   g_XInputGetState = (XInputGetStateEx_t)dylib_proc(
+         g_xinput_dll, "XInputGetState");
+#else
+   g_XInputGetState = NULL;
+#endif
+
+#if defined(HAVE_DYLIB) && !defined(__WINRT__)
    g_XInputSetState = (XInputSetState_t)dylib_proc(
          g_xinput_dll, "XInputSetState");
 #else
@@ -427,7 +459,7 @@ static void *xinput_joypad_init(void *data)
       g_xinput_states[i].xstate.Gamepad.sThumbRX      = 0;
       g_xinput_states[i].xstate.Gamepad.sThumbRY      = 0;
       g_xinput_states[i].connected                    =
-         !(g_XInputGetStateEx(i, &dummy_state) == ERROR_DEVICE_NOT_CONNECTED);
+         !(xinput_get_state(i, &dummy_state) == ERROR_DEVICE_NOT_CONNECTED);
    }
 
    for (i = 0; i < 4; ++i)
@@ -591,7 +623,7 @@ static void xinput_joypad_poll(void)
       if (!xinput_active_port[xinput_hotplug_index])
       {
          XINPUT_STATE tmp_state;
-         DWORD result = g_XInputGetStateEx(xinput_hotplug_index, &tmp_state);
+         DWORD result = xinput_get_state(xinput_hotplug_index, &tmp_state);
          if (result == ERROR_SUCCESS)
          {
             const char *name = xinput_joypad_name(xinput_hotplug_index);
@@ -636,7 +668,7 @@ static void xinput_joypad_poll(void)
 #endif
 
       state         = &g_xinput_states[i];
-      status        = g_XInputGetStateEx(i, &state->xstate);
+      status        = xinput_get_state(i, &state->xstate);
       success       = (status == ERROR_SUCCESS);
       new_connected = (status != ERROR_DEVICE_NOT_CONNECTED);
       if (new_connected != state->connected)
@@ -760,6 +792,7 @@ static void xinput_joypad_destroy(void)
    g_xinput_dll        = NULL;
 #endif
    g_XInputGetStateEx  = NULL;
+   g_XInputGetState    = NULL;
    g_XInputSetState    = NULL;
 
    dinput_joypad_destroy();

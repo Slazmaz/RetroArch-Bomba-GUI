@@ -32,9 +32,13 @@
  * The game runs in eden-cli.exe, which comes with Eden, rather than
  * eden.exe: it can join multiplayer rooms (see "Multiplayer"), and its
  * Switch keyboard is RetroArch's (see "Switch keyboard").
+ *
+ * In overlay mode the players' controllers are RetroArch's (see
+ * "Controllers through RetroArch").
  */
 #define WIN32_LEAN_AND_MEAN
 #define COBJMACROS
+#include <winsock2.h>
 #include <windows.h>
 #include <winioctl.h>
 #include <dwmapi.h>
@@ -381,8 +385,505 @@ static BOOL spawn_process(LPCWSTR app, LPWSTR cmd, BOOL inherit,
    return create(app, cmd, NULL, NULL, inherit, flags, env, dir, si, pi);
 }
 
+/* spawn_process for eden-cli, without a console: it logs every line to
+ * one too, and a console slower than the log (a game or mod hitting an
+ * error each frame) stalls its emulation, as its log queue fills. Its
+ * stdout and stderr are NUL, the only handle it inherits; its log stays
+ * in eden_log.txt. */
+static BOOL spawn_without_console(LPCWSTR app, LPWSTR cmd, DWORD flags,
+      LPVOID env, LPCWSTR dir, LPSTARTUPINFOW si, LPPROCESS_INFORMATION pi)
+{
+   SECURITY_ATTRIBUTES sa = { sizeof(sa), NULL, TRUE };
+   STARTUPINFOEXW six;
+   SIZE_T size = 0;
+   HANDLE nul;
+   BOOL ok = FALSE;
+
+   flags |= DETACHED_PROCESS;
+   nul    = CreateFileW(L"NUL", GENERIC_READ | GENERIC_WRITE,
+         FILE_SHARE_READ | FILE_SHARE_WRITE, &sa, OPEN_EXISTING, 0, NULL);
+   if (nul == INVALID_HANDLE_VALUE)
+      return spawn_process(app, cmd, FALSE, flags, env, dir, si, pi);
+
+   memset(&six, 0, sizeof(six));
+   six.StartupInfo             = *si;
+   six.StartupInfo.cb          = sizeof(six);
+   six.StartupInfo.dwFlags    |= STARTF_USESTDHANDLES;
+   six.StartupInfo.hStdInput   = nul;
+   six.StartupInfo.hStdOutput  = nul;
+   six.StartupInfo.hStdError   = nul;
+   InitializeProcThreadAttributeList(NULL, 1, 0, &size);
+   if (     (six.lpAttributeList = (LPPROC_THREAD_ATTRIBUTE_LIST)malloc(size))
+         && InitializeProcThreadAttributeList(six.lpAttributeList, 1, 0, &size))
+   {
+      if (UpdateProcThreadAttribute(six.lpAttributeList, 0,
+               PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &nul, sizeof(nul), NULL, NULL))
+         ok = spawn_process(app, cmd, TRUE, flags | EXTENDED_STARTUPINFO_PRESENT,
+               env, dir, &six.StartupInfo, pi);
+      else
+         /* No console still: its writes fail at once. */
+         ok = spawn_process(app, cmd, FALSE, flags, env, dir, si, pi);
+      DeleteProcThreadAttributeList(six.lpAttributeList);
+   }
+   else
+      ok = spawn_process(app, cmd, FALSE, flags, env, dir, si, pi);
+   free(six.lpAttributeList);
+   CloseHandle(nul);
+   return ok;
+}
+
 /* ---------------------------------------------------------------------- */
-/* Controller: Player 1 on the first game controller                      */
+/* Controllers through RetroArch                                          */
+/* ---------------------------------------------------------------------- */
+
+/* In overlay mode Eden's players 1-8 are RetroArch's ports 1-8: each
+ * retro_run sends what RetroArch reads on them (its binds, the grid's
+ * Switch bindings, pads plugged in or swapped, gyro where RetroArch's
+ * driver reads it) to Eden as cemuhook "DSU" pads over localhost UDP, the
+ * protocol of Eden's cemuhookudp driver (input_common/drivers/
+ * udp_client.cpp). Eden is bound to those pads once, so changes in
+ * RetroArch apply at once. Two servers, as Eden asks each for four pads.
+ *
+ * Players 2-8 are written as not connected, which is how Eden starts them,
+ * and join once their port is used: eden_kbd.dll connects them in Eden
+ * (see there), told through memory named after Eden's process. Without it
+ * only Player 1 plays. The protocol has no vibration either: eden_kbd.dll
+ * puts Eden's in the same memory, and RetroArch rumbles the port's pad.
+ *
+ * Own-window mode keeps Eden's own SDL mapping for Player 1 (see
+ * write_controls): RetroArch pauses while Eden's window has focus. */
+#define DSU_SERVERS 2
+#define DSU_PLAYERS (DSU_SERVERS * 4)
+/* Eden's id for a server on 127.0.0.1 (UDPClient::GetHostUUID). */
+#define DSU_GUID    "0000000000000000000000007f000001"
+
+/* Eden's PadButton values: the protocol's button bits. */
+enum
+{
+   DSU_SHARE    = 0x0001, DSU_L3     = 0x0002, DSU_R3    = 0x0004, DSU_OPTIONS = 0x0008,
+   DSU_UP       = 0x0010, DSU_RIGHT  = 0x0020, DSU_DOWN  = 0x0040, DSU_LEFT    = 0x0080,
+   DSU_L2       = 0x0100, DSU_R2     = 0x0200, DSU_L1    = 0x0400, DSU_R1      = 0x0800,
+   DSU_TRIANGLE = 0x1000, DSU_CIRCLE = 0x2000, DSU_CROSS = 0x4000, DSU_SQUARE  = 0x8000
+};
+
+static retro_input_state_t input_state_cb;
+
+/* Shared with eden_kbd.dll (struct shared there). */
+struct dsu_shared
+{
+   volatile LONG joined;                /* bit n: player n+1 has played */
+   volatile LONG rumble[DSU_PLAYERS];   /* strong motor | weak << 16 */
+};
+
+/* A rumble left on this long stops, as Eden's SDL driver's does. */
+#define RUMBLE_MAX_MS 2000
+
+static struct
+{
+   bool active;                 /* overlay mode, servers open */
+   bool wsa;
+   bool bitmasks;               /* RetroArch gives the RetroPad as one mask */
+   SOCKET sock[DSU_SERVERS];
+   uint16_t port[DSU_SERVERS];
+   struct sockaddr_in client[DSU_SERVERS]; /* Eden's, once it asked */
+   bool asked[DSU_SERVERS];
+   uint32_t id;
+   uint32_t counter[DSU_PLAYERS];
+   struct retro_sensor_interface sensor;
+   bool gyro[DSU_PLAYERS], accel[DSU_PLAYERS];
+   DWORD sensor_tried;
+   struct retro_rumble_interface rumble;
+   LONG rumble_on[DSU_PLAYERS]; /* as last given to RetroArch */
+   DWORD rumble_at[DSU_PLAYERS];
+   DWORD last_run;
+   LONG joined;                 /* bit n: player n+1 has played */
+   HANDLE map;                  /* ...shared with eden_kbd.dll */
+   struct dsu_shared *volatile shared;
+} dsu;
+
+static void dsu_close(void)
+{
+   int i;
+
+   for (i = 0; i < DSU_PLAYERS; i++)
+      if (dsu.rumble_on[i] && dsu.rumble.set_rumble_state)
+      {
+         dsu.rumble.set_rumble_state(i, RETRO_RUMBLE_STRONG, 0);
+         dsu.rumble.set_rumble_state(i, RETRO_RUMBLE_WEAK, 0);
+         dsu.rumble_on[i] = 0;
+      }
+   for (i = 0; i < DSU_SERVERS; i++)
+      if (dsu.wsa && dsu.sock[i] != INVALID_SOCKET)
+      {
+         closesocket(dsu.sock[i]);
+         dsu.sock[i] = INVALID_SOCKET;
+      }
+   if (dsu.wsa)
+      WSACleanup();
+   dsu.wsa = false;
+   if (dsu.shared)
+      UnmapViewOfFile((void*)dsu.shared);
+   dsu.shared = NULL;
+   if (dsu.map)
+      CloseHandle(dsu.map);
+   dsu.map    = NULL;
+   dsu.active = false;
+   dsu.joined = 0;
+}
+
+/* The servers, on ports Windows picks (other DSU servers, DS4Windows and
+ * such, use 26760). */
+static bool dsu_open(void)
+{
+   WSADATA wsa;
+   int i;
+
+   memset(&dsu, 0, sizeof(dsu));
+   for (i = 0; i < DSU_SERVERS; i++)
+      dsu.sock[i] = INVALID_SOCKET;
+   if (WSAStartup(MAKEWORD(2, 2), &wsa))
+      return false;
+   dsu.wsa = true;
+   dsu.id  = GetTickCount() ^ (GetCurrentProcessId() << 16);
+
+   for (i = 0; i < DSU_SERVERS; i++)
+   {
+      struct sockaddr_in a;
+      int a_len = sizeof(a);
+      u_long nonblocking = 1;
+
+      memset(&a, 0, sizeof(a));
+      a.sin_family      = AF_INET;
+      a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+      if (     (dsu.sock[i] = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == INVALID_SOCKET
+            || bind(dsu.sock[i], (struct sockaddr*)&a, sizeof(a))
+            || getsockname(dsu.sock[i], (struct sockaddr*)&a, &a_len)
+            || ioctlsocket(dsu.sock[i], FIONBIO, &nonblocking))
+      {
+         log_msg("controller: no UDP port for Eden's pads (%d); Eden's own mapping",
+               WSAGetLastError());
+         dsu_close();
+         return false;
+      }
+      dsu.port[i] = ntohs(a.sin_port);
+   }
+
+   dsu.bitmasks = env_cb(RETRO_ENVIRONMENT_GET_INPUT_BITMASKS, NULL);
+   if (!env_cb(RETRO_ENVIRONMENT_GET_SENSOR_INTERFACE, &dsu.sensor))
+      memset(&dsu.sensor, 0, sizeof(dsu.sensor));
+   if (!env_cb(RETRO_ENVIRONMENT_GET_RUMBLE_INTERFACE, &dsu.rumble))
+      memset(&dsu.rumble, 0, sizeof(dsu.rumble));
+   dsu.active = true;
+   return true;
+}
+
+/* The players who joined, for eden_kbd.dll in Eden, and its vibration
+ * (see eden_kbd.c). */
+static void dsu_share(DWORD pid)
+{
+   wchar_t name[64];
+
+   if (!dsu.active)
+      return;
+   _snwprintf(name, 64, L"Local\\bomba-eden-pads-%lu", (unsigned long)pid);
+   name[63] = L'\0';
+   if ((dsu.map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE,
+               0, 4096, name)))
+      dsu.shared = (struct dsu_shared*)MapViewOfFile(dsu.map, FILE_MAP_ALL_ACCESS,
+            0, 0, sizeof(struct dsu_shared));
+}
+
+static void dsu_rumble_set(unsigned p, LONG r)
+{
+   dsu.rumble_on[p] = r;
+   dsu.rumble.set_rumble_state(p, RETRO_RUMBLE_STRONG, (uint16_t)(r & 0xFFFF));
+   dsu.rumble.set_rumble_state(p, RETRO_RUMBLE_WEAK, (uint16_t)((uint32_t)r >> 16));
+}
+
+/* Eden's vibration onto the players' pads. RetroArch stops all rumble when
+ * its menu opens: given again once the game runs again. */
+static void dsu_rumble(DWORD now)
+{
+   bool resumed = now - dsu.last_run > PAUSE_AFTER_MS;
+   unsigned p;
+
+   dsu.last_run = now;
+   if (!dsu.shared || !dsu.rumble.set_rumble_state)
+      return;
+   for (p = 0; p < DSU_PLAYERS; p++)
+   {
+      LONG r = dsu.shared->rumble[p];
+      if (r != dsu.rumble_on[p] || (resumed && r))
+      {
+         if (r != dsu.rumble_on[p])
+            dsu.rumble_at[p] = now;
+         dsu_rumble_set(p, r);
+      }
+      else if (r && now - dsu.rumble_at[p] > RUMBLE_MAX_MS)
+      {
+         InterlockedCompareExchange(&dsu.shared->rumble[p], 0, r);
+         dsu_rumble_set(p, 0);
+      }
+   }
+}
+
+/* Eden's [Controls]: every player on its pad (pad n: player n+1). */
+static void dsu_controls(char **buf, size_t *len)
+{
+   /* By position, as the RetroPad's (see dsu_run). */
+   static const struct { const char *key; unsigned button; } keys[] = {
+      { "button_a",      DSU_CIRCLE },  { "button_b",      DSU_CROSS },
+      { "button_x",      DSU_TRIANGLE },{ "button_y",      DSU_SQUARE },
+      { "button_lstick", DSU_L3 },      { "button_rstick", DSU_R3 },
+      { "button_l",      DSU_L1 },      { "button_r",      DSU_R1 },
+      { "button_zl",     DSU_L2 },      { "button_zr",     DSU_R2 },
+      { "button_plus",   DSU_OPTIONS }, { "button_minus",  DSU_SHARE },
+      { "button_dleft",  DSU_LEFT },    { "button_dup",    DSU_UP },
+      { "button_dright", DSU_RIGHT },   { "button_ddown",  DSU_DOWN },
+   };
+   char key[64], value[192], head[96];
+   unsigned p, i;
+
+   snprintf(value, sizeof(value), "\"127.0.0.1:%u,127.0.0.1:%u\"",
+         dsu.port[0], dsu.port[1]);
+   ini_set(buf, len, "Controls", "udp_input_servers", value);
+
+   for (p = 0; p < DSU_PLAYERS; p++)
+   {
+      snprintf(head, sizeof(head), "engine:cemuhookudp,guid:" DSU_GUID ",port:%u,pad:%u",
+            dsu.port[p / 4], p);
+      for (i = 0; i < sizeof(keys) / sizeof(keys[0]); i++)
+      {
+         snprintf(key, sizeof(key), "player_%u_%s", p, keys[i].key);
+         snprintf(value, sizeof(value), "\"%s,button:%u\"", head, keys[i].button);
+         ini_set(buf, len, "Controls", key, value);
+      }
+      snprintf(key, sizeof(key), "player_%u_button_home", p);
+      ini_set(buf, len, "Controls", key, "\"[empty]\"");
+      snprintf(key, sizeof(key), "player_%u_button_screenshot", p);
+      ini_set(buf, len, "Controls", key, "\"[empty]\"");
+
+      snprintf(key, sizeof(key), "player_%u_lstick", p);
+      snprintf(value, sizeof(value), "\"%s,axis_x:0,axis_y:1\"", head);
+      ini_set(buf, len, "Controls", key, value);
+      snprintf(key, sizeof(key), "player_%u_rstick", p);
+      snprintf(value, sizeof(value), "\"%s,axis_x:2,axis_y:3\"", head);
+      ini_set(buf, len, "Controls", key, value);
+      snprintf(value, sizeof(value), "\"%s,motion:0\"", head);
+      snprintf(key, sizeof(key), "player_%u_motionleft", p);
+      ini_set(buf, len, "Controls", key, value);
+      snprintf(key, sizeof(key), "player_%u_motionright", p);
+      ini_set(buf, len, "Controls", key, value);
+
+      if (p)
+      {
+         snprintf(key, sizeof(key), "player_%u_type", p);
+         ini_set(buf, len, "Controls", key, "0"); /* Pro Controller */
+      }
+      snprintf(key, sizeof(key), "player_%u_connected", p);
+      ini_set(buf, len, "Controls", key, p ? "false" : "true");
+   }
+   log_msg("controller: players 1-%d through RetroArch (Eden's pads on ports %u, %u)",
+         DSU_PLAYERS, dsu.port[0], dsu.port[1]);
+}
+
+/* CRC-32 (IEEE), as the protocol's. */
+static uint32_t dsu_crc(const uint8_t *p, size_t n)
+{
+   uint32_t c = 0xFFFFFFFFu;
+   int k;
+
+   while (n--)
+      for (c ^= *p++, k = 0; k < 8; k++)
+         c = (c >> 1) ^ (0xEDB88320u & (0u - (c & 1u)));
+   return ~c;
+}
+
+/* A stick axis, -32768..32767, as the protocol's byte (127 centre). */
+static uint8_t dsu_axis(int v)
+{
+   v = 127 + v * 127 / 32767;
+   return (uint8_t)(v < 0 ? 0 : v > 254 ? 254 : v);
+}
+
+static void dsu_float(uint8_t *at, float v)
+{
+   memcpy(at, &v, 4);
+}
+
+/* Each retro_run: where Eden asks to be sent pads, and every pad. */
+static void dsu_run(void)
+{
+   /* RetroPad id -> button, the Switch's in the same place (A right). */
+   static const uint16_t buttons[16] = {
+      DSU_CROSS, DSU_SQUARE, DSU_SHARE, DSU_OPTIONS,   /* B Y Select Start */
+      DSU_UP, DSU_DOWN, DSU_LEFT, DSU_RIGHT,
+      DSU_CIRCLE, DSU_TRIANGLE, DSU_L1, DSU_R1,        /* A X L R */
+      DSU_L2, DSU_R2, DSU_L3, DSU_R3
+   };
+   uint8_t pkt[100];
+   uint64_t usec = GetTickCount64() * 1000;
+   DWORD now     = GetTickCount();
+   unsigned p;
+   int s, i;
+
+   if (!dsu.active || !input_state_cb)
+      return;
+   dsu_rumble(now);
+
+   /* Eden asks every 3 seconds, from one socket per server. */
+   for (s = 0; s < DSU_SERVERS; s++)
+      for (i = 0; i < 32; i++)
+      {
+         struct sockaddr_in from;
+         int from_len = sizeof(from), n;
+         uint32_t magic, type;
+
+         n = recvfrom(dsu.sock[s], (char*)pkt, sizeof(pkt), 0,
+               (struct sockaddr*)&from, &from_len);
+         if (n < 0)
+         {
+            /* An earlier send found no one there (Eden restarting). */
+            if (WSAGetLastError() == WSAECONNRESET)
+               continue;
+            break;
+         }
+         if (n < 20)
+            continue;
+         memcpy(&magic, pkt, 4);
+         memcpy(&type, pkt + 16, 4);
+         if (magic != 0x43555344u /* "DSUC" */ || type != 0x00100002u /* pad data */)
+            continue;
+         if (!dsu.asked[s])
+            log_msg("controller: Eden reads pads %d-%d", s * 4 + 1, s * 4 + 4);
+         dsu.client[s] = from;
+         dsu.asked[s]  = true;
+      }
+
+   /* Gyro and accelerometer, for pads that have them; pads can come later. */
+   if (dsu.sensor.set_sensor_state && now - dsu.sensor_tried > 2000)
+   {
+      dsu.sensor_tried = now;
+      for (p = 0; p < DSU_PLAYERS; p++)
+      {
+         if (!dsu.gyro[p])
+            dsu.gyro[p]  = dsu.sensor.set_sensor_state(p, RETRO_SENSOR_GYROSCOPE_ENABLE, 60);
+         if (!dsu.accel[p])
+            dsu.accel[p] = dsu.sensor.set_sensor_state(p, RETRO_SENSOR_ACCELEROMETER_ENABLE, 60);
+      }
+   }
+
+   for (p = 0; p < DSU_PLAYERS; p++)
+   {
+      uint8_t *d = pkt + 20;
+      uint16_t held = 0;
+      int lx = input_state_cb(p, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT,  RETRO_DEVICE_ID_ANALOG_X);
+      int ly = input_state_cb(p, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_LEFT,  RETRO_DEVICE_ID_ANALOG_Y);
+      int rx = input_state_cb(p, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_X);
+      int ry = input_state_cb(p, RETRO_DEVICE_ANALOG, RETRO_DEVICE_INDEX_ANALOG_RIGHT, RETRO_DEVICE_ID_ANALOG_Y);
+      /* Resting flat when the pad can't tell (RetroArch's axes, in g). */
+      float ax = 0.0f, ay = 0.0f, az = 1.0f, gx = 0.0f, gy = 0.0f, gz = 0.0f;
+      unsigned bits;
+      int b;
+
+      s = (int)(p / 4);
+      if (dsu.bitmasks)
+         bits = (unsigned)(uint16_t)input_state_cb(p, RETRO_DEVICE_JOYPAD, 0,
+               RETRO_DEVICE_ID_JOYPAD_MASK);
+      else
+         for (bits = 0, b = 0; b < 16; b++)
+            if (input_state_cb(p, RETRO_DEVICE_JOYPAD, 0, b))
+               bits |= 1u << b;
+      for (b = 0; b < 16; b++)
+         if (bits & (1u << b))
+            held |= buttons[b];
+
+      /* A player joins by playing (Player 1 is always in). */
+      if (     !(dsu.joined & (1L << p))
+            && (!p || held || abs(lx) > 16384 || abs(ly) > 16384
+               || abs(rx) > 16384 || abs(ry) > 16384))
+      {
+         dsu.joined |= 1L << p;
+         if (p)
+            log_msg("controller: player %u joined", p + 1);
+      }
+      if (dsu.shared && (dsu.shared->joined & dsu.joined) != dsu.joined)
+         InterlockedOr(&dsu.shared->joined, dsu.joined);
+
+      if (!dsu.asked[s])
+         continue;
+
+      if (dsu.gyro[p])
+      {
+         gx = dsu.sensor.get_sensor_input(p, RETRO_SENSOR_GYROSCOPE_X);
+         gy = dsu.sensor.get_sensor_input(p, RETRO_SENSOR_GYROSCOPE_Y);
+         gz = dsu.sensor.get_sensor_input(p, RETRO_SENSOR_GYROSCOPE_Z);
+      }
+      if (dsu.accel[p])
+      {
+         ax = dsu.sensor.get_sensor_input(p, RETRO_SENSOR_ACCELEROMETER_X);
+         ay = dsu.sensor.get_sensor_input(p, RETRO_SENSOR_ACCELEROMETER_Y);
+         az = dsu.sensor.get_sensor_input(p, RETRO_SENSOR_ACCELEROMETER_Z);
+      }
+
+      memset(pkt, 0, sizeof(pkt));
+      memcpy(pkt, "DSUS", 4);
+      pkt[4] = 1001 & 0xFF;            /* protocol version */
+      pkt[5] = 1001 >> 8;
+      pkt[6] = 80 + 4;                 /* type and pad data */
+      memcpy(pkt + 12, &dsu.id, 4);
+      pkt[16] = 0x02;                  /* 0x100002, pad data */
+      pkt[18] = 0x10;
+
+      d[0]  = (uint8_t)(p % 4);        /* slot */
+      d[1]  = 2;                       /* connected */
+      d[2]  = 2;                       /* full gyro */
+      d[3]  = 1;                       /* USB */
+      d[9]  = (uint8_t)(p + 1);        /* MAC */
+      d[10] = 0x05;                    /* battery full */
+      d[11] = 1;                       /* active */
+      dsu.counter[p]++;                /* each one new, or Eden drops it */
+      memcpy(d + 12, &dsu.counter[p], 4);
+      memcpy(d + 16, &held, 2);
+      d[20] = dsu_axis(lx);
+      d[21] = dsu_axis(-ly);           /* up is positive */
+      d[22] = dsu_axis(rx);
+      d[23] = dsu_axis(-ry);
+      d[24] = held & DSU_LEFT     ? 255 : 0;
+      d[25] = held & DSU_DOWN     ? 255 : 0;
+      d[26] = held & DSU_RIGHT    ? 255 : 0;
+      d[27] = held & DSU_UP       ? 255 : 0;
+      d[28] = held & DSU_SQUARE   ? 255 : 0;
+      d[29] = held & DSU_CROSS    ? 255 : 0;
+      d[30] = held & DSU_CIRCLE   ? 255 : 0;
+      d[31] = held & DSU_TRIANGLE ? 255 : 0;
+      d[32] = held & DSU_R1       ? 255 : 0;
+      d[33] = held & DSU_L1       ? 255 : 0;
+      d[34] = held & DSU_R2       ? 255 : 0;
+      d[35] = held & DSU_L2       ? 255 : 0;
+      memcpy(d + 48, &usec, 8);
+      /* Eden turns these into its motion (OnPadData) as its SDL driver
+       * does a pad's own sensors: RetroArch's axes (SDL's, reordered by
+       * its sdl joypad driver) back to the protocol's. Gyro: the
+       * protocol's degrees per second, which Eden takes as 312 a turn. */
+      dsu_float(d + 56, -ax);
+      dsu_float(d + 60, -az);
+      dsu_float(d + 64, -ay);
+      dsu_float(d + 68,  gx * 312.0f / 6.2831853f);  /* pitch */
+      dsu_float(d + 72, -gz * 312.0f / 6.2831853f);  /* yaw */
+      dsu_float(d + 76,  gy * 312.0f / 6.2831853f);  /* roll */
+
+      {
+         uint32_t crc = dsu_crc(pkt, sizeof(pkt));
+         memcpy(pkt + 8, &crc, 4);
+      }
+      sendto(dsu.sock[s], (const char*)pkt, sizeof(pkt), 0,
+            (const struct sockaddr*)&dsu.client[s], sizeof(dsu.client[s]));
+   }
+}
+
+/* ---------------------------------------------------------------------- */
+/* Controller: Player 1 on the first game controller (own-window mode)    */
 /* ---------------------------------------------------------------------- */
 
 /* A boolean "key=true|false" from the INI text (any section). */
@@ -519,7 +1020,8 @@ static void grid_bind_args(wchar_t *out, size_t out_len)
    free(text);
 }
 
-/* Player 1's mapping, from eden_padinfo.exe (next to this core, see
+/* The players' controls: RetroArch's in overlay mode (dsu_controls), else
+ * Player 1's mapping, from eden_padinfo.exe (next to this core, see
  * eden_padinfo.c), which asks RetroArch's SDL2.dll in a process of its
  * own, the way Eden's SDL2 will see the controllers. */
 static void write_controls(char **buf, size_t *len)
@@ -535,6 +1037,11 @@ static void write_controls(char **buf, size_t *len)
    DWORD got, total = 0;
    int mapped = 0;
 
+   if (dsu.active)
+   {
+      dsu_controls(buf, len);
+      return;
+   }
    if (!core_dir(dir, MAX_PATH * 2)
          || !GetModuleFileNameW(NULL, exe_dir, MAX_PATH * 2)
          || !(slash = wcsrchr(exe_dir, L'\\')))
@@ -612,10 +1119,11 @@ static void write_controls(char **buf, size_t *len)
 /* Shown in RetroArch's Quick Menu and on the grid's Consoles pages (the
  * categories put them under Graphics and System). Values are Eden's own
  * (its enum indices); defaults are Eden's. Eden reads its config when it
- * starts, so changes apply from the next launch. */
+ * starts; those it changes while a game runs change at once too (see
+ * "Settings while the game runs"), the others from the next launch. */
 static struct retro_core_option_v2_category option_cats[] = {
-   { "video",  "Video",  "Eden's graphics. Changes apply the next time a game starts." },
-   { "system", "System", "Eden's console settings. Changes apply the next time a game starts." },
+   { "video",  "Video",  "Eden's graphics. Resolution and anisotropic filtering apply the next time a game starts." },
+   { "system", "System", "Eden's console settings. Region applies the next time a game starts." },
    { NULL, NULL, NULL },
 };
 
@@ -909,6 +1417,85 @@ static void write_config(const wchar_t *exe, bool cli)
    config_path[MAX_PATH * 2 - 1] = L'\0';
 
    config_edit(cli ? apply_launch_cli : apply_launch, NULL);
+}
+
+/* ---------------------------------------------------------------------- */
+/* Settings while the game runs                                           */
+/* ---------------------------------------------------------------------- */
+
+/* Options changed while the game runs also go into the running Eden, for
+ * the settings Eden changes while a game runs (as in its own settings
+ * dialog): eden_kbd.dll sets them, from memory named after Eden's process,
+ * and says which it can. The others apply the next time a game starts. */
+#define LIVE_SETTINGS 16
+
+/* Shared with eden_kbd.dll (struct settings_shared there). */
+struct settings_shared
+{
+   volatile LONG seq;              /* bumped on a change */
+   volatile LONG live;             /* bit n: setting n changes in Eden */
+   struct { char key[32]; volatile LONG value; } item[LIVE_SETTINGS]; /* -1: none */
+};
+
+static HANDLE settings_map;
+static struct settings_shared *volatile settings_mem;
+
+static void settings_fill(void)
+{
+   size_t i;
+   for (i = 0; i < OPTION_COUNT && i < LIVE_SETTINGS; i++)
+      settings_mem->item[i].value = option_values[i][0]
+         ? atol(option_values[i]) : -1;
+}
+
+/* Eden was started: the settings it has from its config. */
+static void settings_share(DWORD pid)
+{
+   wchar_t name[64];
+   size_t i;
+
+   _snwprintf(name, 64, L"Local\\bomba-eden-settings-%lu", (unsigned long)pid);
+   name[63] = L'\0';
+   if (     !(settings_map = CreateFileMappingW(INVALID_HANDLE_VALUE, NULL,
+               PAGE_READWRITE, 0, 4096, name))
+         || !(settings_mem = (struct settings_shared*)MapViewOfFile(settings_map,
+               FILE_MAP_ALL_ACCESS, 0, 0, sizeof(struct settings_shared))))
+      return;
+   for (i = 0; i < OPTION_COUNT && i < LIVE_SETTINGS; i++)
+      snprintf(settings_mem->item[i].key, sizeof(settings_mem->item[i].key),
+            "%s", option_keys[i].key);
+   settings_fill();
+}
+
+static void settings_close(void)
+{
+   if (settings_mem)
+      UnmapViewOfFile((void*)settings_mem);
+   settings_mem = NULL;
+   if (settings_map)
+      CloseHandle(settings_map);
+   settings_map = NULL;
+}
+
+/* The options changed (read_options): into the running Eden. True if all
+ * that changed apply there. */
+static bool settings_update(void)
+{
+   bool all = true;
+   size_t i;
+
+   if (!settings_mem)
+      return false;
+   for (i = 0; i < OPTION_COUNT; i++)
+   {
+      LONG value = option_values[i][0] ? atol(option_values[i]) : -1;
+      if (     i >= LIVE_SETTINGS || (value != settings_mem->item[i].value
+            && !(settings_mem->live & (1L << i))))
+         all = false;
+   }
+   settings_fill();
+   InterlockedIncrement(&settings_mem->seq);
+   return all;
 }
 
 /* ---------------------------------------------------------------------- */
@@ -1512,9 +2099,8 @@ static void kbd_inject(HANDLE process)
       CloseHandle(thread);
    }
    VirtualFreeEx(process, remote, 0, MEM_RELEASE);
-   log_msg(code ? "keyboard: eden_kbd.dll hooked into Eden (keyboard, TCP sockets)"
-                : "keyboard: neither Eden's keyboard nor its sockets found; "
-                  "it answers \"Eden\"");
+   log_msg(code ? "keyboard: eden_kbd.dll loaded into Eden"
+                : "keyboard: eden_kbd.dll didn't load into Eden");
 }
 
 /* Once Eden runs (the overlay starts it suspended), after its C runtime
@@ -2932,9 +3518,11 @@ static DWORD WINAPI launch_main(LPVOID unused)
    {
       /* Without Steam's SDL settings, see child_environment. */
       wchar_t *env = child_environment();
-      ok = spawn_process(exe, cmdline, FALSE,
-            (launch.overlay ? CREATE_SUSPENDED : 0)
-            | (env ? CREATE_UNICODE_ENVIRONMENT : 0), env, launch.workdir, &si, &pi);
+      DWORD flags  = (launch.overlay ? CREATE_SUSPENDED : 0)
+         | (env ? CREATE_UNICODE_ENVIRONMENT : 0);
+      ok = launch.use_cli
+         ? spawn_without_console(exe, cmdline, flags, env, launch.workdir, &si, &pi)
+         : spawn_process(exe, cmdline, FALSE, flags, env, launch.workdir, &si, &pi);
       free(env);
    }
    if (!ok)
@@ -2948,6 +3536,8 @@ static DWORD WINAPI launch_main(LPVOID unused)
 
    emu_process = pi.hProcess;
    emu_pid     = pi.dwProcessId;
+   dsu_share(pi.dwProcessId);
+   settings_share(pi.dwProcessId);
    if (launch.use_cli)
    {
       kbd_start(pi.dwProcessId);
@@ -2993,7 +3583,7 @@ RETRO_API void retro_set_video_refresh(retro_video_refresh_t cb) { video_cb = cb
 RETRO_API void retro_set_audio_sample(retro_audio_sample_t cb) { (void)cb; }
 RETRO_API void retro_set_audio_sample_batch(retro_audio_sample_batch_t cb) { (void)cb; }
 RETRO_API void retro_set_input_poll(retro_input_poll_t cb) { input_poll_cb = cb; }
-RETRO_API void retro_set_input_state(retro_input_state_t cb) { (void)cb; }
+RETRO_API void retro_set_input_state(retro_input_state_t cb) { input_state_cb = cb; }
 
 RETRO_API void retro_init(void)
 {
@@ -3012,6 +3602,8 @@ RETRO_API void retro_deinit(void)
    release_process();
    stop_room();
    loading_close();
+   dsu_close();
+   settings_close();
    if (kbd.lock_init)
    {
       DeleteCriticalSection(&kbd.lock);
@@ -3079,6 +3671,7 @@ RETRO_API void retro_run(void)
    if (ov.active)
       overlay_run();
    kbd_run();
+   dsu_run();
 
    /* The launch thread finished: what it had to say, and the end if Eden
     * didn't start. */
@@ -3099,21 +3692,24 @@ RETRO_API void retro_run(void)
    }
 
    /* An option changed (Quick Menu, grid): into Eden's config, which it
-    * reads at its next start. (Once launched: the launch thread writes
-    * the config.) */
+    * reads at its next start, and into the running Eden where it can be.
+    * (Once launched: the launch thread writes the config.) */
    if (!launch.thread)
    {
       bool updated = false;
       if (env_cb(RETRO_ENVIRONMENT_GET_VARIABLE_UPDATE, &updated) && updated)
       {
          char before[sizeof(options_written)];
+         bool live;
          strcpy(before, options_written);
          read_options();
          config_edit(apply_options, NULL);
+         live = settings_update();
          if (strcmp(before, options_written))
          {
-            log_msg("options changed: %s", options_written);
-            show_message("Eden setting saved. It applies the next time the game starts.");
+            log_msg("options changed: %s%s", options_written, live ? " (live)" : "");
+            if (!live)
+               show_message("Eden setting saved. It applies the next time the game starts.");
          }
       }
    }
@@ -3238,6 +3834,8 @@ RETRO_API bool retro_load_game(const struct retro_game_info *game)
    wcscpy(launch.rom, rom);
    launch.overlay    = overlay && ov.thread;
    launch.fullscreen = fullscreen;
+   if (launch.overlay)
+      dsu_open();
    launch.message    = NULL;
    launch.state      = LAUNCH_RUNNING;
    if (!(launch.thread = CreateThread(NULL, 0, launch_main, NULL, 0, NULL)))
@@ -3273,6 +3871,8 @@ RETRO_API void retro_unload_game(void)
    release_process();
    stop_room();
    loading_close();
+   dsu_close();
+   settings_close();
 }
 
 RETRO_API unsigned retro_get_region(void) { return RETRO_REGION_NTSC; }

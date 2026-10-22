@@ -669,7 +669,9 @@ static const enum input_driver_enum INPUT_DEFAULT_DRIVER = INPUT_DOS;
 static const enum input_driver_enum INPUT_DEFAULT_DRIVER = INPUT_NULL;
 #endif
 
-#if defined(HAVE_STEAM) && defined(__linux__) && defined(HAVE_SDL2)
+/* Bomba: SDL on Windows too; it reads Switch pads, and the virtual pads
+ * Steam Input hands out, which xinput/dinput can't do both of. */
+#if defined(HAVE_STEAM) && defined(HAVE_SDL2)
 static const enum joypad_driver_enum JOYPAD_DEFAULT_DRIVER = JOYPAD_SDL;
 #elif defined(HAVE_XINPUT)
 static const enum joypad_driver_enum JOYPAD_DEFAULT_DRIVER = JOYPAD_XINPUT;

@@ -45,13 +45,16 @@ void grid_controls_set_core(const char *console, const char *core_file);
 void grid_controls_apply(const char *console, const char *core_path,
       const char *content_path);
 
-/* A console's bindings changed while its game runs: use them now, if
- * RetroArch will put the usual ones back when the game closes (an
- * override is in use); otherwise from its next start. */
-void grid_controls_apply_running(const char *console);
+/* A console's bindings changed in the menu while its game (core_path,
+ * content_path) runs: they apply when the menu closes. A game started
+ * without any has no override yet: written and loaded now, as at its
+ * start. A player's own override is left alone. */
+void grid_controls_changed_running(const char *console, const char *core_path,
+      const char *content_path);
 
 /* The menu opens (on) or closes over a game started with our override:
- * the menu goes by the usual binds, the game by its console's. */
+ * the menu goes by the usual binds, the game by its console's, as they
+ * are when the menu closes (changed in it, they apply then). */
 void grid_controls_menu(bool on);
 
 RETRO_END_DECLS

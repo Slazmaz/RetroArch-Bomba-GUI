@@ -63,8 +63,9 @@ DECL_AXIS(l_y_plus,  +1) \
 DECL_AXIS(l_y_minus, -1) \
 DECL_AXIS(r_x_plus,  +2) \
 DECL_AXIS(r_x_minus, -2) \
-DECL_AXIS(r_y_plus,  -3) \
-DECL_AXIS(r_y_minus, +3)
+DECL_AXIS(r_y_plus,  +3) \
+DECL_AXIS(r_y_minus, -3) \
+DECL_MENU(5)
 
 #if defined(DINGUX) && defined(HAVE_SDL_DINGUX)
 #define DINGUX_SDL_DEFAULT_BINDS \

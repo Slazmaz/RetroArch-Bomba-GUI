@@ -947,8 +947,13 @@ bool input_autoconfigure_connect(
     * task status messages
     * > Can skip this check if autoconfig notifications
     *   have been disabled by the user */
-   if (   !(autoconfig_handle->flags & AUTOCONF_FLAG_SUPPRESS_NOTIFICATIONS)
-       && !string_is_empty(autoconfig_handle->device_info.name))
+   /* Bomba: SDL's game controller mapping is the same for every pad, so
+    * its built-in fallback is right; don't warn about it. */
+   if (string_is_equal(autoconfig_handle->device_info.joypad_driver, "sdl2"))
+      autoconfig_handle->flags |= AUTOCONF_FLAG_SUPPRESS_FAILURE_NOTIF;
+
+   /* Bomba: the fallback warning too, not just 'connected' */
+   if (!string_is_empty(autoconfig_handle->device_info.name))
    {
       const char *last_device_name = input_config_get_device_name(port);
       uint16_t last_vid            = input_config_get_device_vid(port);
@@ -961,7 +966,8 @@ bool input_autoconfigure_connect(
           && (autoconfig_handle->device_info.vid == last_vid)
           && (autoconfig_handle->device_info.pid == last_pid)
           && last_autoconfigured)
-         autoconfig_handle->flags |= AUTOCONF_FLAG_SUPPRESS_NOTIFICATIONS;
+         autoconfig_handle->flags |= AUTOCONF_FLAG_SUPPRESS_NOTIFICATIONS
+                                   |  AUTOCONF_FLAG_SUPPRESS_FAILURE_NOTIF;
    }
 
    /* Configure task */

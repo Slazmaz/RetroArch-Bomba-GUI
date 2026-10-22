@@ -139,8 +139,15 @@ static void sdl_pad_connect(unsigned id)
    vendor     = guid_ptr[2];
    product    = guid_ptr[4];
 #elif _WIN32
+#if SDL_VERSION_ATLEAST(2, 0, 6)
+   /* The GUID starts with the bus and a CRC of the name now. */
+   vendor     = SDL_JoystickGetVendor(pad->joypad);
+   product    = SDL_JoystickGetProduct(pad->joypad);
+   (void)guid_ptr;
+#else
    vendor     = guid_ptr[0];
    product    = guid_ptr[1];
+#endif
 #endif
 #ifdef WEBOS
    if (vendor == 0x9999 && product == 0x9999)
@@ -233,24 +240,24 @@ static void sdl_pad_connect(unsigned id)
 #endif
 }
 
-static void sdl_pad_disconnect(unsigned id)
+static void sdl_pad_disconnect(unsigned id, bool notify)
 {
+   bool opened = sdl_pads[id].joypad != NULL;
 #ifdef HAVE_SDL2
    if (sdl_pads[id].haptic)
       SDL_HapticClose(sdl_pads[id].haptic);
 
    if (sdl_pads[id].controller)
-   {
       SDL_GameControllerClose(sdl_pads[id].controller);
-      input_autoconfigure_disconnect(id, sdl_joypad.ident);
-   }
    else
 #endif
    if (sdl_pads[id].joypad)
-   {
       SDL_JoystickClose(sdl_pads[id].joypad);
+
+   /* Bomba: only a real unplug says so; the driver being torn down
+    * on every core load isn't one. */
+   if (opened && notify)
       input_autoconfigure_disconnect(id, sdl_joypad.ident);
-   }
 
    memset(&sdl_pads[id], 0, sizeof(sdl_pads[id]));
 }
@@ -259,7 +266,7 @@ static void sdl_joypad_destroy(void)
 {
    int i;
    for (i = 0; i < MAX_USERS; i++)
-      sdl_pad_disconnect(i);
+      sdl_pad_disconnect(i, false);
 
    memset(sdl_pads, 0, sizeof(sdl_pads));
 }
@@ -466,10 +473,32 @@ static void sdl_joypad_poll(void)
       switch (event.type)
       {
          case SDL_JOYDEVICEADDED:
-            sdl_pad_connect(event.jdevice.which);
+            /* Bomba: pads already there at init get an added event
+             * too; don't open those a second time. */
+            {
+               int i;
+               SDL_JoystickID inst = SDL_JoystickGetDeviceInstanceID(
+                     event.jdevice.which);
+               bool open           = false;
+               for (i = 0; i < MAX_USERS; i++)
+                  if (     sdl_pads[i].joypad
+                        && SDL_JoystickInstanceID(sdl_pads[i].joypad) == inst)
+                     open = true;
+               if (!open && event.jdevice.which < MAX_USERS)
+                  sdl_pad_connect(event.jdevice.which);
+            }
             break;
          case SDL_JOYDEVICEREMOVED:
-            sdl_pad_disconnect(event.jdevice.which);
+            /* Bomba: removed events carry the instance id, not the
+             * device index the pad was opened at. */
+            {
+               int i;
+               for (i = 0; i < MAX_USERS; i++)
+                  if (     sdl_pads[i].joypad
+                        && SDL_JoystickInstanceID(sdl_pads[i].joypad)
+                           == event.jdevice.which)
+                     sdl_pad_disconnect(i, true);
+            }
             break;
       }
    }

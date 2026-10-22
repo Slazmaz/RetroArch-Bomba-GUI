@@ -61,6 +61,12 @@ void steam_set_connect(const char *connect);
 /* Bomba: the name rich presence shows while the content at path runs. */
 void steam_set_game_title(const char *path, const char *title);
 
+#ifdef _WIN32
+/* Bomba: undoes the Steam overlay's detour of XInputGetStateEx, which drops
+ * the guide button. For the xinput joypad driver only. */
+void steam_keep_guide_button(void);
+#endif
+
 /* Located in tasks/task_steam.c */
 void task_push_steam_core_dlc_install(AppId app_id, const char *name);
 

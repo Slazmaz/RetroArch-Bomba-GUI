@@ -82,6 +82,7 @@ static struct
 static struct
 {
    char console[40];
+   char path[PATH_MAX_LENGTH];   /* the override */
    grid_controls_bind_t binds[MAX_USERS][GRID_CONTROLS_BUTTONS];
 } grid_controls_game;
 
@@ -455,6 +456,7 @@ void grid_controls_apply(const char *console, const char *core_path,
 
    strlcpy(grid_controls_game.console, console,
          sizeof(grid_controls_game.console));
+   strlcpy(grid_controls_game.path, path, sizeof(grid_controls_game.path));
    for (p = 0; p < MAX_USERS; p++)
       for (j = 0; j < GRID_CONTROLS_BUTTONS; j++)
       {
@@ -462,6 +464,28 @@ void grid_controls_apply(const char *console, const char *core_path,
          grid_controls_game.binds[p][j].joyaxis = input_config_binds[p][j].joyaxis;
          grid_controls_game.binds[p][j].key     = input_config_binds[p][j].key;
       }
+}
+
+static void grid_controls_apply_running(const char *console);
+
+void grid_controls_changed_running(const char *console, const char *core_path,
+      const char *content_path)
+{
+   /* Ours is in use (they apply when the menu closes), or the player's. */
+   if (     grid_controls_game.console[0]
+         || !path_is_empty(RARCH_PATH_CONFIG_OVERRIDE))
+      return;
+
+   grid_controls_apply(console, core_path, content_path);
+   if (!grid_controls_game.console[0])
+      return;
+   if (!config_load_override_file(grid_controls_game.path))
+   {
+      grid_controls_game.console[0] = '\0';
+      return;
+   }
+   /* Loaded over the menu, which keeps the usual binds. */
+   grid_controls_menu(true);
 }
 
 void grid_controls_menu(bool on)
@@ -496,7 +520,8 @@ void grid_controls_menu(bool on)
    }
 }
 
-void grid_controls_apply_running(const char *console)
+/* The console's bindings onto the running game's binds. */
+static void grid_controls_apply_running(const char *console)
 {
    settings_t *settings = config_get_ptr();
    unsigned p, j;

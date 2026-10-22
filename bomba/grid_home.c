@@ -3051,6 +3051,7 @@ static void grid_cc_bind_start(unsigned id)
          MENU_INPUT_BINDS_CTL_BIND_SINGLE, s);
 }
 
+
 static void grid_cc_bindings_changed(const char *console);
 
 /* The bind wait ended: keep what was pressed (nothing if it timed out). */
@@ -3073,7 +3074,8 @@ static void grid_cc_bind_poll(void)
    grid_cc_bindings_changed(console);
 }
 
-/* A console's bindings changed: if its game is running, use them now. */
+/* A console's bindings changed: a running game of it gets them when the
+ * menu closes (grid_controls_changed_running). */
 static void grid_cc_bindings_changed(const char *console)
 {
    size_t i;
@@ -3081,7 +3083,8 @@ static void grid_cc_bindings_changed(const char *console)
       if (     grid_is_running(&grid_st.games[i])
             && string_is_equal(grid_st.games[i].system, console))
       {
-         grid_controls_apply_running(console);
+         grid_controls_changed_running(console, grid_st.games[i].core_path,
+               grid_st.games[i].path);
          break;
       }
 }

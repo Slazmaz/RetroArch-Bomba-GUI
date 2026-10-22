@@ -114,8 +114,11 @@ static bool steam_module_file_bytes(HMODULE mod, DWORD rva,
  * joypad driver reads the guide button through, and drops the guide
  * button, so it can't open the menu. Whether the overlay came in with
  * Steam's injection or steam_load_overlay, put the function's start back
- * as the dll file has it (its first bytes hold no addresses to relocate). */
-static void steam_keep_guide_button(void)
+ * as the dll file has it (its first bytes hold no addresses to relocate).
+ * Only for that driver, which calls this when it starts: SDL reads pads
+ * through XInputGetStateEx too, and undone, it no longer sees the virtual
+ * pads Steam Input hands out. */
+void steam_keep_guide_button(void)
 {
    static const char *xinput_dlls[] = { "xinput1_4.dll", "xinput1_3.dll" };
    size_t i;
@@ -150,10 +153,14 @@ static void steam_keep_guide_button(void)
 void steam_init(void)
 {
    MistResult result;
-
 #ifdef _WIN32
+   settings_t *settings = config_get_ptr();
+
    steam_load_overlay();
-   steam_keep_guide_button();
+   /* Settings aren't loaded yet on the first start. */
+   if (     settings
+         && string_is_equal(settings->arrays.input_joypad_driver, "xinput"))
+      steam_keep_guide_button();
 #endif
 
    result = mist_subprocess_init();
